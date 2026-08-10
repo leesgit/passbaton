@@ -188,6 +188,11 @@ function extractNextTasks(content: string): string[] {
 
   const nextPatterns = [
     /(?:next steps?|todo|remaining|다음 (?:단계|작업|할 일)|남은 작업|해야 할)[:\s]*([^.!?\n]{10,})/gi,
+    // P1-2 (2026-08-10): 위 패턴은 영어 리포트체를 가정해 한국어 구어체에 0/18 히트였다.
+    // 실제 대화에서 다음 작업이 표현되는 형태를 추가한다.
+    /(?:남음|남은 것|다음은|이어서|아직)[:\s]*([^.!?\n]{10,})/gi,
+    /([^.!?\n]{10,}?)(?:해야 (?:한다|함|합니다)|필요하다|필요함|필요합니다|하면 된다|하면 됩니다)/gi,
+    /(?:^|\n)\s*(?:[-*]|\d+\.)\s*\[\s\]\s*([^\n]{10,})/gm,
   ];
 
   for (const pattern of nextPatterns) {
@@ -777,10 +782,22 @@ async function main() {
       lastWork = summarizeUserRequests(allRequests);
     }
 
+    // P1-2 (2026-08-10): nextTasks 추출을 `!lastWork` 폴백 밖으로 분리.
+    //   기존에는 아래 2d/2c 폴백 안에서만 호출돼, 2a/2b/2c가 lastWork를 채우는
+    //   정상 세션(대부분)에서는 도달조차 못 했다 — 실측 최근30일 376건 중 1건만 저장됨.
+    //   lastWork 결정과 무관하게 항상 시도한다.
+    if (input.last_assistant_message) {
+      nextTasks = extractNextTasks(input.last_assistant_message);
+    }
+    if (nextTasks.length === 0 && transcript.recentAssistantMessages.length > 0) {
+      for (let i = transcript.recentAssistantMessages.length - 1; i >= 0 && nextTasks.length === 0; i--) {
+        nextTasks = extractNextTasks(transcript.recentAssistantMessages[i]);
+      }
+    }
+
     // 2d: last_assistant_message에서 추출
     if (!lastWork && input.last_assistant_message) {
       lastWork = extractSummaryFromText(input.last_assistant_message);
-      nextTasks = extractNextTasks(input.last_assistant_message);
     }
 
     // 2c: transcript에서 최근 assistant 메시지 스캔 (이미 파싱됨)
@@ -788,10 +805,6 @@ async function main() {
       for (let i = transcript.recentAssistantMessages.length - 1; i >= 0; i--) {
         lastWork = extractSummaryFromText(transcript.recentAssistantMessages[i]);
         if (lastWork) break;
-      }
-      if (nextTasks.length === 0) {
-        const lastMsg = transcript.recentAssistantMessages[transcript.recentAssistantMessages.length - 1];
-        nextTasks = extractNextTasks(lastMsg);
       }
     }
 

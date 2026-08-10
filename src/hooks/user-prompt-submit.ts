@@ -392,14 +392,24 @@ function extractAndSaveDirectives(dbPath: string, project: string, prompt: strin
       }
     }
 
-    // MAX_DIRECTIVES 초과 시 가장 오래된 normal 삭제
+    // P1-1 (2026-08-10): 90일 지난 지시문 정리.
+    //   지시문은 memories와 달리 decay도 TTL도 없어 한 번 들어오면 영구 잔존했다.
+    //   오탐으로 들어온 high 지시문이 매 SessionStart마다 🔴 CRITICAL로 재주입되는 걸 막는다.
+    db.prepare(`
+      DELETE FROM user_directives
+      WHERE project = ? AND created_at < datetime('now', '-90 days')
+    `).run(project);
+
+    // MAX_DIRECTIVES 초과 시 가장 오래된 것 삭제
+    // P1-1: priority='normal' 조건 제거 — high가 상한을 넘겨도 삭제 대상에서 원천
+    //   제외돼 정상 지시문만 밀려나던 문제. 우선순위는 normal을 먼저 버리는 것으로 유지.
     const count = (db.prepare('SELECT COUNT(*) as cnt FROM user_directives WHERE project = ?').get(project) as { cnt: number })?.cnt || 0;
     if (count > MAX_DIRECTIVES) {
       db.prepare(`
         DELETE FROM user_directives WHERE id IN (
           SELECT id FROM user_directives
-          WHERE project = ? AND priority = 'normal'
-          ORDER BY created_at ASC
+          WHERE project = ?
+          ORDER BY CASE priority WHEN 'high' THEN 1 ELSE 0 END ASC, created_at ASC
           LIMIT ?
         )
       `).run(project, count - MAX_DIRECTIVES);

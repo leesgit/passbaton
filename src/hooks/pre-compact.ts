@@ -13,11 +13,13 @@ import { isEnabled } from '../utils/config.js';
 
 interface CompactInput {
   cwd?: string;
-  sessionId?: string;
-  transcript?: Array<{
-    role: string;
-    content: string;
-  }>;
+  // P0-2 (2026-08-10): 실제 hook 페이로드는 snake_case이고 인라인 transcript 배열을
+  //   주지 않는다(JSONL 파일 경로를 준다). camelCase `sessionId` + `transcript` 배열을
+  //   기대하던 기존 정의 탓에 handover가 항상 null이었고, 그 결과 아래
+  //   active_context 저장까지 한 번도 실행되지 않았다.
+  session_id?: string;
+  transcript_path?: string;
+  hook_event_name?: string;
 }
 
 interface HandoverContext {
@@ -90,6 +92,42 @@ function stripMarkdown(text: string): string {
 /**
  * 대화 transcript에서 구조화된 핸드오버 컨텍스트를 빌드합니다.
  */
+/**
+ * transcript_path(JSONL)를 buildHandoverContext가 받는 {role, content}[] 형태로 읽는다.
+ * P0-2 (2026-08-10): hook은 인라인 transcript 배열을 주지 않으므로 파일에서 직접 읽는다.
+ * 컴팩션 직전에만 실행되고 뒤쪽 메시지만 필요하므로 마지막 MAX_LINES 줄만 파싱한다.
+ */
+function readTranscript(transcriptPath: string): Array<{ role: string; content: string }> {
+  const MAX_LINES = 200;
+  try {
+    if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
+    const lines = fs.readFileSync(transcriptPath, 'utf-8').split('\n').filter(Boolean);
+    const out: Array<{ role: string; content: string }> = [];
+    for (const line of lines.slice(-MAX_LINES)) {
+      try {
+        const entry = JSON.parse(line);
+        // Claude Code JSONL은 역할을 최상위 `type`으로 싣고, `message.role`은 없을 수 있다.
+        const role = entry?.message?.role || entry?.role || entry?.type;
+        if (role !== 'user' && role !== 'assistant') continue;
+        const raw = entry?.message?.content ?? entry?.content;
+        let content = '';
+        if (typeof raw === 'string') {
+          content = raw;
+        } else if (Array.isArray(raw)) {
+          content = raw
+            .filter((b: { type?: string }) => b?.type === 'text')
+            .map((b: { text?: string }) => b.text || '')
+            .join('\n');
+        }
+        if (content.trim()) out.push({ role, content });
+      } catch { /* 깨진 줄은 건너뛴다 */ }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 function buildHandoverContext(
   transcript: Array<{ role: string; content: string }>
 ): HandoverContext {
@@ -250,8 +288,9 @@ async function main() {
 
     // 디버그 로그 (DB 없어도 발화 자체는 기록)
     const debugLogPath = path.join(path.dirname(dbPath), 'pre-compact-debug.log');
-    const transcriptLen = input.transcript?.length || 0;
-    const sid = input.sessionId?.slice(0, 8) || 'none';
+    const transcriptMessages = readTranscript(input.transcript_path || '');
+    const transcriptLen = transcriptMessages.length;
+    const sid = input.session_id?.slice(0, 8) || 'none';
 
     if (!fs.existsSync(dbPath)) {
       try {
@@ -265,7 +304,7 @@ async function main() {
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
 
     // 핸드오버 컨텍스트 빌드
-    const handover = input.transcript ? buildHandoverContext(input.transcript) : null;
+    const handover = transcriptMessages.length > 0 ? buildHandoverContext(transcriptMessages) : null;
 
     // active_context 업데이트 (memories에는 저장하지 않음)
     if (handover?.workSummary) {
@@ -275,9 +314,15 @@ async function main() {
         handover.pendingAction ? `pending: ${handover.pendingAction.slice(0, 50)}` : ''
       ].filter(Boolean).join(' | ');
 
+      // P0-2 (2026-08-10): INSERT OR REPLACE는 명시하지 않은 컬럼(blockers/active_tasks/
+      //   recent_files)을 NULL로 날린다. 이 write는 지금까지 handover가 항상 null이라
+      //   실행된 적이 없어 드러나지 않았으므로, 되살리면서 UPSERT로 바꾼다.
       db.prepare(`
-        INSERT OR REPLACE INTO active_context (project, current_state, updated_at)
+        INSERT INTO active_context (project, current_state, updated_at)
         VALUES (?, ?, datetime('now'))
+        ON CONFLICT(project) DO UPDATE SET
+          current_state = excluded.current_state,
+          updated_at = excluded.updated_at
       `).run(project, stateStr.slice(0, 300));
     }
 
@@ -366,7 +411,13 @@ async function main() {
 
     db.close();
 
-    const systemMessage = recoveryLines.join('\n');
+    // P0-1 (2026-08-10): systemMessage는 사용자에게 보여주는 경고 필드일 뿐 모델
+    //   컨텍스트에 들어가지 않는다(공식 hook 문서: "Warning message shown to the user").
+    //   PreCompact는 additionalContext도 지원하지 않으므로 여기서 재주입은 불가능하다.
+    //   → 복구 컨텍스트는 위에서 active_context에 저장하고, 실제 주입은 컴팩션 직후
+    //     SessionStart(source='compact')가 담당한다. 여기서는 사람이 읽을 알림만 남긴다.
+    const recoveryText = recoveryLines.join('\n');
+    const systemMessage = `♻️ passbaton: 컴팩션 복구 컨텍스트 저장됨 (${recoveryText.split('\n').length}줄). 다음 세션 시작 시 자동 주입됩니다.`;
 
     // 디버그 로그 (성공 케이스)
     try {
@@ -374,7 +425,7 @@ async function main() {
       const errsCount = handover?.recentErrors.length || 0;
       fs.appendFileSync(
         debugLogPath,
-        `[${new Date().toISOString()}] project=${project} sid=${sid} transcript_msgs=${transcriptLen} sysmsg_len=${systemMessage.length} active_file=${handover?.activeFile || 'none'} pending=${handover?.pendingAction ? 'yes' : 'no'} facts=${factsCount} errs=${errsCount} status=ok\n`
+        `[${new Date().toISOString()}] project=${project} sid=${sid} transcript_msgs=${transcriptLen} recovery_len=${recoveryText.length} saved=${handover?.workSummary ? 'yes' : 'no'} active_file=${handover?.activeFile || 'none'} pending=${handover?.pendingAction ? 'yes' : 'no'} facts=${factsCount} errs=${errsCount} status=ok\n`
       );
     } catch { /* ignore */ }
 

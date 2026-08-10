@@ -13,6 +13,10 @@ interface SessionInput {
   cwd?: string;
   sessionId?: string;
   transcript_path?: string;
+  // P0-1 (2026-08-10): PreCompact의 systemMessage는 사용자 표시용이라 모델에 도달하지
+  //   않는다(공식 hook 문서 확인). 컴팩션 직후 재시작은 source='compact'로 오므로,
+  //   이때는 PreCompact가 저장해 둔 복구 상태임을 명시해 주입한다.
+  source?: string;
 }
 
 function detectWorkspaceRoot(cwd: string): string {
@@ -83,7 +87,7 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4); // 대략적 추정 (한글은 1.5~2배)
 }
 
-function loadContext(dbPath: string, project: string): string | null {
+function loadContext(dbPath: string, project: string, source?: string): string | null {
   if (!fs.existsSync(dbPath)) return null;
 
   // dbPath is "<workspaceRoot>/.claude/sessions.db" → strip two levels for feature-flag lookups.
@@ -102,7 +106,9 @@ function loadContext(dbPath: string, project: string): string | null {
     // [Priority 1] 현재 상태
     const active = db.prepare('SELECT current_state, blockers FROM active_context WHERE project = ?').get(project) as { current_state: string; blockers: string } | undefined;
     if (active?.current_state) {
-      const stateBlock = `📍 **State**: ${active.current_state}` + (active.blockers ? `\n🚧 **Blocker**: ${active.blockers}` : '');
+      // P0-1: 컴팩션 직후 재시작이면 PreCompact가 저장한 복구 상태임을 밝힌다.
+      const stateLabel = source === 'compact' ? '♻️ **Recovered after compaction**' : '📍 **State**';
+      const stateBlock = `${stateLabel}: ${active.current_state}` + (active.blockers ? `\n🚧 **Blocker**: ${active.blockers}` : '');
       const cost = estimateTokens(stateBlock);
       if (tokenBudget > cost) {
         lines.push(stateBlock);
@@ -128,7 +134,9 @@ function loadContext(dbPath: string, project: string): string | null {
     if (recentSessions.length > 0 && tokenBudget > 100) {
       const sessionLines: string[] = ['## Recent Sessions'];
       for (const session of recentSessions) {
-        const work = session.last_work.length > 60 ? session.last_work.slice(0, 60) + '...' : session.last_work;
+        // P1-3 (2026-08-10): 60자는 문장 중간을 잘라 요약이 무의미했다(실측 최근30일 326/376 절단, AVG 121.9자).
+        // 140자로 확대 — 예산 초과 시 이 블록은 통째로 skip되는 구조라 오버플로 위험 없음.
+        const work = session.last_work.length > 140 ? session.last_work.slice(0, 140) + '...' : session.last_work;
         sessionLines.push(`- [${session.timestamp?.slice(0, 10) || '?'}] ${work}`);
 
         if (session.issues) {
@@ -335,7 +343,7 @@ async function main() {
     }
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
-    const context = loadContext(dbPath, project);
+    const context = loadContext(dbPath, project, input.source);
 
     if (context) {
       emitContext(`\n<session-context project="${project}">\n${context}\n</session-context>\n`, 'SessionStart', input.transcript_path);

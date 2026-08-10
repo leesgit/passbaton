@@ -1,6 +1,6 @@
 {
   "name": "passbaton",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "Session continuity and persistent memory for Claude Code, OpenAI Codex CLI & Google Gemini CLI. Auto-injects past context on start, hands over hot files + build status across compaction, shares one local db across all three. Every feature is opt-in via `passbaton config`. 100% local SQLite, zero API cost.",
   "type": "module",
   "main": "dist/index.js",
