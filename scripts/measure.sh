@@ -28,15 +28,18 @@ SELECT
   ROUND(1.0 * (SELECT COUNT(*) FROM sessions) / NULLIF((SELECT COUNT(*) FROM memories), 0), 1) AS s_m_ratio;
 "
 
-# === duration_minutes 충실도 (Phase 1 P0-4) ===
+# === next_tasks 충실도 (P1-2, 2026-08-10) ===
+# duration_minutes 충실도 지표는 폐기됨 — 커밋 5bcfc314(2026-07-08)에서 해당 필드
+# INSERT를 의도적으로 중단했으므로(신뢰 불가 + 소비처 없음) 이 지표는 0으로만 수렴한다.
+# 대신 실제 연속성 가치를 좌우하는 next_tasks 저장률을 본다.
 echo ""
-echo "## duration_minutes 수집 충실도 (Phase 1 효과)"
+echo "## next_tasks 저장률 (P1-2 효과, 최근 30일)"
 sqlite3 -column -header "$DB" "
 SELECT
-  COUNT(*) AS total,
-  SUM(CASE WHEN duration_minutes IS NOT NULL THEN 1 ELSE 0 END) AS with_duration,
-  ROUND(100.0 * SUM(CASE WHEN duration_minutes IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS pct
-FROM sessions;
+  COUNT(*) AS total_30d,
+  SUM(CASE WHEN next_tasks IS NOT NULL AND next_tasks != '' AND next_tasks != '[]' THEN 1 ELSE 0 END) AS with_tasks,
+  ROUND(100.0 * SUM(CASE WHEN next_tasks IS NOT NULL AND next_tasks != '' AND next_tasks != '[]' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) AS pct
+FROM sessions WHERE timestamp > datetime('now', '-30 days');
 "
 
 # === auto-extracted 메모리 (Phase 2 효과) ===
@@ -67,27 +70,18 @@ SELECT memory_type, COUNT(*) cnt
 FROM memories GROUP BY memory_type ORDER BY cnt DESC;
 "
 
-# === 베이스라인 비교 (2026-05-12 Phase 2 직후) ===
-# STALE 2026-05-12 baseline — delta 추적용, 현재 상태 아님.
-# 2026-05-22 7-agent 검증 시점 live: sessions=134, memories=76, solutions=31 (~/.claude/sessions.db는 stale fallback이므로 위 DB=path 확인 필수).
+# === 베이스라인 비교 ===
+# ⚠️ 2026-05-12 베이스라인(sessions=1291)은 DB 정리 이전 수치라 현재(1121)와 직접
+#    비교하면 delta가 음수로 나와 무의미했다. cleanup으로 302건이 영구삭제된 이력이
+#    있어 sessions 총량은 누적 지표로 못 쓴다. → 총량 delta 대신 현재 스냅샷만 낸다.
 echo ""
-echo "## 베이스라인 (2026-05-12 Phase 2 직후) 대비"
+echo "## 현재 스냅샷 (총량은 cleanup 이력 탓에 시계열 비교 불가)"
 sqlite3 -column -header "$DB" "
-WITH baseline AS (
-  SELECT 1291 AS b_sessions, 61 AS b_memories, 58 AS b_solutions, 4 AS b_duration
-), curr AS (
-  SELECT
-    (SELECT COUNT(*) FROM sessions) c_sessions,
-    (SELECT COUNT(*) FROM memories) c_memories,
-    (SELECT COUNT(*) FROM solutions) c_solutions,
-    (SELECT SUM(CASE WHEN duration_minutes IS NOT NULL THEN 1 ELSE 0 END) FROM sessions) c_duration
-)
 SELECT
-  c.c_sessions - b.b_sessions AS delta_sessions,
-  c.c_memories - b.b_memories AS delta_memories,
-  c.c_solutions - b.b_solutions AS delta_solutions,
-  c.c_duration - b.b_duration AS delta_duration
-FROM baseline b, curr c;
+  (SELECT COUNT(*) FROM sessions) AS sessions,
+  (SELECT COUNT(*) FROM memories) AS memories,
+  (SELECT COUNT(*) FROM solutions) AS solutions,
+  (SELECT COUNT(*) FROM sessions WHERE timestamp > datetime('now','-7 days')) AS sessions_7d;
 "
 
 # === 가치 점수 추정 ===
@@ -99,13 +93,16 @@ WITH stats AS (
     (SELECT COUNT(*) FROM sessions) AS s,
     (SELECT COUNT(*) FROM memories) AS m,
     (SELECT COUNT(*) FROM solutions) AS sol,
-    (SELECT 100.0 * SUM(CASE WHEN duration_minutes IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*) FROM sessions) AS dur_pct,
+    (SELECT 100.0 * SUM(CASE WHEN next_tasks IS NOT NULL AND next_tasks != '' AND next_tasks != '[]' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)
+       FROM sessions WHERE timestamp > datetime('now','-30 days')) AS nt_pct,
     (SELECT COUNT(*) FROM memories WHERE tags LIKE '%auto-extracted%') AS auto_mem
 )
 SELECT
   CAST(
     CASE WHEN m > 0 AND s/m <= 5 THEN 20 ELSE CAST(20.0 * 5 / MAX(1.0*s/m, 5) AS INT) END +  -- memories 비율
-    CASE WHEN dur_pct >= 50 THEN 10 ELSE CAST(dur_pct/5 AS INT) END +                         -- duration 충실도
+    -- duration 충실도(10점)를 next_tasks 저장률로 교체 (2026-08-10):
+    -- duration_minutes는 2026-07-08 의도적 폐기라 0으로만 수렴하는 死지표였다.
+    CASE WHEN COALESCE(nt_pct,0) >= 50 THEN 10 ELSE CAST(COALESCE(nt_pct,0)/5 AS INT) END +
     CASE WHEN sol >= 70 THEN 15 ELSE CAST(15.0 * sol / 70 AS INT) END +                       -- solutions
     CASE WHEN auto_mem >= 20 THEN 25 ELSE CAST(25.0 * auto_mem / 20 AS INT) END +             -- 자동 추출
     30  -- SESSION.md 수동 연속성 (이미 잘 작동)
@@ -115,7 +112,8 @@ FROM stats;
 
 echo ""
 echo "==================================================================="
-echo "  베이스라인 (2026-05-12):"
-echo "    sessions=1291, memories=61, solutions=58, with_duration=4"
-echo "    가치 점수: ~38/100 (Phase 0) → 예상 75/100 (Phase 2 효과 누적 시)"
+echo "  참고 (2026-08-10 audit-7 실측, passbaton v2.1.3):"
+echo "    sessions=1121, memories/solutions는 위 스냅샷 참조"
+echo "    next_tasks 저장률: 수정 전 1/376 (0.3%) → P1-2 수정 후 재측정 대상"
+echo "    ⚠️ duration_minutes 지표는 폐기됨 (2026-07-08 커밋 5bcfc314)"
 echo "==================================================================="
