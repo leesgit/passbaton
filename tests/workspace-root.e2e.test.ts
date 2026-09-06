@@ -6,7 +6,7 @@
 //
 // `npm run build` 가 선행돼야 한다 (dist/hooks/*.js 를 spawn 한다).
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -61,6 +61,7 @@ function initSchema(dbPath: string): void {
 /** 모노레포 + apps/<app> 함정 DB 를 만든다. 루트만 스키마를 갖는다. */
 function makeMonorepoWithTrap(app: string): { root: string; appDir: string; rootDb: string; trapDb: string } {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-p06-')));
+  createdDirs.push(root);
   const appDir = path.join(root, 'apps', app);
   fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
   fs.mkdirSync(path.join(appDir, '.claude'), { recursive: true });
@@ -88,6 +89,20 @@ function untouched(dbPath: string, bytes: number): boolean {
   const buf = fs.readFileSync(dbPath);
   return buf.length === bytes && buf.every((b) => b === 0);
 }
+
+const createdDirs: string[] = [];
+
+// 임시 워크스페이스를 지운다. 안 지우면 %TEMP% 에 쌓인다 — 실측으로 84개가
+// 남아 있었고, 「워크스페이스 탐지가 새 DB 를 만들었나」를 잴 때 잡음이 된다.
+afterAll(() => {
+  for (const dir of createdDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // 정리 실패가 테스트를 빨갛게 만들지는 않는다
+    }
+  }
+});
 
 describe.skipIf(!built)('P0-6 워크스페이스 루트 탐지', () => {
   beforeAll(() => {

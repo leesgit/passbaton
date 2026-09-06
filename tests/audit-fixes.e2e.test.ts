@@ -8,7 +8,7 @@
 // Requires `npm run build` first (reads dist/hooks/*.js). Skips if dist is
 // missing rather than failing spuriously.
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import * as fs from 'fs';
@@ -64,6 +64,7 @@ function initSchema(dbPath: string): void {
 
 function makeWorkspace(): { ws: string; dbPath: string } {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'pb-audit-'));
+  createdDirs.push(ws);
   fs.mkdirSync(path.join(ws, '.claude'), { recursive: true });
   const dbPath = path.join(ws, '.claude', 'sessions.db');
   initSchema(dbPath);
@@ -78,6 +79,20 @@ function runHook(hook: string, input: object, ws: string): string {
   });
   return res.stdout || '';
 }
+
+const createdDirs: string[] = [];
+
+// 임시 워크스페이스를 지운다. 안 지우면 %TEMP% 에 쌓인다 — 실측으로 84개가
+// 남아 있었고, 「워크스페이스 탐지가 새 DB 를 만들었나」를 잴 때 잡음이 된다.
+afterAll(() => {
+  for (const dir of createdDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // 정리 실패가 테스트를 빨갛게 만들지는 않는다
+    }
+  }
+});
 
 describe.skipIf(!built)('audit-7 2026-08-10 regression', () => {
   beforeAll(() => {
