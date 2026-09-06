@@ -10,10 +10,12 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { logHookError } from '../utils/logger.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
+import { trace, tpathOf } from '../utils/hook-trace.js';
 
 interface ToolUseInput {
   cwd?: string;
-  sessionId?: string;
+  // 실제 훅 페이로드는 snake_case 다 (camelCase 는 항상 undefined).
+  session_id?: string;
   tool_name?: string;
   tool_input?: {
     file_path?: string;
@@ -23,6 +25,7 @@ interface ToolUseInput {
     content?: string;
   };
   tool_result?: string;
+  transcript_path?: string;
 }
 
 // ===== Playwright 캐시 정리 (20MB 컨텍스트 초과 방지) =====
@@ -227,6 +230,18 @@ async function main() {
     if (!toolName) {
       process.exit(0);
     }
+
+    // 이 훅은 settings.json 에 matcher 'Edit' / 'Write' 로만 등록된다(install.ts).
+    // Bash·Read·Glob·Grep 은 **애초에 이 프로세스에 도달하지 않는다** — 앞 판의
+    // 「추적되지 않는 도구까지 센다」는 주석은 거짓이었다. 아래 TRACKED_TOOLS 필터보다
+    // 앞에 두는 이유는 그 필터에 걸려 버려지는 발화(경로 없는 Write 등)를 세기 위해서다.
+    const traceCwd = input.cwd || process.cwd();
+    trace('post-tool-use', detectWorkspaceRoot(traceCwd), {
+      tool: toolName,
+      tpath: tpathOf(input.transcript_path),
+      file: input.tool_input?.file_path,
+      cwd: traceCwd,
+    });
 
     // Bash 에러 감지 → 솔루션 자동 주입
     if (toolName === 'Bash' && input.tool_result) {

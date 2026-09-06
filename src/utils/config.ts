@@ -24,7 +24,7 @@ export interface FeatureDef {
    * Whether a hook actually reads this flag via isEnabled(). Only wired flags
    * are user-toggleable; unwired ones (hook existence is controlled by
    * settings.json, not config) render as "always on" and reject `config set`.
-   * Omitted = true. Audited 2026-07-20 (audit-7): 5 wired, 10 unwired.
+   * Omitted = true. Audited 2026-09-07: 6 wired, 10 unwired.
    */
   configurable?: boolean;
 }
@@ -58,6 +58,7 @@ export const FEATURE_DEFS: Record<string, FeatureDef> = {
   patternMining:      { enabled: false, desc: 'Mine work patterns and suggest workflows (not yet wired)', group: 'experimental', configurable: false },
   memoryAutoStore:    { enabled: false, desc: 'Auto-write observation memories from prompts (not yet wired)', group: 'experimental', configurable: false },
   statusLineInject:   { enabled: false, desc: 'Append a passbaton status line to session-start output (not yet wired)', group: 'experimental', configurable: false },
+  hookTrace:          { enabled: false, desc: 'Diagnostics: one line per SessionStart/PostToolUse fire to .claude/hook-trace.log (pid + resolved ws_root). Logs absolute paths; capped at 5MB', group: 'experimental' },
 };
 
 const DEFAULTS: Record<string, boolean> =

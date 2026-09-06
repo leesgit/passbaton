@@ -315,7 +315,7 @@ After installation, restart Claude Code to activate the hooks.
 
 ## Feature toggles — everything is opt-in
 
-**(v2.1.0+)** Five behaviours are individually toggleable; the rest are shown for
+**(v2.1.0+)** Six behaviours are individually toggleable; the rest are shown for
 transparency but are **always on** (a hook's mere existence is controlled by your
 `settings.json`, not by config) or **not yet wired**. Config lives in a plain,
 hand-editable JSON file (`~/.claude/passbaton.config.json`) — separate from your data,
@@ -372,9 +372,15 @@ Legend: **●/○** = toggleable (on/off) · **·** = always on, not a config to
 | Pattern mining | `patternMining` | ⋯ not yet wired | (planned) Mine work patterns and suggest workflows |
 | Memory auto-store | `memoryAutoStore` | ⋯ not yet wired | (planned) Auto-write observation memories from prompts |
 | Status line | `statusLineInject` | ⋯ not yet wired | (planned) Append a passbaton status line to session-start output |
+| **Hook trace** | `hookTrace` | ○ opt-in | Diagnostics: one line per SessionStart / PostToolUse fire into `<workspace>/.claude/hook-trace.log`, with `pid` and the resolved `ws_root`. Off by default because PostToolUse fires on every edit. Capped at 5 MB (one generation kept). **Logs absolute file paths in plaintext** — add `.claude/hook-trace.log` to `.gitignore` if your repo tracks `.claude/` |
 
 The only genuinely user-flippable flags today are **`compactionHandover`, `hotPathPrewarm`,
-`verificationLedger`, `solutionCapture`** (on) and **`strictSolutionGate`** (opt-in).
+`verificationLedger`, `solutionCapture`** (on) and **`strictSolutionGate`, `hookTrace`** (opt-in).
+
+> **Turning on `hookTrace` on Windows:** edit `~/.claude/passbaton.config.json` (or run
+> `passbaton config set hookTrace on`). The `PASSBATON_HOOKTRACE=1` env override works
+> too, but hooks are launched from `settings.json` through `cmd.exe`, where a
+> `VAR=1 command` prefix is a syntax error — so the config file is the practical path.
 
 ---
 

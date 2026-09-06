@@ -102,6 +102,8 @@ describe('FEATURE_DEFS — wired/configurable honesty (audit-7 pin)', () => {
     'verificationLedger',
     'solutionCapture',
     'strictSolutionGate',
+    // 2026-09-07: src/utils/hook-trace.ts 가 isEnabled('hookTrace') 로 읽는다.
+    'hookTrace',
   ];
 
   it('exactly the wired flags are user-configurable', () => {

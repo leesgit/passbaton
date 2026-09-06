@@ -8,11 +8,14 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { logHookError, emitContext, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
+import { trace, tpathOf } from '../utils/hook-trace.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 
 interface SessionInput {
   cwd?: string;
-  sessionId?: string;
+  // 실제 훅 페이로드는 snake_case 다. camelCase `sessionId` 는 항상 undefined 였다
+  // (PreCompact 이 같은 실수로 핸드오버가 死코드였다 — audit-7 2026-08-10).
+  session_id?: string;
   transcript_path?: string;
   // P0-1 (2026-08-10): PreCompact의 systemMessage는 사용자 표시용이라 모델에 도달하지
   //   않는다(공식 hook 문서 확인). 컴팩션 직후 재시작은 source='compact'로 오므로,
@@ -326,12 +329,29 @@ async function main() {
     const workspaceRoot = detectWorkspaceRoot(cwd);
     const project = getProject(cwd, workspaceRoot);
 
+    // 조기 반환과 loadContext **앞**에서 찍는다. 뒤에 두면 「발화 안 함」과
+    // 「발화했으나 도중에 죽음」이 로그상 같아진다.
+    trace('session-start', workspaceRoot, {
+      project,
+      tpath: tpathOf(input.transcript_path),
+      source: input.source,
+      cwd,
+    });
+
     if (!project) {
       process.exit(0);
     }
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
     const context = loadContext(dbPath, project, input.source);
+
+    // 주입 결과는 별도 줄. injected 는 **문자 수**다 (토큰 아님 — 예산은 2000 토큰이고
+    // 한글은 문자당 토큰이 더 든다. 대략 len/4 보다 나쁘다).
+    trace('session-start:injected', workspaceRoot, {
+      project,
+      tpath: tpathOf(input.transcript_path),
+      injected_chars: context ? context.length : 0,
+    });
 
     if (context) {
       emitContext(`\n<session-context project="${project}">\n${context}\n</session-context>\n`, 'SessionStart', input.transcript_path);
