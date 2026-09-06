@@ -111,6 +111,60 @@ describe('detectWorkspaceRoot', () => {
     expect(detectWorkspaceRoot(proj)).toBe(proj);
   });
 
+  // /ashfall-fleet 은 %TEMP% 에 워크트리를 만들고 끝나면 지운다. 본체를 안 따라가면
+  // 그 안에 DB 가 생겨 워크트리와 함께 통째로 사라진다.
+  describe('git 워크트리', () => {
+    /** 실제 git 이 쓰는 형식 그대로: `.git` 은 gitdir 한 줄이 든 파일이다. */
+    function makeWorktree(mainRepo: string, name: string): string {
+      const wt = mk('elsewhere', name);
+      fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${path.join(mainRepo, '.git', 'worktrees', name)}\n`);
+      return wt;
+    }
+
+    it('워크트리에서 실행하면 본체 레포 기준으로 판정한다', () => {
+      const repo = mk('repo');
+      const app = mk('repo', 'apps', 'kenshi-fantasy');
+      fs.mkdirSync(path.join(app, '.git'), { recursive: true });
+      touchDb(repo, 4096);
+      const wt = makeWorktree(app, 'inj0');
+
+      expect(detectWorkspaceRoot(wt)).toBe(repo);
+    });
+
+    it('워크트리 하위 디렉터리에서도 마찬가지다', () => {
+      const repo = mk('repo');
+      const app = mk('repo', 'apps', 'kenshi-fantasy');
+      fs.mkdirSync(path.join(app, '.git'), { recursive: true });
+      touchDb(repo, 4096);
+      const wt = makeWorktree(app, 'inj1');
+      const deep = path.join(wt, 'core', 'Sim.Core');
+      fs.mkdirSync(deep, { recursive: true });
+
+      expect(detectWorkspaceRoot(deep)).toBe(repo);
+    });
+
+    it('gitdir 이 worktrees 형태가 아니면 commondir 로 본체를 찾는다', () => {
+      const repo = mk('repo');
+      const app = mk('repo', 'apps', 'myapp');
+      fs.mkdirSync(path.join(app, '.git'), { recursive: true });
+      touchDb(repo, 4096);
+      const gitdir = mk('elsewhere', 'odd-gitdir');
+      fs.writeFileSync(path.join(gitdir, 'commondir'), '../../repo/apps/myapp/.git\n');
+      const wt = mk('elsewhere', 'odd');
+      fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${gitdir}\n`);
+
+      expect(detectWorkspaceRoot(wt)).toBe(repo);
+    });
+
+    it('.git 파일이 깨져 있으면 조용히 무시하고 기존 규칙을 쓴다', () => {
+      const proj = mk('standalone');
+      touchDb(proj, 4096);
+      fs.writeFileSync(path.join(proj, '.git'), 'garbage\n');
+
+      expect(detectWorkspaceRoot(proj)).toBe(proj);
+    });
+  });
+
   it('모노레포 루트에서 호출하면 자기 자신을 반환한다', () => {
     const repo = mk('repo');
     mk('repo', 'apps');

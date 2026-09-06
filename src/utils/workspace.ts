@@ -11,6 +11,8 @@ import * as path from 'path';
  *   3. `.claude/sessions.db` 를 가진 가장 가까운 상위 — **레포 경계 안에서만**
  *   4. 레포 루트(.git 을 가진 가장 가까운 상위), 없으면 cwd
  *
+ * cwd 가 git 워크트리 안이면 **본체 레포 루트에서** 위 규칙을 적용한다.
+ *
  * 어느 순회도 홈 디렉터리를 넘지 않는다.
  *
  * ── 왜 이렇게 비대칭인가 (2026-09-07 감사 실측) ─────────────────────────
@@ -53,12 +55,61 @@ function candidateDirs(start: string): string[] {
   return dirs;
 }
 
+/**
+ * git 워크트리면 본체 레포 루트를 돌려준다. 워크트리가 아니면 null.
+ *
+ * 워크트리의 `.git` 은 디렉터리가 아니라 `gitdir: <path>` 한 줄이 든 **파일**이다.
+ * 이걸 안 따라가면 워크트리가 자기 자신을 워크스페이스로 잡고, `%TEMP%` 안에
+ * DB 를 만든 뒤 `worktree remove` 와 함께 통째로 사라진다.
+ * `/ashfall-fleet` 이 정확히 그 구조로 돈다 (에이전트 11개, 끝나면 워크트리 제거).
+ */
+function mainWorktreeRoot(dir: string): string | null {
+  const dotGit = path.join(dir, '.git');
+
+  try {
+    if (!fs.statSync(dotGit).isFile()) return null; // 디렉터리면 본체 레포다
+  } catch {
+    return null;
+  }
+
+  let gitdir: string;
+  try {
+    const match = fs.readFileSync(dotGit, 'utf-8').match(/^gitdir:\s*(.+)$/m);
+    if (!match) return null;
+    gitdir = path.resolve(dir, match[1].trim());
+  } catch {
+    return null;
+  }
+
+  // <main>/.git/worktrees/<name> → <main>
+  const marker = path.sep + path.join('.git', 'worktrees') + path.sep;
+  const idx = gitdir.indexOf(marker);
+  if (idx > 0) return gitdir.slice(0, idx);
+
+  // 폴백: <gitdir>/commondir 가 본체의 .git 을 가리킨다
+  try {
+    const common = fs.readFileSync(path.join(gitdir, 'commondir'), 'utf-8').trim();
+    return path.dirname(path.resolve(gitdir, common));
+  } catch {
+    return null;
+  }
+}
+
+/** cwd 가 워크트리 안이면 본체 레포 루트를, 아니면 null. 한 단계만 따라간다. */
+function resolveWorktreeMain(start: string): string | null {
+  for (const dir of candidateDirs(start)) {
+    if (fs.existsSync(path.join(dir, '.git'))) return mainWorktreeRoot(dir);
+  }
+  return null;
+}
+
 export function detectWorkspaceRoot(cwd: string): string {
   if (process.env.WORKSPACE_ROOT) {
     return process.env.WORKSPACE_ROOT;
   }
 
-  const start = path.resolve(cwd);
+  // 워크트리면 본체 레포에서 판정한다 (아래 규칙들은 본체 기준이어야 뜻이 맞는다)
+  const start = resolveWorktreeMain(path.resolve(cwd)) ?? path.resolve(cwd);
   const dirs = candidateDirs(start);
 
   // 레포 경계 — .git 을 가진 가장 가까운 디렉터리
