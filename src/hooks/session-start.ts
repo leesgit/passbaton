@@ -8,6 +8,7 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { logHookError, emitContext, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
+import { detectWorkspaceRoot } from '../utils/workspace.js';
 
 interface SessionInput {
   cwd?: string;
@@ -17,19 +18,6 @@ interface SessionInput {
   //   않는다(공식 hook 문서 확인). 컴팩션 직후 재시작은 source='compact'로 오므로,
   //   이때는 PreCompact가 저장해 둔 복구 상태임을 명시해 주입한다.
   source?: string;
-}
-
-function detectWorkspaceRoot(cwd: string): string {
-  let current = cwd;
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    if (fs.existsSync(path.join(current, 'apps'))) return current;
-    if (fs.existsSync(path.join(current, '.claude', 'sessions.db'))) return current;
-    current = path.dirname(current);
-  }
-
-  return cwd;
 }
 
 function getProject(cwd: string, workspaceRoot: string): string | null {

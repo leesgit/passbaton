@@ -8,24 +8,12 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { logHookError, emitContext } from '../utils/logger.js';
 import { tokenizeQuery } from '../utils/tokenize.js';
+import { detectWorkspaceRoot } from '../utils/workspace.js';
 
 interface PromptInput {
   prompt?: string;
   cwd?: string;
   transcript_path?: string;
-}
-
-function detectWorkspaceRoot(cwd: string): string {
-  let current = cwd;
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    if (fs.existsSync(path.join(current, 'apps'))) return current;
-    if (fs.existsSync(path.join(current, '.claude', 'sessions.db'))) return current;
-    current = path.dirname(current);
-  }
-
-  return cwd;
 }
 
 function getProject(cwd: string, workspaceRoot: string): string | null {

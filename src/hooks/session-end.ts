@@ -17,6 +17,7 @@ import * as crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { logHookError, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
+import { detectWorkspaceRoot } from '../utils/workspace.js';
 
 interface SessionEndInput {
   cwd?: string;
@@ -30,19 +31,6 @@ interface SessionEndInput {
     role: string;
     content: string;
   }>;
-}
-
-function detectWorkspaceRoot(cwd: string): string {
-  let current = cwd;
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    if (fs.existsSync(path.join(current, 'apps'))) return current;
-    if (fs.existsSync(path.join(current, '.claude', 'sessions.db'))) return current;
-    current = path.dirname(current);
-  }
-
-  return cwd;
 }
 
 function getDbPath(cwd: string): string {
