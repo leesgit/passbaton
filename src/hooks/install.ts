@@ -10,7 +10,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { spawnSync } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,10 +36,42 @@ const GEMINI_SETTINGS_FILE = path.join(GEMINI_DIR, 'settings.json');
 const PKG_NAME = 'passbaton';
 const LEGACY_PKG_NAME = 'claude-session-continuity-mcp';
 const HOOK_PREFIX = 'passbaton-hook-';
+
+/**
+ * 훅 실행 명령을 만든다.
+ *
+ * 원래는 무조건 `npm exec -- <bin>` 이었다. 로컬 설치에서도 node_modules/.bin 을
+ * 찾아주므로 경로 독립적이라는 이유였는데, **매 Edit/Write 마다 그 대가를 낸다.**
+ * 실측(Windows, 5회 중앙값):
+ *
+ *   npm exec -- passbaton-hook-post-tool   1,357 ms
+ *   passbaton-hook-post-tool (이름만)         125 ms   ← 10.9배
+ *   node <절대 dist 경로>                      117 ms   (경로가 박혀 취약)
+ *
+ * 그래서 **설치 시점에 이름이 PATH 에서 풀리는지 확인하고**(전역 설치의 정상 상태)
+ * 풀리면 이름만 쓴다. 안 풀리면 예전 그대로 `npm exec` — 즉 최악이어도 현상 유지다.
+ * 절대경로는 쓰지 않는다: 설치 위치가 바뀌면 조용히 깨진다.
+ */
+export function hookCommand(name: string, bareResolves: boolean, extra = ''): string {
+  const bin = `${HOOK_PREFIX}${name}${extra}`;
+  return bareResolves ? bin : `npm exec -- ${bin}`;
+}
+
+/** 이 이름이 PATH 에서 실행 가능한가. 실패하면 false — 판정 불가는 안전한 쪽으로. */
+export function binResolves(name: string): boolean {
+  try {
+    const probe = process.platform === 'win32' ? 'where' : 'which';
+    return spawnSync(probe, [name], { stdio: 'ignore', shell: false }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+const BARE_OK = binResolves(`${HOOK_PREFIX}session-start`);
 const LEGACY_HOOK_PREFIX = 'claude-hook-';
 
 /** True if this command string is one of ours (current or legacy naming). */
-function isOurHookCommand(command?: string): boolean {
+export function isOurHookCommand(command?: string): boolean {
   if (!command) return false;
   return command.includes(HOOK_PREFIX) || command.includes(LEGACY_HOOK_PREFIX);
 }
@@ -187,10 +220,10 @@ function installCodexHooks(): void {
   // Codex uses the same event names as Claude (SessionStart/UserPromptSubmit/Stop...).
   // Append "--codex" so hooks detect the host reliably: Codex passes transcript_path
   // as null at SessionStart, so the argv marker is the only dependable signal.
-  merge('SessionStart', [{ hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}session-start --codex` }] }]);
-  merge('UserPromptSubmit', [{ hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}user-prompt --codex` }] }]);
-  merge('PreCompact', [{ hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}pre-compact --codex` }] }]);
-  merge('Stop', [{ hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}session-end --codex` }] }]);
+  merge('SessionStart', [{ hooks: [{ type: 'command', command: `${hookCommand('session-start', BARE_OK, ' --codex')}` }] }]);
+  merge('UserPromptSubmit', [{ hooks: [{ type: 'command', command: `${hookCommand('user-prompt', BARE_OK, ' --codex')}` }] }]);
+  merge('PreCompact', [{ hooks: [{ type: 'command', command: `${hookCommand('pre-compact', BARE_OK, ' --codex')}` }] }]);
+  merge('Stop', [{ hooks: [{ type: 'command', command: `${hookCommand('session-end', BARE_OK, ' --codex')}` }] }]);
 
   hooksConfig.hooks = hooks;
   try {
@@ -224,10 +257,10 @@ function installGeminiHooks(): void {
   };
 
   // Gemini hook entries are flat {type, command} (no nested "hooks" array like Claude/Codex).
-  merge('SessionStart', [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}session-start --gemini` }]);
-  merge('BeforeAgent', [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}user-prompt --gemini` }]);
-  merge('PreCompress', [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}pre-compact --gemini` }]);
-  merge('SessionEnd', [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}session-end --gemini` }]);
+  merge('SessionStart', [{ type: 'command', command: `${hookCommand('session-start', BARE_OK, ' --gemini')}` }]);
+  merge('BeforeAgent', [{ type: 'command', command: `${hookCommand('user-prompt', BARE_OK, ' --gemini')}` }]);
+  merge('PreCompress', [{ type: 'command', command: `${hookCommand('pre-compact', BARE_OK, ' --gemini')}` }]);
+  merge('SessionEnd', [{ type: 'command', command: `${hookCommand('session-end', BARE_OK, ' --gemini')}` }]);
 
   settings.hooks = hooks;
   try {
@@ -246,8 +279,8 @@ function install(): void {
   // ===== 0. Migrate from settings.local.json if needed =====
   migrateLegacyHooks();
 
-  // ===== 1. Hooks 설치 (npm exec 방식 - 경로 독립적) =====
-  console.log('📌 Step 1: Installing Hooks (npm exec mode)...');
+  // ===== 1. Hooks 설치 (이름 해석 가능하면 직접 실행, 아니면 npm exec) =====
+  console.log(`📌 Step 1: Installing Hooks (${BARE_OK ? 'direct bin' : 'npm exec'} mode)...`);
 
   const settings = loadSettings();
 
@@ -272,24 +305,24 @@ function install(): void {
   }
 
   mergeHooks('SessionStart', [
-    { hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}session-start` }] }
+    { hooks: [{ type: 'command', command: `${hookCommand('session-start', BARE_OK)}` }] }
   ]);
 
   mergeHooks('UserPromptSubmit', [
-    { hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}user-prompt` }] }
+    { hooks: [{ type: 'command', command: `${hookCommand('user-prompt', BARE_OK)}` }] }
   ]);
 
   mergeHooks('PostToolUse', [
-    { matcher: 'Edit', hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}post-tool` }] },
-    { matcher: 'Write', hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}post-tool` }] }
+    { matcher: 'Edit', hooks: [{ type: 'command', command: `${hookCommand('post-tool', BARE_OK)}` }] },
+    { matcher: 'Write', hooks: [{ type: 'command', command: `${hookCommand('post-tool', BARE_OK)}` }] }
   ]);
 
   mergeHooks('PreCompact', [
-    { hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}pre-compact` }] }
+    { hooks: [{ type: 'command', command: `${hookCommand('pre-compact', BARE_OK)}` }] }
   ]);
 
   mergeHooks('Stop', [
-    { hooks: [{ type: 'command', command: `npm exec -- ${HOOK_PREFIX}session-end` }] }
+    { hooks: [{ type: 'command', command: `${hookCommand('session-end', BARE_OK)}` }] }
   ]);
 
   settings.hooks = hooks;
@@ -302,7 +335,7 @@ function install(): void {
   // Gemini CLI hooks (2026-07-10): same, in ~/.gemini/settings.json if Gemini is present.
   installGeminiHooks();
 
-  console.log('✅ Hooks installed (npm exec mode - works with local or global install!)');
+  console.log(`✅ Hooks installed (${BARE_OK ? 'direct bin — ~10x faster per fire' : 'npm exec — bin not on PATH'})`);
   console.log('   SessionStart: context auto-load');
   console.log('   UserPromptSubmit: relevant memory injection');
   console.log('   PostToolUse: file change tracking (Edit, Write)');
@@ -422,21 +455,34 @@ function status(): void {
   }
 }
 
-// CLI
-const args = process.argv.slice(2);
-const command = args[0] || 'install';
+/**
+ * 이 파일을 **직접 실행했을 때만** CLI 로 동작한다.
+ *
+ * 예전엔 이 스위치가 top-level 에 그냥 있어서 `import` 만 해도 install() 이 돌았다.
+ * 즉 테스트가 이 모듈을 불러오는 순간 사용자의 ~/.claude/settings.json 과
+ * ~/.claude.json 이 다시 쓰였다. 실제로 2026-09-07 에 그렇게 터졌다 — 결과가
+ * 우연히 원하던 값이라 알아채기까지 한 단계 더 걸렸다.
+ * postinstall 은 이 파일을 직접 실행하므로 동작에는 영향이 없다.
+ */
+const invokedDirectly =
+  !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
-switch (command) {
-  case 'install':
-    install();
-    break;
-  case 'uninstall':
-  case 'remove':
-    uninstall();
-    break;
-  case 'status':
-    status();
-    break;
-  default:
-    console.log('Usage: npx passbaton-hooks [install|uninstall|status]');
+if (invokedDirectly) {
+  const args = process.argv.slice(2);
+  const command = args[0] || 'install';
+
+  switch (command) {
+    case 'install':
+      install();
+      break;
+    case 'uninstall':
+    case 'remove':
+      uninstall();
+      break;
+    case 'status':
+      status();
+      break;
+    default:
+      console.log('Usage: npx passbaton-hooks [install|uninstall|status]');
+  }
 }

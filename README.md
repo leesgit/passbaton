@@ -181,7 +181,7 @@ Global installation is strongly recommended because:
 | **Hooks are user-scoped** | `~/.claude/settings.json` lives in your home directory, not per-project |
 | **Cross-project context** | Sessions from `app-a` and `app-b` share the same DB and search index |
 | **One update = everything refreshed** | `npm install -g <latest>` updates all projects at once; no per-project reinstall |
-| **`npm exec` resolves global first** | Hooks call `npm exec -- passbaton-hook-*` which finds the global package reliably regardless of cwd |
+| **Hooks resolve by bin name** | The installer writes the bare bin name (`passbaton-hook-*`) when it resolves on PATH — the normal case for `npm i -g`. Measured **135 ms** per fire vs **1,367 ms** for `npm exec -- …` (10×), and PostToolUse fires on every edit. If the name does not resolve (local install), it falls back to `npm exec -- …` |
 
 **Important**: Even with global install, you can still **disable the hook for specific projects** (see below).
 Global ≠ forced on every project.
@@ -228,7 +228,7 @@ If you really want per-project install (e.g., locked version for one project):
 ```bash
 cd <project> && npm install passbaton
 ```
-Drawback: you must install separately in every project, and `npm exec` may not find the local copy reliably from hook context (cwd-dependent). Stick with `-g` unless you have a specific reason.
+Drawback: you must install separately in every project, `npm exec` may not find the local copy reliably from hook context (cwd-dependent), and you pay the `npm exec` startup cost (~1.4 s) on every hook fire instead of ~135 ms. Stick with `-g` unless you have a specific reason.
 
 ### What Gets Installed
 
@@ -248,16 +248,16 @@ Drawback: you must install separately in every project, and `npm exec` may not f
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "npm exec -- passbaton-hook-session-start" }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "npm exec -- passbaton-hook-user-prompt" }] }],
-    "PostToolUse": [{ "matcher": "Edit", "hooks": [{ "type": "command", "command": "npm exec -- passbaton-hook-post-tool" }] }, { "matcher": "Write", "hooks": [{ "type": "command", "command": "npm exec -- passbaton-hook-post-tool" }] }],
-    "PreCompact": [{ "hooks": [{ "type": "command", "command": "npm exec -- passbaton-hook-pre-compact" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "npm exec -- passbaton-hook-session-end" }] }]
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "passbaton-hook-session-start" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "passbaton-hook-user-prompt" }] }],
+    "PostToolUse": [{ "matcher": "Edit", "hooks": [{ "type": "command", "command": "passbaton-hook-post-tool" }] }, { "matcher": "Write", "hooks": [{ "type": "command", "command": "passbaton-hook-post-tool" }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "passbaton-hook-pre-compact" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "passbaton-hook-session-end" }] }]
   }
 }
 ```
 
-**Note (v1.5.0+):** Full lifecycle coverage with 5 hooks. Uses `npm exec --` which finds local `node_modules/.bin` first.
+**Note (v2.2.1+):** Full lifecycle coverage with 5 hooks. The installer probes whether `passbaton-hook-*` resolves on PATH and writes the bare name if so (≈10× faster per fire); otherwise it writes `npm exec -- …`, which also finds a local `node_modules/.bin`.
 
 ### Installed Hooks (v1.5.0+)
 
@@ -508,7 +508,7 @@ Previous versions used absolute paths or `npx`:
 
 Now we use `npm exec --`:
 ```json
-"command": "npm exec -- passbaton-hook-session-start"
+"command": "passbaton-hook-session-start"
 ```
 
 **`npm exec --` finds local `node_modules/.bin` first**, then falls back to global. Works with both local and global installation without hitting npm registry.
