@@ -907,6 +907,70 @@ async function main() {
       unobserved: 'shell-driven edits (Bash/PowerShell) and generated output are not observed',
     };
 
+
+
+    if (sessionId) {
+      try {
+        // ★ 「행이 0개」와 「테이블이 없다」를 반드시 구분한다.
+        //   행 0개 = 이 턴에 아무것도 안 고쳤다 → **빈 목록이 정답**이다.
+        //   테이블 없음 = 이 호스트/DB 가 아직 턴 추적을 안 한다 → 폴백해야 한다.
+        //   이걸 뭉개고 「비었으면 폴백」으로 두면, 아무것도 안 고친 턴이 옆
+        //   세션의 파일 목록을 빌려온다 — 고치려던 그 증상 그대로다.
+        const hasTable = db.prepare(`
+          SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_files'
+        `).get() as { 1: number } | undefined;
+
+        if (hasTable) {
+          const rows = db.prepare(`
+            SELECT file_path FROM session_files
+            WHERE session_id = ? AND project = ?
+            ORDER BY updated_at DESC
+          `).all(sessionId, project) as Array<{ file_path: string }>;
+
+          modifiedFiles = rows.map(r => r.file_path);
+          filesFromSession = true;
+          coverage.source = 'turn_scoped';
+        }
+      } catch { /* 조회 실패 → 폴백 */ }
+    }
+
+    if (!filesFromSession) {
+      try {
+        const activeCtx = db.prepare('SELECT recent_files FROM active_context WHERE project = ?').get(project) as { recent_files: string } | undefined;
+        if (activeCtx?.recent_files) {
+          modifiedFiles = JSON.parse(activeCtx.recent_files);
+
+          // ⚠ 이건 이 세션의 편집이 아니다. active_context.recent_files 는
+          //   프로젝트당 한 칸이라 **누가 만졌든** 최근 것이 들어 있다. 구버전
+          //   호스트에서 아무것도 없는 것보다는 낫지만, 「이 턴의 편집」인 척하면
+          //   안 된다 — 그게 처음부터 고치려던 증상이다.
+          coverage.source = 'project_snapshot';
+          coverage.attribution = 'unknown — this is the project-wide snapshot, not this session';
+
+          if (modifiedFiles.length > 0) {
+            console.log(`[SessionEnd] modified_files is DEGRADED for ${project}: `
+              + `no turn-scoped record, using the project-wide snapshot `
+              + `(${modifiedFiles.length} path(s), attribution unknown)`);
+          }
+        }
+      } catch { /* active_context may not exist */ }
+    }
+
+    // 과거에 쌓인 경로에도 같은 규칙을 적용한다 — 폴백 경로로 들어온 목록에는
+    // 필터가 배포되기 전의 스크래치패드 항목이 그대로 남아 있다.
+    //
+    // 버린 개수를 찍는다. 이 규칙의 근거는 커버리지 실측이지 정밀도가 아니므로,
+    // 오탐이 생겼을 때 조용히 사라지지 않아야 한다.
+    {
+      const part = partitionTrackedPaths(modifiedFiles);
+      modifiedFiles = part.kept;
+      if (part.excluded.length > 0) {
+        coverage.excluded = part.excluded.length;
+        console.log(`[SessionEnd] ${part.excluded.length} path(s) excluded from tracking `
+          + `(e.g. ${displayName(part.excluded[0])})`);
+      }
+    }
+
     /**
      * 워킹트리에서 본 「이 턴에 쓰인 파일」.
      *
@@ -983,9 +1047,16 @@ async function main() {
           results.push(writesSince(r, turn.started_at_ms, baselines.get(r) ?? null));
         }
 
-        const advance = db.prepare(
-          'UPDATE session_roots SET head_baseline = ? WHERE session_id = ? AND project = ? AND root = ?'
-        );
+        // ★ 이 턴에 처음 해석된 루트도 **저장한다.** 안 그러면 그 레포는 매 턴
+        //   HEAD 기준선이 없어 **커밋이 영원히 안 보인다** — 편집 파일로만 발견되는
+        //   레포(모노레포 밖의 형제 레포 등)가 정확히 그 경우다. 실측으로 잡혔다.
+        //   Stop 에서 처음 등록된 루트는 과거 기준선이 없으므로, 지금 HEAD 를
+        //   기준선으로 삼아 **다음 턴부터** 보이게 한다.
+        const advance = db.prepare(`
+          INSERT INTO session_roots (session_id, project, root, head_baseline)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(session_id, project, root) DO UPDATE SET head_baseline = excluded.head_baseline
+        `);
 
         for (const r of results) {
           if (r.status === 'checked' || r.status === 'truncated') {
@@ -999,7 +1070,7 @@ async function main() {
             if (r.status === 'truncated') uncovered.push(`${path.basename(r.root)}: truncated`);
             if (!r.headBaseline) uncovered.push(`${path.basename(r.root)}: no HEAD baseline (commits invisible)`);
             // 다음 턴이 이 턴의 커밋을 다시 세지 않도록 기준선을 옮긴다.
-            try { advance.run(r.head ?? null, sessionId, project, r.root); } catch { /* noop */ }
+            try { advance.run(sessionId, project, r.root, r.head ?? null); } catch { /* noop */ }
           } else {
             uncovered.push(`${path.basename(r.root)}: ${r.status}`);
           }
@@ -1046,69 +1117,6 @@ async function main() {
         roots: 0, checked: 0, elapsedMs: 0,
         uncovered: [`lookup failed: ${(e as Error).message.slice(0, 80)}`],
       };
-    }
-
-
-    if (sessionId) {
-      try {
-        // ★ 「행이 0개」와 「테이블이 없다」를 반드시 구분한다.
-        //   행 0개 = 이 턴에 아무것도 안 고쳤다 → **빈 목록이 정답**이다.
-        //   테이블 없음 = 이 호스트/DB 가 아직 턴 추적을 안 한다 → 폴백해야 한다.
-        //   이걸 뭉개고 「비었으면 폴백」으로 두면, 아무것도 안 고친 턴이 옆
-        //   세션의 파일 목록을 빌려온다 — 고치려던 그 증상 그대로다.
-        const hasTable = db.prepare(`
-          SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_files'
-        `).get() as { 1: number } | undefined;
-
-        if (hasTable) {
-          const rows = db.prepare(`
-            SELECT file_path FROM session_files
-            WHERE session_id = ? AND project = ?
-            ORDER BY updated_at DESC
-          `).all(sessionId, project) as Array<{ file_path: string }>;
-
-          modifiedFiles = rows.map(r => r.file_path);
-          filesFromSession = true;
-          coverage.source = 'turn_scoped';
-        }
-      } catch { /* 조회 실패 → 폴백 */ }
-    }
-
-    if (!filesFromSession) {
-      try {
-        const activeCtx = db.prepare('SELECT recent_files FROM active_context WHERE project = ?').get(project) as { recent_files: string } | undefined;
-        if (activeCtx?.recent_files) {
-          modifiedFiles = JSON.parse(activeCtx.recent_files);
-
-          // ⚠ 이건 이 세션의 편집이 아니다. active_context.recent_files 는
-          //   프로젝트당 한 칸이라 **누가 만졌든** 최근 것이 들어 있다. 구버전
-          //   호스트에서 아무것도 없는 것보다는 낫지만, 「이 턴의 편집」인 척하면
-          //   안 된다 — 그게 처음부터 고치려던 증상이다.
-          coverage.source = 'project_snapshot';
-          coverage.attribution = 'unknown — this is the project-wide snapshot, not this session';
-
-          if (modifiedFiles.length > 0) {
-            console.log(`[SessionEnd] modified_files is DEGRADED for ${project}: `
-              + `no turn-scoped record, using the project-wide snapshot `
-              + `(${modifiedFiles.length} path(s), attribution unknown)`);
-          }
-        }
-      } catch { /* active_context may not exist */ }
-    }
-
-    // 과거에 쌓인 경로에도 같은 규칙을 적용한다 — 폴백 경로로 들어온 목록에는
-    // 필터가 배포되기 전의 스크래치패드 항목이 그대로 남아 있다.
-    //
-    // 버린 개수를 찍는다. 이 규칙의 근거는 커버리지 실측이지 정밀도가 아니므로,
-    // 오탐이 생겼을 때 조용히 사라지지 않아야 한다.
-    {
-      const part = partitionTrackedPaths(modifiedFiles);
-      modifiedFiles = part.kept;
-      if (part.excluded.length > 0) {
-        coverage.excluded = part.excluded.length;
-        console.log(`[SessionEnd] ${part.excluded.length} path(s) excluded from tracking `
-          + `(e.g. ${displayName(part.excluded[0])})`);
-      }
     }
 
     // last_work 최종 폴백: 파일 목록 기반

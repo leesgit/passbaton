@@ -232,6 +232,33 @@ describe.skipIf(!built || !gitOk)('workspace_writes — 셸이 고친 파일', (
       expect(groups.flatMap(g => g.committed ?? [])).toEqual([]);
     });
 
+    // ★ 실측으로 잡힌 결함(2026-09-08). Stop 이 편집 파일에서 루트를 해석해 그 턴에는
+    //   쓰면서 **저장하지 않아**, 그 레포는 매 턴 HEAD 기준선이 없어 커밋이 영원히
+    //   안 보였다. 모노레포 밖의 형제 레포가 정확히 그 경우다.
+    it('Stop 에서 처음 해석된 루트도 저장돼 다음 턴부터 커밋이 보인다', () => {
+      const ws = gitWorkspace();
+      const sibling = gitWorkspace();          // 등록되지 않은 별개 워킹트리
+
+      startTurn(ws, 's1', 'p1');
+      // 형제 레포의 파일을 Edit 로 만진 것처럼 session_files 에 넣는다
+      const db = new Database(path.join(ws, '.claude', 'sessions.db'));
+      db.prepare(`INSERT INTO session_files (session_id, project, file_path) VALUES (?, ?, ?)`)
+        .run('s1', path.basename(ws), path.join(sibling, 'tracked.txt'));
+      db.close();
+      fs.writeFileSync(path.join(sibling, 'tracked.txt'), 'edited in the sibling repo\n');
+
+      stopTurn(ws, 's1', 'p1', '형제 레포를 처음 건드렸다');
+
+      const after = new Database(path.join(ws, '.claude', 'sessions.db'), { readonly: true });
+      const roots = (after.prepare('SELECT root, head_baseline FROM session_roots').all() as
+        Array<{ root: string; head_baseline: string | null }>);
+      after.close();
+
+      const sib = roots.find(r => r.root === sibling);
+      expect(sib).toBeDefined();                    // ★ 저장됐다
+      expect(sib!.head_baseline).toBeTruthy();      // ★ 다음 턴의 커밋 기준선이 생겼다
+    });
+
     it('HEAD 기준선이 없으면 커밋이 안 보인다고 적는다', () => {
       const ws = gitWorkspace();
       // startTurn 없이 루트만 등록되게 만들 수는 없으므로, 기준선만 지운다
