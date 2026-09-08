@@ -9,11 +9,60 @@ import Database from 'better-sqlite3';
 import { logHookError, emitContext } from '../utils/logger.js';
 import { tokenizeQuery } from '../utils/tokenize.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
+import { migrateSchema } from '../db/migrate.js';
+import { findWorktreeRoot, MAX_ROOTS } from '../utils/worktree.js';
 
 interface PromptInput {
   prompt?: string;
   cwd?: string;
   transcript_path?: string;
+  session_id?: string;
+  prompt_id?: string;
+  turn_id?: string;
+}
+
+/**
+ * 턴이 시작한 시각을 적고, 이 프롬프트가 도는 워킹트리를 등록한다.
+ *
+ * ★ 여기가 턴 경계다. Stop 끼리의 간격을 쓰면 **턴 사이 유휴 시간에 일어난 변경**이
+ * 섞인다 — 사용자가 에디터에서 저장하거나 다른 세션이 건드린 것까지 「이 턴의
+ * 작업」이 된다.
+ *
+ * ★ 비용은 거의 없다. 여기서는 시각 하나와 `git rev-parse` 한 번뿐이고,
+ * 실제 조회(`git status`)는 Stop 에서만 한다.
+ */
+function markTurnStart(dbPath: string, project: string, input: PromptInput, cwd: string): void {
+  const sessionId = input.session_id;
+  if (!sessionId || !fs.existsSync(dbPath)) return;
+
+  try {
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    migrateSchema(db);
+
+    db.prepare(`
+      INSERT INTO session_turns (session_id, project, started_at_ms, prompt_id)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id, project)
+      DO UPDATE SET started_at_ms = excluded.started_at_ms, prompt_id = excluded.prompt_id
+    `).run(sessionId, project, Date.now(), input.prompt_id || input.turn_id || null);
+
+    // 이 프롬프트가 도는 워킹트리를 등록한다. 다른 루트(중첩 레포·워크트리)는
+    // 그곳에서 실제로 작업이 일어날 때 PostToolUse 가 등록한다.
+    const root = findWorktreeRoot(cwd);
+    if (root) {
+      const n = db.prepare('SELECT COUNT(*) c FROM session_roots WHERE session_id = ? AND project = ?')
+        .get(sessionId, project) as { c: number };
+      if (n.c < MAX_ROOTS) {
+        db.prepare(`
+          INSERT INTO session_roots (session_id, project, root) VALUES (?, ?, ?)
+          ON CONFLICT(session_id, project, root) DO NOTHING
+        `).run(sessionId, project, root);
+      }
+    }
+
+    db.close();
+  } catch { /* 이 훅은 컨텍스트 주입이 본업이다. 여기서 죽으면 안 된다 */ }
 }
 
 function getProject(cwd: string, workspaceRoot: string): string | null {
@@ -432,6 +481,8 @@ async function main() {
     }
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
+
+    markTurnStart(dbPath, project, input, cwd);
 
     // 사용자 프롬프트에서 지시사항 추출 (DB 저장, 출력 0 토큰)
     if (input.prompt) {

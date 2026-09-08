@@ -282,21 +282,6 @@ export function initDatabase() {
     );
     CREATE INDEX IF NOT EXISTS idx_hot_paths_project ON hot_paths(project);
 
-    -- ===== 턴 단위 편집 파일 =====
-    -- active_context.recent_files 는 **프로젝트 하나당 하나**여서, 같은 프로젝트에
-    -- 동시에 붙은 세션들이 서로의 편집을 덮어썼다. 그 결과 sessions.modified_files
-    -- 는 「이 턴에 무엇을 고쳤는가」가 아니라 「이 프로젝트에서 최근 누가 뭘
-    -- 만졌는가」의 스냅샷이었고, 같은 payload 가 여러 행에 그대로 복제됐다.
-    -- session_id 로 갈라 두면 각 턴이 자기 것만 가져가고, 가져간 행은 지운다.
-    CREATE TABLE IF NOT EXISTS session_files (
-      session_id TEXT NOT NULL,
-      project TEXT NOT NULL,
-      file_path TEXT NOT NULL,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      prompt_id TEXT,
-      PRIMARY KEY (session_id, project, file_path)
-    );
-    CREATE INDEX IF NOT EXISTS idx_session_files_lookup ON session_files(session_id, project);
   `);
 
   migrateSchema(db);

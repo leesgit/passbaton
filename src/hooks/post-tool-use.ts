@@ -352,17 +352,7 @@ async function main() {
       //   (훅 페이로드에 이 키가 실제로 오는지는 배포 후 실물로 확인한다.)
       if (input.session_id) {
         try {
-          db.exec(`
-            CREATE TABLE IF NOT EXISTS session_files (
-              session_id TEXT NOT NULL,
-              project TEXT NOT NULL,
-              file_path TEXT NOT NULL,
-              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-              prompt_id TEXT,
-              PRIMARY KEY (session_id, project, file_path)
-            )
-          `);
-          // 먼저 만들어진 DB 에는 컬럼이 없다. 보강의 정본은 db/migrate.ts 하나다.
+          // 테이블 생성과 컬럼 보강의 정본은 db/migrate.ts 하나다.
           migrateSchema(db);
 
           const turnId = input.prompt_id || input.turn_id || null;
@@ -377,6 +367,14 @@ async function main() {
           // 회수되지 못한 찌꺼기 청소 — session-end 가 한 번도 안 뜬 세션이
           // 남긴 행이 영구히 쌓이는 것을 막는다.
           db.prepare(`DELETE FROM session_files WHERE updated_at < datetime('now', '-2 days')`).run();
+          db.prepare(`DELETE FROM session_roots WHERE first_seen < datetime('now', '-2 days')`).run();
+
+          // ⛔ 여기서 워킹트리를 해석하지 않는다. 편집마다 `git rev-parse` 를 띄우면
+          //   비용이 편집 수에 비례하고, **DB 핸들을 연 채 spawnSync 를 하는 것이
+          //   실제로 불안정했다** — 이 훅을 반복 실행하는 e2e 에서 종료 시
+          //   세그폴트가 5회 중 4회 났고, 이 호출을 빼자 5회 중 0회가 됐다.
+          //   경로는 아래 session_files 에 이미 남으므로, 루트 해석은 Stop 에서
+          //   턴당 한 번만 한다.
         } catch {
           // 테이블 생성 실패(권한·구버전 DB) 시 무시 — 폴백이 있다
         }

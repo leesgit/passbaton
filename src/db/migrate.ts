@@ -30,12 +30,59 @@ const COLUMNS: Record<string, Record<string, string>> = {
   // user_intent: 요청은 결과가 아니므로 last_work 에 섞지 않고 여기 따로 둔다.
   // file_coverage: modified_files 가 **무엇을 봤고 무엇을 못 봤는지**. 목록만으로는
   // 「비어 있음」이 「안 고쳤다」인지 「안 봤다」인지 구분되지 않는다.
-  sessions: { session_id: 'TEXT', prompt_id: 'TEXT', user_intent: 'TEXT', file_coverage: 'TEXT' },
+  // workspace_writes: 워킹트리에서 관측한 「이 턴에 쓰인 파일」. modified_files
+  // (Edit/Write 로 직접 관측)와 **합치지 않는다** — 근거의 종류가 다르다.
+  sessions: {
+    session_id: 'TEXT', prompt_id: 'TEXT', user_intent: 'TEXT',
+    file_coverage: 'TEXT', workspace_writes: 'TEXT',
+  },
   session_files: { prompt_id: 'TEXT' },
 };
 
+/**
+ * passbaton 이 스스로 소유하는 테이블. **여기가 유일한 정의다.**
+ *
+ * `sessions` 같은 옛 테이블은 여기 넣지 않는다 — 그것들은 이미 index.ts 와
+ * database.ts 에 정의가 있고, 여기서 또 만들면 정의가 하나 더 늘 뿐이다.
+ * 아래 둘은 2026-09-08 에 새로 생긴 것이라 처음부터 한 곳에서만 만든다.
+ */
+const TABLES: string[] = [
+  // 턴 단위 편집 파일. active_context.recent_files 는 프로젝트당 한 칸이라
+  // 동시에 붙은 세션들이 서로를 덮었다.
+  `CREATE TABLE IF NOT EXISTS session_files (
+     session_id TEXT NOT NULL,
+     project TEXT NOT NULL,
+     file_path TEXT NOT NULL,
+     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+     prompt_id TEXT,
+     PRIMARY KEY (session_id, project, file_path)
+   )`,
+
+  // 턴 경계. 「이 턴에 쓰였는가」를 mtime 으로 판정하려면 턴이 언제 시작했는지가
+  // 있어야 한다. UserPromptSubmit 이 적고 Stop 이 읽는다.
+  `CREATE TABLE IF NOT EXISTS session_turns (
+     session_id TEXT NOT NULL,
+     project TEXT NOT NULL,
+     started_at_ms INTEGER NOT NULL,
+     prompt_id TEXT,
+     PRIMARY KEY (session_id, project)
+   )`,
+
+  // 어떤 워킹트리를 볼 것인가. ⛔ 매 턴 재귀 탐색으로 **발견**하지 않는다 —
+  // 모노레포 아래 중첩 레포와 %TEMP% 워크트리까지 훑는 것은 숨은 비용 폭탄이다.
+  // 작업이 그곳에서 시작될 때 **등록**한다.
+  `CREATE TABLE IF NOT EXISTS session_roots (
+     session_id TEXT NOT NULL,
+     project TEXT NOT NULL,
+     root TEXT NOT NULL,
+     first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (session_id, project, root)
+   )`,
+];
+
 const INDEXES = [
   'CREATE INDEX IF NOT EXISTS idx_sessions_turn ON sessions(project, session_id, prompt_id)',
+  'CREATE INDEX IF NOT EXISTS idx_session_files_lookup ON session_files(session_id, project)',
 ];
 
 /**
@@ -48,6 +95,14 @@ const INDEXES = [
  * 여기서 만들면 정의가 다섯 벌이 된다.
  */
 export function migrateSchema(db: MinimalDb): void {
+  for (const sql of TABLES) {
+    try {
+      db.exec(sql);
+    } catch {
+      // 권한·잠금 — 호출부는 이 테이블 없이도 동작해야 한다
+    }
+  }
+
   for (const [table, columns] of Object.entries(COLUMNS)) {
     let existing: string[];
 

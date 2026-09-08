@@ -20,6 +20,7 @@ import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
+import { writesSince, findWorktreeRoot, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
 
 /**
  * 결과를 뽑지 못했을 때 last_work 에 적는 값.
@@ -857,6 +858,8 @@ async function main() {
     //
     // ★ session_id 가 없으면 예전 스냅샷으로 떨어진다. 훅 페이로드에 그 키가
     // 온다는 것은 선언일 뿐이므로, 없더라도 동작이 후퇴하지 않아야 한다.
+    const sessionId = input.session_id || null;
+
     let modifiedFiles: string[] = [];
     let filesFromSession = false;
 
@@ -887,13 +890,106 @@ async function main() {
       unobserved: string;
       excluded?: number;
       attribution?: string;
+      workspace?: {
+        boundary: 'turn_start' | 'none';
+        roots: number;
+        checked: number;
+        elapsedMs: number;
+        uncovered: string[];
+      };
     } = {
       source: 'none',
       observedVia: 'edit_write_hook',
       unobserved: 'shell-driven edits (Bash/PowerShell) and generated output are not observed',
     };
 
-    const sessionId = input.session_id || null;
+    /**
+     * 워킹트리에서 본 「이 턴에 쓰인 파일」.
+     *
+     * ⛔ **modified_files 와 합치지 않는다.** 근거의 종류가 다르다 —
+     * modified_files 는 Edit/Write 로 직접 관측한 사건이고, 이쪽은 시간 창 안에
+     * mtime 이 움직였다는 관측이다. 저작자를 모르고, git 이 무시하는 산출물은
+     * 안 보이고, 썼다가 되돌린 파일도 안 보인다. 신뢰도 점수를 붙여 한 목록으로
+     * 합치면 소비자는 결국 단서를 떼고 사실로 쓴다. (2026-09-08 Astra 리뷰)
+     */
+    let workspaceWrites: { root: string; written: string[]; status: string }[] = [];
+
+    try {
+      const turn = db.prepare('SELECT started_at_ms FROM session_turns WHERE session_id = ? AND project = ?')
+        .get(sessionId, project) as { started_at_ms: number } | undefined;
+
+      // 루트 = UserPromptSubmit 이 등록한 것(이 프롬프트의 cwd) + 이 턴에 편집된
+      // 파일들이 사는 워킹트리. 후자를 **여기서** 해석하는 이유는 둘이다:
+      //   • 편집마다 `git rev-parse` 를 띄우면 비용이 편집 수에 비례한다
+      //   • 디렉터리 단위로 중복을 걷어내면 턴당 한두 번이면 끝난다
+      // ⛔ 루트에서 재귀 탐색으로 **발견**하지는 않는다. 모노레포 아래 중첩
+      //   레포(별도 원격을 가진 apps/kenshi-fantasy)와 %TEMP% 워크트리까지 훑는 것은
+      //   숨은 비용 폭탄이다. 작업이 그곳에서 일어났다는 신호가 있을 때만 본다.
+      const roots: string[] = [];
+
+      if (sessionId) {
+        for (const r of db.prepare(
+          'SELECT root FROM session_roots WHERE session_id = ? AND project = ? ORDER BY first_seen LIMIT ?'
+        ).all(sessionId, project, MAX_ROOTS) as Array<{ root: string }>) {
+          if (!roots.includes(r.root)) roots.push(r.root);
+        }
+
+        const seenDirs = new Set<string>();
+        for (const f of modifiedFiles) {
+          if (roots.length >= MAX_ROOTS) break;
+          const dir = path.dirname(f);
+          if (seenDirs.has(dir)) continue;
+          seenDirs.add(dir);
+          const wt = findWorktreeRoot(dir);
+          if (wt && !roots.includes(wt)) roots.push(wt);
+        }
+      }
+
+      if (!turn) {
+        // ★ 기준선이 없으면 델타를 **만들어내지 않는다.** 「검사 안 함」이지
+        //   「변경 없음」이 아니다. UserPromptSubmit 이 안 돌았거나 이 세션의
+        //   첫 턴이다.
+        coverage.workspace = {
+          boundary: 'none', roots: roots.length, checked: 0, elapsedMs: 0,
+          uncovered: roots.length > 0 ? ['no turn-start baseline'] : [],
+        };
+      } else if (roots.length > 0) {
+        const started = Date.now();
+        const results: RootWrites[] = roots.map(r => writesSince(r, turn.started_at_ms));
+        const uncovered: string[] = [];
+
+        for (const r of results) {
+          if (r.status === 'checked' || r.status === 'truncated') {
+            if (r.written.length > 0) {
+              workspaceWrites.push({ root: r.root, written: r.written, status: r.status });
+            }
+            if (r.status === 'truncated') uncovered.push(`${path.basename(r.root)}: truncated`);
+          } else {
+            uncovered.push(`${path.basename(r.root)}: ${r.status}`);
+          }
+        }
+
+        coverage.workspace = {
+          boundary: 'turn_start',
+          roots: roots.length,
+          checked: results.filter(r => r.status === 'checked' || r.status === 'truncated').length,
+          elapsedMs: Date.now() - started,
+          uncovered,
+        };
+      } else {
+        // 경계는 있는데 볼 워킹트리가 없다. 「변경 없음」이 아니라 「볼 곳이 없음」이다.
+        coverage.workspace = {
+          boundary: 'turn_start', roots: 0, checked: 0, elapsedMs: 0,
+          uncovered: ['no registered worktree (not a git repository?)'],
+        };
+      }
+    } catch (e) {
+      coverage.workspace = {
+        boundary: 'none', roots: 0, checked: 0, elapsedMs: 0,
+        uncovered: [`lookup failed: ${(e as Error).message.slice(0, 80)}`],
+      };
+    }
+
 
     if (sessionId) {
       try {
@@ -999,7 +1095,7 @@ async function main() {
       migrateSchema(db);
       const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
         .map(c => c.name);
-      hasTurnColumns = ['session_id', 'prompt_id', 'user_intent', 'file_coverage']
+      hasTurnColumns = ['session_id', 'prompt_id', 'user_intent', 'file_coverage', 'workspace_writes']
         .every(c => cols.includes(c));
     } catch { /* 보강 실패 → 구스키마로 동작 */ }
 
@@ -1138,7 +1234,7 @@ async function main() {
     //   • 커버리지는 **둘 다와 무관하다** — 무엇을 봤는지는 언제나 적을 수 있다
     const insertCols = ['project', 'last_work', 'next_tasks', 'modified_files', 'issues'];
     if (hasTurnColumns) {
-      insertCols.push('session_id', 'prompt_id', 'user_intent', 'file_coverage');
+      insertCols.push('session_id', 'prompt_id', 'user_intent', 'file_coverage', 'workspace_writes');
     }
 
     const dedupWhere = turnId && hasTurnColumns
@@ -1180,7 +1276,8 @@ async function main() {
       }
 
       const values = hasTurnColumns
-        ? [...common, sessionId, turnId, userIntent, JSON.stringify(coverage)]
+        ? [...common, sessionId, turnId, userIntent, JSON.stringify(coverage),
+           workspaceWrites.length > 0 ? JSON.stringify(workspaceWrites) : null]
         : common;
 
       const dedupArgs = turnId && hasTurnColumns
@@ -1191,6 +1288,14 @@ async function main() {
 
       // 회수 — 행이 실제로 들어갔을 때만, 그리고 **실은 경로들만** 지운다.
       // 15개 상한에 잘려 나간 나머지는 남겨 다음 행에 실리게 한다.
+      if (res.changes > 0 && sessionId) {
+        try {
+          db.prepare(`
+            UPDATE session_turns SET started_at_ms = ? WHERE session_id = ? AND project = ?
+          `).run(Date.now(), sessionId, project);
+        } catch { /* 테이블 없음 — 다음 UserPromptSubmit 이 만든다 */ }
+      }
+
       if (res.changes > 0 && sessionId && filesFromSession && shipped.length > 0) {
         const del = db.prepare(
           'DELETE FROM session_files WHERE session_id = ? AND project = ? AND file_path = ?'

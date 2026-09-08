@@ -44,6 +44,21 @@ const IGNORED_DIRS = new Set([
 
 const IGNORED_FILES = new Set(['.DS_Store', 'Thumbs.db']);
 
+/**
+ * passbaton 자신이 만드는 파일.
+ *
+ * ★ 이걸 빼지 않으면 **매 턴 자기 DB 를 「이 턴에 쓰인 파일」로 보고한다.**
+ * Stop 이 sessions.db 에 쓰고, 같은 Stop 이 워킹트리를 보면 방금 자기가 쓴 것이
+ * 거기 있다. 워킹트리 관측을 붙이자마자 e2e 에서 드러났다(2026-09-08).
+ *
+ * ⛔ `.claude` 디렉터리를 통째로 빼지는 않는다 — 그 아래 `commands/*.md` 나
+ * `passbaton.config.json` 은 사람이 고치는 진짜 작업이다. 이름을 짚어서 뺀다.
+ */
+const TOOL_ARTIFACTS = new Set([
+  'sessions.db', 'sessions.db-wal', 'sessions.db-shm',
+  'session-end-debug.log', 'pre-compact-debug.log', 'hook-errors.log', 'hook-trace.log',
+]);
+
 /** 경로를 슬래시 형태로 통일한다. 비교는 전부 이 형태에서 한다. */
 export function normalizePath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
@@ -78,7 +93,13 @@ export function ignoredReason(filePath: string): string | null {
   if (dir !== undefined) return dir;
 
   const base = segments[segments.length - 1];
-  return base !== undefined && IGNORED_FILES.has(base) ? base : null;
+  if (base === undefined) return null;
+
+  if (IGNORED_FILES.has(base)) return base;
+  if (TOOL_ARTIFACTS.has(base)) return 'passbaton_artifact';
+  if (/^\.session-end-.*\.lock$/.test(base)) return 'passbaton_artifact';
+
+  return null;
 }
 
 /** 근거가 커버리지 실측뿐이라 오탐이 보여야 하는 규칙. */
