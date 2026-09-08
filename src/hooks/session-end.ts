@@ -20,7 +20,8 @@ import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
-import { writesSince, findWorktreeRoot, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
+import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
+import { readWorkspaceDeclaration, scanArtifacts } from '../utils/workspace-config.js';
 
 /**
  * 결과를 뽑지 못했을 때 last_work 에 적는 값.
@@ -892,10 +893,13 @@ async function main() {
       attribution?: string;
       workspace?: {
         boundary: 'turn_start' | 'none';
+        /** ⛔ 「등록된 루트만」이다. uncovered 가 놓친 것 전부를 열거하지 않는다. */
+        scope: 'registered roots only';
         roots: number;
         checked: number;
         elapsedMs: number;
         uncovered: string[];
+        artifacts?: { patterns: number; matched: number; problems: string[] };
       };
     } = {
       source: 'none',
@@ -912,7 +916,9 @@ async function main() {
      * 안 보이고, 썼다가 되돌린 파일도 안 보인다. 신뢰도 점수를 붙여 한 목록으로
      * 합치면 소비자는 결국 단서를 떼고 사실로 쓴다. (2026-09-08 Astra 리뷰)
      */
-    let workspaceWrites: { root: string; written: string[]; status: string }[] = [];
+    let workspaceWrites: {
+      root: string; written: string[]; committed?: string[]; status: string;
+    }[] = [];
 
     try {
       const turn = db.prepare('SELECT started_at_ms FROM session_turns WHERE session_id = ? AND project = ?')
@@ -950,42 +956,94 @@ async function main() {
         //   「변경 없음」이 아니다. UserPromptSubmit 이 안 돌았거나 이 세션의
         //   첫 턴이다.
         coverage.workspace = {
-          boundary: 'none', roots: roots.length, checked: 0, elapsedMs: 0,
+          boundary: 'none', scope: 'registered roots only',
+          roots: roots.length, checked: 0, elapsedMs: 0,
           uncovered: roots.length > 0 ? ['no turn-start baseline'] : [],
         };
       } else if (roots.length > 0) {
         const started = Date.now();
-        const results: RootWrites[] = roots.map(r => writesSince(r, turn.started_at_ms));
         const uncovered: string[] = [];
+        const results: RootWrites[] = [];
+
+        // ★ 훅 전체 데드라인. 루트당 5초 × 8루트 = 40초를 그냥 기다릴 수는 없다.
+        //   경로 상한은 git 이 **끝난 뒤에** 적용되므로 git 의 열거 비용을 못 막는다.
+        const DEADLINE_MS = 3000;
+
+        const baselines = new Map(
+          (db.prepare('SELECT root, head_baseline FROM session_roots WHERE session_id = ? AND project = ?')
+            .all(sessionId, project) as Array<{ root: string; head_baseline: string | null }>)
+            .map(r => [r.root, r.head_baseline])
+        );
+
+        for (const r of roots) {
+          if (Date.now() - started > DEADLINE_MS) {
+            uncovered.push(`${path.basename(r)}: skipped (hook deadline)`);
+            continue;
+          }
+          results.push(writesSince(r, turn.started_at_ms, baselines.get(r) ?? null));
+        }
+
+        const advance = db.prepare(
+          'UPDATE session_roots SET head_baseline = ? WHERE session_id = ? AND project = ? AND root = ?'
+        );
 
         for (const r of results) {
           if (r.status === 'checked' || r.status === 'truncated') {
-            if (r.written.length > 0) {
-              workspaceWrites.push({ root: r.root, written: r.written, status: r.status });
+            if (r.written.length > 0 || (r.committed && r.committed.length > 0)) {
+              workspaceWrites.push({
+                root: r.root, written: r.written,
+                committed: r.committed && r.committed.length > 0 ? r.committed : undefined,
+                status: r.status,
+              });
             }
             if (r.status === 'truncated') uncovered.push(`${path.basename(r.root)}: truncated`);
+            if (!r.headBaseline) uncovered.push(`${path.basename(r.root)}: no HEAD baseline (commits invisible)`);
+            // 다음 턴이 이 턴의 커밋을 다시 세지 않도록 기준선을 옮긴다.
+            try { advance.run(r.head ?? null, sessionId, project, r.root); } catch { /* noop */ }
           } else {
             uncovered.push(`${path.basename(r.root)}: ${r.status}`);
           }
         }
 
+        let artifactCoverage: { patterns: number; matched: number; problems: string[] } | undefined;
+
+        // 선언된 산출물 — git 이 무시해서 위 스캔에 절대 안 나오는 것들.
+        // ★ 커버리지를 **따로** 적는다. git 스캔 성공이 산출물 스캔 실패를 가리면 안 된다.
+        const declared = readWorkspaceDeclaration(wsRoot);
+        if (declared.artifacts.length > 0) {
+          const scan = scanArtifacts(wsRoot, declared.artifacts, turn.started_at_ms);
+          if (scan.written.length > 0) {
+            workspaceWrites.push({ root: wsRoot, written: scan.written, status: 'declared_artifacts' });
+          }
+          artifactCoverage = {
+            patterns: declared.artifacts.length,
+            matched: scan.written.length,
+            problems: scan.results.filter(r => r.outcome === 'failed' || r.outcome === 'truncated')
+              .map(r => `${r.pattern}: ${r.outcome}`),
+          };
+        }
+
         coverage.workspace = {
           boundary: 'turn_start',
+          scope: 'registered roots only',
           roots: roots.length,
           checked: results.filter(r => r.status === 'checked' || r.status === 'truncated').length,
           elapsedMs: Date.now() - started,
           uncovered,
+          artifacts: artifactCoverage,
         };
       } else {
         // 경계는 있는데 볼 워킹트리가 없다. 「변경 없음」이 아니라 「볼 곳이 없음」이다.
         coverage.workspace = {
-          boundary: 'turn_start', roots: 0, checked: 0, elapsedMs: 0,
+          boundary: 'turn_start', scope: 'registered roots only',
+          roots: 0, checked: 0, elapsedMs: 0,
           uncovered: ['no registered worktree (not a git repository?)'],
         };
       }
     } catch (e) {
       coverage.workspace = {
-        boundary: 'none', roots: 0, checked: 0, elapsedMs: 0,
+        boundary: 'none', scope: 'registered roots only',
+        roots: 0, checked: 0, elapsedMs: 0,
         uncovered: [`lookup failed: ${(e as Error).message.slice(0, 80)}`],
       };
     }

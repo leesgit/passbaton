@@ -37,6 +37,7 @@ const COLUMNS: Record<string, Record<string, string>> = {
     file_coverage: 'TEXT', workspace_writes: 'TEXT',
   },
   session_files: { prompt_id: 'TEXT' },
+  session_roots: { head_baseline: 'TEXT' },
 };
 
 /**
@@ -76,6 +77,7 @@ const TABLES: string[] = [
      project TEXT NOT NULL,
      root TEXT NOT NULL,
      first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+     head_baseline TEXT,
      PRIMARY KEY (session_id, project, root)
    )`,
 ];

@@ -108,9 +108,120 @@ function loadContext(dbPath: string, project: string, source?: string): string |
       }
     }
 
+
+/**
+ * 한 세션 기록의 파일 증거를 렌더링한다.
+ *
+ * ★ 두 집합을 **합치지 않고 근거를 표시한다.** 겹침은 「같은 경로에 대한 관측이
+ * 둘」이라는 뜻이지 「내가 고쳤다」가 아니다 — Edit/Write 호출 이후에 다른 쪽이
+ * 덮어썼을 수도 있다. 차집합도 「도구를 안 거쳤다」를 정확히 뜻하지는 않는다:
+ * 수집 실패·미지원 편집 도구·경로 불일치·턴 귀속 오류도 같은 차이를 만든다.
+ *
+ *   [E,M]  Edit/Write 관측 + 파일시스템 표본
+ *   [M]    파일시스템 표본만  ← 이 기능이 존재하는 이유. 절대 잘라내지 않는다
+ *   [E]    도구 관측만        ← 커밋·되돌림·삭제로 표본에 안 잡힌 것들
+ *
+ * ★ 아무것도 없을 때 「변경 없음」이라고 쓰지 않는다. 「검사한 범위에서 해당
+ * 관측 없음」이다. 둘은 다른 말이다.
+ */
+function renderFileEvidence(row: {
+  modified_files?: string | null;
+  workspace_writes?: string | null;
+  file_coverage?: string | null;
+}, maxPaths: number): string[] {
+  const parse = <T>(raw: string | null | undefined, fallback: T): T => {
+    if (!raw) return fallback;
+    try { return JSON.parse(raw) as T; } catch { return fallback; }
+  };
+
+  const edited = parse<string[]>(row.modified_files, []);
+  const groups = parse<Array<{ root: string; written: string[]; committed?: string[] }>>(row.workspace_writes, []);
+  const coverage = parse<{ workspace?: { boundary?: string; scope?: string; roots?: number; checked?: number; uncovered?: string[] } } | null>(row.file_coverage, null);
+
+  const key = (p: string) => p.split(String.fromCharCode(92)).join('/').toLowerCase();
+  const sampled = new Set<string>();
+  for (const g of groups) {
+    for (const p of g.written) sampled.add(key(p));
+    for (const p of g.committed ?? []) sampled.add(key(p));
+  }
+  const editedKeys = new Set(edited.map(key));
+
+  // (경로, 마커) — 루트별로 묶어 내되, 경로는 한 번만 낸다.
+  const byRoot = new Map<string, Array<{ p: string; mark: string }>>();
+  const push = (root: string, p: string, mark: string) => {
+    const list = byRoot.get(root) ?? [];
+    if (!list.some(e => key(e.p) === key(p))) list.push({ p, mark });
+    byRoot.set(root, list);
+  };
+
+  for (const g of groups) {
+    for (const p of [...g.written, ...(g.committed ?? [])]) {
+      push(g.root, p, editedKeys.has(key(p)) ? 'E,M' : 'M');
+    }
+  }
+  for (const p of edited) {
+    if (sampled.has(key(p))) continue;
+    const root = groups.find(g => key(p).startsWith(key(g.root) + '/'))?.root ?? '';
+    push(root, p, 'E');
+  }
+
+  const ws = coverage?.workspace;
+  const out: string[] = [];
+
+  if (byRoot.size === 0) {
+    out.push(ws
+      ? `  files: no qualifying observations within checked scope (${ws.checked ?? 0}/${ws.roots ?? 0} roots, boundary=${ws.boundary ?? '?'})`
+      : '  files: not recorded');
+    return out;
+  }
+
+  // 커버리지를 **파일 바로 앞에** 둔다. 목록의 부재와 포함을 해석하는 근거다.
+  if (ws) {
+    const bits = [`boundary=${ws.boundary ?? '?'}`, `${ws.checked ?? 0}/${ws.roots ?? 0} roots`];
+    if (ws.uncovered?.length) bits.push(`skipped: ${ws.uncovered.slice(0, 2).join('; ')}`);
+    out.push(`  coverage: ${bits.join(', ')} (${ws.scope ?? 'registered roots only'})`);
+  }
+  out.push('  files [E=edit/write, M=filesystem sample] — state and authorship unverified:');
+
+  // ★ 잘라야 하면 항목을 통째로 버린다. 경로를 반토막 내지 않는다.
+  //   그리고 M 만 있는 것을 먼저 낸다 — 그게 이 기능의 기여분이다.
+  const order = { M: 0, 'E,M': 1, E: 2 } as Record<string, number>;
+  const flat = [...byRoot.entries()].flatMap(([root, list]) =>
+    list.map(e => ({ root, ...e }))
+  ).sort((a, b) => (order[a.mark] ?? 3) - (order[b.mark] ?? 3));
+
+  const shown = flat.slice(0, maxPaths);
+  let currentRoot: string | null = null;
+
+  for (const e of shown) {
+    if (e.root !== currentRoot) {
+      currentRoot = e.root;
+      if (e.root) out.push(`  ${e.root}:`);
+    }
+    const rel = e.root && key(e.p).startsWith(key(e.root) + '/') ? e.p.slice(e.root.length + 1) : e.p;
+    out.push(`    ${rel} [${e.mark}]`);
+  }
+
+  if (flat.length > shown.length) {
+    out.push(`    … ${flat.length - shown.length} more observed path(s) not listed`);
+  }
+
+  return out;
+}
+
     // [Priority 2] 최근 3개 세션 (빈 세션 skip)
+    // 새 컬럼이 없는 구스키마 DB 에서도 돌아야 한다.
+    const sessionCols = new Set(
+      (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map(c => c.name)
+    );
+    const hasEvidence = ['user_intent', 'workspace_writes', 'file_coverage', 'modified_files']
+      .every(c => sessionCols.has(c));
+    const extraCols = hasEvidence
+      ? ', user_intent, modified_files, workspace_writes, file_coverage'
+      : '';
+
     const recentSessions = db.prepare(`
-      SELECT last_work, next_tasks, issues, timestamp FROM sessions
+      SELECT last_work, next_tasks, issues, timestamp${extraCols} FROM sessions
       WHERE project = ?
         AND last_work != 'Session ended'
         AND last_work != 'Session work completed'
@@ -119,16 +230,30 @@ function loadContext(dbPath: string, project: string, source?: string): string |
         AND length(last_work) > 15
       ORDER BY timestamp DESC LIMIT 3
     `).all(project) as Array<{
-      last_work: string; next_tasks: string; issues: string; timestamp: string
+      last_work: string; next_tasks: string; issues: string; timestamp: string;
+      user_intent?: string | null; modified_files?: string | null;
+      workspace_writes?: string | null; file_coverage?: string | null;
     }>;
 
     if (recentSessions.length > 0 && tokenBudget > 100) {
       const sessionLines: string[] = ['## Recent Sessions'];
-      for (const session of recentSessions) {
+      for (const [i, session] of recentSessions.entries()) {
         // P1-3 (2026-08-10): 60자는 문장 중간을 잘라 요약이 무의미했다(실측 최근30일 326/376 절단, AVG 121.9자).
         // 140자로 확대 — 예산 초과 시 이 블록은 통째로 skip되는 구조라 오버플로 위험 없음.
         const work = session.last_work.length > 140 ? session.last_work.slice(0, 140) + '...' : session.last_work;
         sessionLines.push(`- [${session.timestamp?.slice(0, 10) || '?'}] ${work}`);
+
+        // ★ 상세(요청 → 한 일 → 커버리지 → 파일)는 **가장 최근 한 건에만** 붙인다.
+        //   셋 다 붙이면 예산을 파일 목록이 다 먹고 정작 지시사항이 잘린다.
+        //   순서는 「무엇을 하려 했나 → 무엇을 했나 → 어디까지 봤나 → 어떤 파일」이다.
+        if (i === 0 && hasEvidence) {
+          if (session.user_intent) {
+            const intent = session.user_intent.length > 120
+              ? session.user_intent.slice(0, 120) + '...' : session.user_intent;
+            sessionLines.push(`  intent: ${intent}`);
+          }
+          sessionLines.push(...renderFileEvidence(session, 12));
+        }
 
         if (session.issues) {
           try {

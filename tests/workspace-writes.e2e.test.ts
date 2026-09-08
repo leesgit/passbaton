@@ -190,6 +190,104 @@ describe.skipIf(!built || !gitOk)('workspace_writes — 셸이 고친 파일', (
     expect(cov.workspace.checked).toBe(0);
   });
 
+  // ★ 이 셋이 3라운드에서 Astra 가 짚은 「더 큰 구멍」이다.
+  //   git status 는 HEAD 와의 차이를 보므로 **턴 안에서 커밋하면 후보가 0이 된다.**
+  //   실측(2026-09-08): 커밋 직후 관측 0건, 실제로 바뀐 파일 10개.
+  describe('커밋된 작업', () => {
+    const commitAll = (ws: string, msg: string) => {
+      spawnSync('git', ['add', '-A'], { cwd: ws, encoding: 'utf-8' });
+      spawnSync('git', ['commit', '-q', '-m', msg], { cwd: ws, encoding: 'utf-8' });
+    };
+
+    it('턴 안에서 커밋해도 잡는다', () => {
+      const ws = gitWorkspace();
+      startTurn(ws, 's1', 'p1');
+
+      fs.writeFileSync(path.join(ws, 'tracked.txt'), 'edited then committed\n');
+      fs.writeFileSync(path.join(ws, 'added.txt'), 'new then committed\n');
+      commitAll(ws, 'work done in this turn');
+
+      // 전제 확인 — 커밋 후에는 워킹트리가 깨끗하다
+      const st = spawnSync('git', ['status', '--porcelain'], { cwd: ws, encoding: 'utf-8' });
+      expect(st.stdout.trim()).toBe('');
+
+      const row = stopTurn(ws, 's1', 'p1', '커밋까지 마쳤다');
+      const groups = JSON.parse(row.workspace_writes || '[]') as Array<{ committed?: string[] }>;
+      const committed = groups.flatMap(g => g.committed ?? []);
+
+      expect(committed.some(p => p.endsWith('tracked.txt'))).toBe(true);
+      expect(committed.some(p => p.endsWith('added.txt'))).toBe(true);
+    });
+
+    it('이전 턴의 커밋을 다시 세지 않는다', () => {
+      const ws = gitWorkspace();
+      startTurn(ws, 's1', 'p1');
+      fs.writeFileSync(path.join(ws, 'tracked.txt'), 'turn one\n');
+      commitAll(ws, 'turn one');
+      stopTurn(ws, 's1', 'p1', '첫 턴에서 커밋했다');
+
+      startTurn(ws, 's1', 'p2');            // 기준선이 앞 턴의 HEAD 로 옮겨진다
+      const row = stopTurn(ws, 's1', 'p2', '두 번째 턴에서는 아무것도 안 했다');
+      const groups = JSON.parse(row.workspace_writes || '[]') as Array<{ committed?: string[] }>;
+      expect(groups.flatMap(g => g.committed ?? [])).toEqual([]);
+    });
+
+    it('HEAD 기준선이 없으면 커밋이 안 보인다고 적는다', () => {
+      const ws = gitWorkspace();
+      // startTurn 없이 루트만 등록되게 만들 수는 없으므로, 기준선만 지운다
+      startTurn(ws, 's1', 'p1');
+      const db = new Database(path.join(ws, '.claude', 'sessions.db'));
+      db.prepare('UPDATE session_roots SET head_baseline = NULL').run();
+      db.close();
+
+      fs.writeFileSync(path.join(ws, 'tracked.txt'), 'committed with no baseline\n');
+      commitAll(ws, 'no baseline');
+
+      const row = stopTurn(ws, 's1', 'p1', '기준선 없이 커밋했다');
+      const cov = JSON.parse(row.file_coverage!);
+      expect(cov.workspace.uncovered.some((u: string) => /no HEAD baseline/.test(u))).toBe(true);
+    });
+  });
+
+  describe('프로젝트 선언', () => {
+    const declare = (ws: string, workspace: unknown) => {
+      fs.writeFileSync(
+        path.join(ws, '.claude', 'passbaton.config.json'),
+        JSON.stringify({ workspace })
+      );
+    };
+
+    it('git 이 무시하는 산출물도 선언하면 본다', () => {
+      const ws = gitWorkspace();
+      fs.writeFileSync(path.join(ws, '.gitignore'), 'artifacts/\n');
+      fs.mkdirSync(path.join(ws, 'artifacts'), { recursive: true });
+      declare(ws, { artifacts: ['artifacts/*.json'] });
+
+      startTurn(ws, 's1', 'p1');
+      fs.writeFileSync(path.join(ws, 'artifacts', 'perf.json'), '{"fps":60}\n');
+      fs.writeFileSync(path.join(ws, 'artifacts', 'noise.bin'), 'x\n');   // 패턴 밖
+
+      const row = stopTurn(ws, 's1', 'p1', '산출물을 만들었다');
+      const w = written(row);
+
+      expect(w.some(p => p.endsWith('perf.json'))).toBe(true);
+      expect(w.some(p => p.endsWith('noise.bin'))).toBe(false);
+      expect(JSON.parse(row.file_coverage!).workspace.artifacts.patterns).toBe(1);
+    });
+
+    it('워크스페이스 밖을 가리키는 선언은 거부한다', () => {
+      const ws = gitWorkspace();
+      declare(ws, { roots: ['../elsewhere'], artifacts: ['../../secrets/*'] });
+
+      startTurn(ws, 's1', 'p1');
+      fs.writeFileSync(path.join(ws, 'tracked.txt'), 'x\n');
+      const row = stopTurn(ws, 's1', 'p1', '밖을 가리키는 선언');
+
+      // 선언은 무시되고 정상 관측은 계속된다
+      expect(written(row).some(p => p.endsWith('tracked.txt'))).toBe(true);
+    });
+  });
+
   it('git 워킹트리가 아니면 검사하지 않았다고 적는다', () => {
     const ws = gitWorkspace();
     fs.rmSync(path.join(ws, '.git'), { recursive: true, force: true });   // 레포가 아니게 만든다

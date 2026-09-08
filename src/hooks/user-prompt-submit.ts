@@ -10,7 +10,8 @@ import { logHookError, emitContext } from '../utils/logger.js';
 import { tokenizeQuery } from '../utils/tokenize.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { migrateSchema } from '../db/migrate.js';
-import { findWorktreeRoot, MAX_ROOTS } from '../utils/worktree.js';
+import { findWorktreeRoot, readHead, MAX_ROOTS } from '../utils/worktree.js';
+import { readWorkspaceDeclaration } from '../utils/workspace-config.js';
 
 interface PromptInput {
   prompt?: string;
@@ -31,7 +32,7 @@ interface PromptInput {
  * ★ 비용은 거의 없다. 여기서는 시각 하나와 `git rev-parse` 한 번뿐이고,
  * 실제 조회(`git status`)는 Stop 에서만 한다.
  */
-function markTurnStart(dbPath: string, project: string, input: PromptInput, cwd: string): void {
+function markTurnStart(dbPath: string, project: string, input: PromptInput, cwd: string, workspaceRoot: string): void {
   const sessionId = input.session_id;
   if (!sessionId || !fs.existsSync(dbPath)) return;
 
@@ -47,18 +48,40 @@ function markTurnStart(dbPath: string, project: string, input: PromptInput, cwd:
       DO UPDATE SET started_at_ms = excluded.started_at_ms, prompt_id = excluded.prompt_id
     `).run(sessionId, project, Date.now(), input.prompt_id || input.turn_id || null);
 
-    // 이 프롬프트가 도는 워킹트리를 등록한다. 다른 루트(중첩 레포·워크트리)는
-    // 그곳에서 실제로 작업이 일어날 때 PostToolUse 가 등록한다.
-    const root = findWorktreeRoot(cwd);
-    if (root) {
+    // 등록 우선순위: (1) 이 프롬프트의 cwd → (2) 프로젝트가 선언한 추가 루트.
+    // ⛔ 선언된 루트가 슬롯 8개를 다 먹고 실제로 작업 중인 트리를 밀어내면 안 되므로
+    //    cwd 를 **먼저** 넣는다.
+    const declared = readWorkspaceDeclaration(workspaceRoot);
+    const candidates: string[] = [];
+
+    const cwdRoot = findWorktreeRoot(cwd);
+    if (cwdRoot) candidates.push(cwdRoot);
+
+    for (const rel of declared.roots) {
+      const r = findWorktreeRoot(path.resolve(workspaceRoot, rel));
+      if (r && !candidates.includes(r)) candidates.push(r);
+    }
+
+    const insertRoot = db.prepare(`
+      INSERT INTO session_roots (session_id, project, root) VALUES (?, ?, ?)
+      ON CONFLICT(session_id, project, root) DO NOTHING
+    `);
+    for (const r of candidates) {
       const n = db.prepare('SELECT COUNT(*) c FROM session_roots WHERE session_id = ? AND project = ?')
         .get(sessionId, project) as { c: number };
-      if (n.c < MAX_ROOTS) {
-        db.prepare(`
-          INSERT INTO session_roots (session_id, project, root) VALUES (?, ?, ?)
-          ON CONFLICT(session_id, project, root) DO NOTHING
-        `).run(sessionId, project, root);
-      }
+      if (n.c >= MAX_ROOTS) break;
+      insertRoot.run(sessionId, project, r);
+    }
+
+    // ★ HEAD 도 경계다. 이게 없으면 **턴 안에서 커밋한 작업이 통째로 사라진다** —
+    //   `git status` 는 HEAD 와의 차이를 보므로 커밋이 끝나면 후보가 0이 된다.
+    //   실측(2026-09-08): 커밋 직후 관측 0건, 실제로 바뀐 파일 10개.
+    const setHead = db.prepare(
+      'UPDATE session_roots SET head_baseline = ? WHERE session_id = ? AND project = ? AND root = ?'
+    );
+    for (const r of db.prepare('SELECT root FROM session_roots WHERE session_id = ? AND project = ?')
+      .all(sessionId, project) as Array<{ root: string }>) {
+      setHead.run(readHead(r.root), sessionId, project, r.root);
     }
 
     db.close();
@@ -482,7 +505,7 @@ async function main() {
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
 
-    markTurnStart(dbPath, project, input, cwd);
+    markTurnStart(dbPath, project, input, cwd, workspaceRoot);
 
     // 사용자 프롬프트에서 지시사항 추출 (DB 저장, 출력 0 토큰)
     if (input.prompt) {
