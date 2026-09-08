@@ -1,6 +1,7 @@
 // 검증 도구 (verify)
 // 빌드/테스트/린트 자동 실행
 import * as path from 'path';
+import * as fs from 'fs';
 import { spawn } from 'child_process';
 import { db, APPS_DIR } from '../db/database.js';
 import { logger } from '../utils/logger.js';
@@ -55,6 +56,28 @@ const PLATFORM_COMMANDS: Record<string, Record<string, string>> = {
     build: './gradlew assembleDebug',
     test: './gradlew test',
     lint: './gradlew lint'
+  },
+  // ⛔ .NET / GODOT — 이게 없어서 이 도구가 통째로 못 쓰이는 프로젝트가 있었다.
+  //
+  // Ashfall(apps/kenshi-fantasy)은 Godot 4 + 정수 전용 C# 코어이고, 표식이
+  // 루트가 아니라 한 단계 아래에 있다: core/Sim.sln, game/project.godot,
+  // game/game.csproj. 루트만 보던 detectPlatform 은 전부 놓치고 'node' 로
+  // 떨어져 `pnpm build` 를 시도했다 — 그 레포엔 package.json 이 없다.
+  //
+  // 그래서 그 프로젝트는 passbaton 의 verify_* 를 쓸 수 없다고 자기 명령
+  // 문서(.claude/commands/ashfall.md)에 적어두고 우회하고 있었다. 2026-09-08.
+  //
+  // ⚠ 이 명령들은 컴파일이 되는지까지만 본다. 그 레포의 진짜 게이트는 182개짜리
+  // tools/verify.ps1 이고 이것이 대체하지 않는다. 빠른 확인용이다.
+  godot: {
+    build: 'dotnet build',
+    test: 'dotnet test',
+    lint: 'dotnet format --verify-no-changes || echo "no format config"'
+  },
+  dotnet: {
+    build: 'dotnet build',
+    test: 'dotnet test',
+    lint: 'dotnet format --verify-no-changes || echo "no format config"'
   },
   node: {
     build: 'pnpm build || npm run build',
@@ -133,11 +156,55 @@ export async function handleVerify(args: unknown): Promise<CallToolResult> {
   }, args as Record<string, unknown>);
 }
 
-async function detectPlatform(projectPath: string): Promise<string> {
-  const { existsSync } = await import('fs');
+/**
+ * 프로젝트 루트와 그 바로 아래 한 단계에서 패턴에 맞는 파일을 찾는다.
+ *
+ * ★ 한 단계를 내려가는 이유는 실측이다. Godot·.NET 레포는 솔루션과 프로젝트
+ * 파일을 루트에 두지 않는 것이 오히려 보통이고, Ashfall 이 정확히 그렇다
+ * (core/Sim.sln · game/project.godot). 루트만 보면 그런 레포는 전부 'node' 로
+ * 떨어진다.
+ *
+ * ⚠ 한 단계까지만이다. 깊이 제한이 없으면 node_modules 나 build 산출물 안의
+ * 남의 .csproj 를 주워 엉뚱한 플랫폼으로 판정한다.
+ */
+export function findsNearby(projectPath: string, matches: (name: string) => boolean): boolean {
+  const scan = (dir: string): boolean => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    return entries.some((e) => e.isFile() && matches(e.name));
+  };
+
+  if (scan(projectPath)) return true;
+
+  let children: fs.Dirent[];
+  try {
+    children = fs.readdirSync(projectPath, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+
+  return children.some((e) => {
+    if (!e.isDirectory()) return false;
+    if (e.name.startsWith('.')) return false;
+    if (e.name === 'node_modules' || e.name === 'build' || e.name === 'dist') return false;
+    return scan(path.join(projectPath, e.name));
+  });
+}
+
+export async function detectPlatform(projectPath: string): Promise<string> {
+  const { existsSync } = fs;
 
   if (existsSync(path.join(projectPath, 'pubspec.yaml'))) return 'flutter';
   if (existsSync(path.join(projectPath, 'build.gradle')) || existsSync(path.join(projectPath, 'build.gradle.kts'))) return 'android';
+
+  // Godot 을 .NET 보다 먼저 본다. Godot + C# 레포는 둘 다 갖고 있고, 그때
+  // 더 구체적인 쪽이 godot 이기 때문이다.
+  if (findsNearby(projectPath, (n) => n === 'project.godot')) return 'godot';
+  if (findsNearby(projectPath, (n) => n.endsWith('.sln') || n.endsWith('.csproj'))) return 'dotnet';
 
   try {
     const { readFileSync } = await import('fs');

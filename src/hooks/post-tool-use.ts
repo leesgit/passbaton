@@ -11,6 +11,7 @@ import Database from 'better-sqlite3';
 import { logHookError } from '../utils/logger.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
+import { isIgnoredPath } from '../utils/paths.js';
 
 interface ToolUseInput {
   cwd?: string;
@@ -241,6 +242,9 @@ async function main() {
       tpath: tpathOf(input.transcript_path),
       file: input.tool_input?.file_path,
       cwd: traceCwd,
+      // 이 키가 실제로 오는지가 턴 단위 추적의 성립 조건이다. 선언은 증거가
+      // 아니므로(R2) 값이 아니라 유무만 남겨 배포 후 실측한다.
+      sid: input.session_id ? 'yes' : 'no',
     });
 
     // Bash 에러 감지 → 솔루션 자동 주입
@@ -278,7 +282,6 @@ async function main() {
     }
 
     const TRACKED_TOOLS = ['Edit', 'Write', 'Read', 'Glob', 'Grep'];
-    const IGNORED_PATTERNS = ['node_modules', '.git/', 'dist/', 'build/', '.next/', 'coverage/', '.DS_Store'];
 
     if (!TRACKED_TOOLS.includes(toolName)) {
       process.exit(0);
@@ -298,8 +301,10 @@ async function main() {
       process.exit(0);
     }
 
-    // 무시 패턴 체크
-    if (IGNORED_PATTERNS.some(p => filePath!.includes(p))) {
+    // 무시 패턴 체크 — 세그먼트 일치 + %TEMP%/scratchpad 제외 (utils/paths.ts).
+    // 여기 있던 `includes('dist/')` 식 배열은 Windows 에서 5/7 이 죽어 있었고,
+    // 남의 세션 스크래치패드가 그대로 통과해 modified_files 의 18% 를 채웠다.
+    if (isIgnoredPath(filePath)) {
       process.exit(0);
     }
 
@@ -369,6 +374,38 @@ async function main() {
 
       } catch {
         // 오류 시 무시
+      }
+
+      // 턴 단위 기록 — 위 recent_files 는 프로젝트당 하나라 동시 세션이 서로를
+      // 덮는다. session_id 로 갈라 두면 session-end 가 자기 턴 것만 집어간다.
+      //
+      // ★ session_id 가 없으면 아무것도 하지 않는다. 그 경우 session-end 는
+      //   예전대로 recent_files 스냅샷을 쓰므로 동작이 후퇴하지 않는다.
+      //   (훅 페이로드에 이 키가 실제로 오는지는 배포 후 실물로 확인한다.)
+      if (input.session_id) {
+        try {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS session_files (
+              session_id TEXT NOT NULL,
+              project TEXT NOT NULL,
+              file_path TEXT NOT NULL,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (session_id, project, file_path)
+            )
+          `);
+          db.prepare(`
+            INSERT INTO session_files (session_id, project, file_path, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(session_id, project, file_path)
+            DO UPDATE SET updated_at = datetime('now')
+          `).run(input.session_id, project, filePath);
+
+          // 회수되지 못한 찌꺼기 청소 — session-end 가 한 번도 안 뜬 세션이
+          // 남긴 행이 영구히 쌓이는 것을 막는다.
+          db.prepare(`DELETE FROM session_files WHERE updated_at < datetime('now', '-2 days')`).run();
+        } catch {
+          // 테이블 생성 실패(권한·구버전 DB) 시 무시 — 폴백이 있다
+        }
       }
 
       // auto-tracked 메모리 기록 제거 (v1.10.0)

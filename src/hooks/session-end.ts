@@ -18,6 +18,7 @@ import Database from 'better-sqlite3';
 import { logHookError, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
+import { filterTrackedPaths, displayName } from '../utils/paths.js';
 
 interface SessionEndInput {
   cwd?: string;
@@ -826,17 +827,59 @@ async function main() {
     }
 
     // === modified_files ===
+    //
+    // ★ 우선순위는 「이 턴에 이 세션이 고친 것」 > 「프로젝트 최근 스냅샷」이다.
+    // 뒤엣것은 프로젝트당 하나뿐이라 동시에 붙은 세션들이 서로를 덮었고, 그래서
+    // 같은 payload 가 여러 행에 복제되고 남의 %TEMP% 스크래치패드가 「내가 고친
+    // 파일」로 들어왔다(30일 창 2,896항목 중 520개, 18.0%).
+    //
+    // ★ session_id 가 없으면 예전 스냅샷으로 떨어진다. 훅 페이로드에 그 키가
+    // 온다는 것은 선언일 뿐이므로, 없더라도 동작이 후퇴하지 않아야 한다.
     let modifiedFiles: string[] = [];
-    try {
-      const activeCtx = db.prepare('SELECT recent_files FROM active_context WHERE project = ?').get(project) as { recent_files: string } | undefined;
-      if (activeCtx?.recent_files) {
-        modifiedFiles = JSON.parse(activeCtx.recent_files);
-      }
-    } catch { /* active_context may not exist */ }
+    let filesFromSession = false;
+
+    const sessionId = input.session_id || null;
+
+    if (sessionId) {
+      try {
+        // ★ 「행이 0개」와 「테이블이 없다」를 반드시 구분한다.
+        //   행 0개 = 이 턴에 아무것도 안 고쳤다 → **빈 목록이 정답**이다.
+        //   테이블 없음 = 이 호스트/DB 가 아직 턴 추적을 안 한다 → 폴백해야 한다.
+        //   이걸 뭉개고 「비었으면 폴백」으로 두면, 아무것도 안 고친 턴이 옆
+        //   세션의 파일 목록을 빌려온다 — 고치려던 그 증상 그대로다.
+        const hasTable = db.prepare(`
+          SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_files'
+        `).get() as { 1: number } | undefined;
+
+        if (hasTable) {
+          const rows = db.prepare(`
+            SELECT file_path FROM session_files
+            WHERE session_id = ? AND project = ?
+            ORDER BY updated_at DESC
+          `).all(sessionId, project) as Array<{ file_path: string }>;
+
+          modifiedFiles = rows.map(r => r.file_path);
+          filesFromSession = true;
+        }
+      } catch { /* 조회 실패 → 폴백 */ }
+    }
+
+    if (!filesFromSession) {
+      try {
+        const activeCtx = db.prepare('SELECT recent_files FROM active_context WHERE project = ?').get(project) as { recent_files: string } | undefined;
+        if (activeCtx?.recent_files) {
+          modifiedFiles = JSON.parse(activeCtx.recent_files);
+        }
+      } catch { /* active_context may not exist */ }
+    }
+
+    // 과거에 쌓인 경로에도 같은 규칙을 적용한다 — 폴백 경로로 들어온 목록에는
+    // 필터가 배포되기 전의 %TEMP% 항목이 그대로 남아 있다.
+    modifiedFiles = filterTrackedPaths(modifiedFiles);
 
     // last_work 최종 폴백: 파일 목록 기반
     if (!lastWork && modifiedFiles.length > 0) {
-      const fileNames = modifiedFiles.slice(0, 5).map(f => path.basename(f)).join(', ');
+      const fileNames = modifiedFiles.slice(0, 5).map(f => displayName(f)).join(', ');
       lastWork = `Modified files: ${fileNames}`;
     }
 
@@ -934,7 +977,7 @@ async function main() {
     //   id 897/898처럼 동일 last_work+timestamp 2행 저장(실측 재현).
     //   INSERT ... WHERE NOT EXISTS로 "최근 10초 내 동일 project+last_work"를 원자적
     //   단일 문장에서 재확인 → race 윈도우 제거. 10초 초과 정당한 재작업은 통과.
-    db.prepare(`
+    const sessionInsert = db.prepare(`
       INSERT INTO sessions (project, last_work, next_tasks, modified_files, issues)
       SELECT ?, ?, ?, ?, ?
       WHERE NOT EXISTS (
@@ -951,6 +994,21 @@ async function main() {
       project,
       lastWork
     );
+
+    // 회수 — 이 턴의 파일 목록은 위 행이 **실제로 들어갔을 때만** 지운다.
+    //
+    // ★ 위 INSERT 는 dedup 조건에 걸리면 0행을 쓴다. 그때도 지워 버리면 그 편집이
+    //   어느 행에도 실리지 못하고 사라진다. changes 로 갈라야 하는 이유다.
+    // 이걸 지워야 다음 턴이 「그 턴에 고친 것」만 갖는다. 안 지우면 세션이 길수록
+    // 목록이 불어나 결국 예전의 스냅샷과 같은 것이 된다.
+    if (sessionId && filesFromSession) {
+      try {
+        if (sessionInsert.changes > 0) {
+          db.prepare('DELETE FROM session_files WHERE session_id = ? AND project = ?')
+            .run(sessionId, project);
+        }
+      } catch { /* 회수 실패는 다음 턴에 중복으로 나타날 뿐, 유실은 아니다 */ }
+    }
 
     // 활성 컨텍스트 업데이트
     db.prepare(`
