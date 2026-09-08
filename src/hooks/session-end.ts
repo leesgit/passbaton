@@ -18,7 +18,7 @@ import Database from 'better-sqlite3';
 import { logHookError, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
-import { filterTrackedPaths, displayName } from '../utils/paths.js';
+import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
 
 /**
@@ -891,13 +891,33 @@ async function main() {
         const activeCtx = db.prepare('SELECT recent_files FROM active_context WHERE project = ?').get(project) as { recent_files: string } | undefined;
         if (activeCtx?.recent_files) {
           modifiedFiles = JSON.parse(activeCtx.recent_files);
+
+          // ⚠ 이건 이 세션의 편집이 아니다. active_context.recent_files 는
+          //   프로젝트당 한 칸이라 **누가 만졌든** 최근 것이 들어 있다. 구버전
+          //   호스트에서 아무것도 없는 것보다는 낫지만, 「이 턴의 편집」인 척하면
+          //   안 된다 — 그게 처음부터 고치려던 증상이다.
+          if (modifiedFiles.length > 0) {
+            console.log(`[SessionEnd] modified_files is DEGRADED for ${project}: `
+              + `no turn-scoped record, using the project-wide snapshot `
+              + `(${modifiedFiles.length} path(s), attribution unknown)`);
+          }
         }
       } catch { /* active_context may not exist */ }
     }
 
     // 과거에 쌓인 경로에도 같은 규칙을 적용한다 — 폴백 경로로 들어온 목록에는
-    // 필터가 배포되기 전의 %TEMP% 항목이 그대로 남아 있다.
-    modifiedFiles = filterTrackedPaths(modifiedFiles);
+    // 필터가 배포되기 전의 스크래치패드 항목이 그대로 남아 있다.
+    //
+    // 버린 개수를 찍는다. 이 규칙의 근거는 커버리지 실측이지 정밀도가 아니므로,
+    // 오탐이 생겼을 때 조용히 사라지지 않아야 한다.
+    {
+      const part = partitionTrackedPaths(modifiedFiles);
+      modifiedFiles = part.kept;
+      if (part.excluded.length > 0) {
+        console.log(`[SessionEnd] ${part.excluded.length} path(s) excluded from tracking `
+          + `(e.g. ${displayName(part.excluded[0])})`);
+      }
+    }
 
     // last_work 최종 폴백: 파일 목록 기반
     if (!lastWork && modifiedFiles.length > 0) {

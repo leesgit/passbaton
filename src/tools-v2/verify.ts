@@ -7,6 +7,7 @@ import { db, APPS_DIR } from '../db/database.js';
 import { logger } from '../utils/logger.js';
 import { VerifySchema } from '../schemas.js';
 import type { Tool, CallToolResult } from '../types.js';
+import { readDeclaredVerification, type DeclaredCommand } from './verify-config.js';
 
 // ===== 도구 정의 =====
 
@@ -102,22 +103,34 @@ export async function handleVerify(args: unknown): Promise<CallToolResult> {
     const { project, gates } = parsed.data;
     const projectPath = path.join(APPS_DIR, project);
 
-    // 플랫폼 감지
+    // 플랫폼 감지 — 선언이 없는 게이트의 폴백이다.
     const platform = await detectPlatform(projectPath);
     const commands = PLATFORM_COMMANDS[platform] || PLATFORM_COMMANDS.node;
 
-    const results: Record<string, { success: boolean; output?: string; error?: string; duration: number }> = {};
+    // ★ 프로젝트가 선언한 명령이 우선한다. 감지는 그 레포가 PATH 를 먼저 세워야
+    //   하는지, 진짜 게이트가 무엇인지 알 수 없다 — 알 수 있는 척하지 않는다.
+    const declared = readDeclaredVerification(projectPath);
+
+    const results: Record<string, {
+      success: boolean; source: 'declared' | 'detected'; command: string;
+      output?: string; error?: string; duration: number;
+    }> = {};
 
     for (const gate of gates) {
-      const command = commands[gate];
-      if (!command) continue;
+      const decl = declared.commands[gate as 'build' | 'test' | 'lint'];
+      const fallback = commands[gate];
+      if (!decl && !fallback) continue;
 
       const startTime = Date.now();
-      const result = await runCommand(command, projectPath);
+      const result = decl
+        ? await runDeclared(decl, projectPath)
+        : await runCommand(fallback, projectPath);
       const duration = Date.now() - startTime;
 
       results[gate] = {
         success: result.success,
+        source: decl ? 'declared' : 'detected',
+        command: decl ? [decl.command, ...decl.args].join(' ') : fallback,
         output: result.success ? result.output?.slice(-500) : undefined,
         error: !result.success ? result.error?.slice(-1000) : undefined,
         duration
@@ -125,7 +138,8 @@ export async function handleVerify(args: unknown): Promise<CallToolResult> {
 
       logger.info(`Gate ${gate} ${result.success ? 'passed' : 'failed'}`, {
         duration,
-        success: result.success
+        success: result.success,
+        source: results[gate].source
       }, 'verify');
     }
 
@@ -147,8 +161,16 @@ export async function handleVerify(args: unknown): Promise<CallToolResult> {
           platform,
           allPassed,
           results,
+          // ★ 선언 없이 돈 결과를 「이 프로젝트를 검증했다」고 말하지 않는다.
+          //   감지된 기본 빌드를 시도했을 뿐이다.
+          scope: Object.values(results).every(r => r.source === 'declared')
+            ? 'project-declared verification'
+            : 'detected default build attempt (declare `verification` in .claude/passbaton.config.json for the real gates)',
+          // 모양이 틀린 선언은 조용히 무시하지 않는다 — 그러면 사용자는 자기
+          // 스크립트가 돈 줄 알고 다른 빌드의 결과를 본다.
+          invalidDeclarations: declared.invalid.length > 0 ? declared.invalid : undefined,
           summary: Object.entries(results)
-            .map(([gate, r]) => `${gate}: ${r.success ? '✅' : '❌'} (${r.duration}ms)`)
+            .map(([gate, r]) => `${gate}: ${r.success ? '✅' : '❌'} (${r.source}, ${r.duration}ms)`)
             .join(', ')
         }, null, 2)
       }]
@@ -217,6 +239,41 @@ export async function detectPlatform(projectPath: string): Promise<string> {
   } catch { /* ignore */ }
 
   return 'node';
+}
+
+/**
+ * 선언된 명령을 **셸을 거치지 않고** 실행한다.
+ *
+ * ★ 인자 경계를 보존해야 한다. `sh -c "<한 줄>"` 로 넘기면 공백이 든 경로가 쪼개지고
+ * 사용자 데이터가 셸 메타문자로 해석된다. 선언은 실행 파일 + 인자 배열이므로 그
+ * 모양 그대로 넘긴다.
+ */
+function runDeclared(decl: DeclaredCommand, projectPath: string): Promise<{ success: boolean; output?: string; error?: string }> {
+  const cwd = decl.cwd ? path.resolve(projectPath, decl.cwd) : projectPath;
+
+  return new Promise((resolve) => {
+    const proc = spawn(decl.command, decl.args, {
+      cwd,
+      env: { ...process.env, CI: 'true' },
+      shell: false,
+      timeout: 300000
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.on('close', (code) => {
+      // ⛔ 실패하면 그 실패를 낸다. 감지된 기본 빌드로 조용히 갈아타지 않는다 —
+      //    그러면 다른 명령의 성공이 이 프로젝트의 검증 성공으로 보고된다.
+      if (code === 0) resolve({ success: true, output: stdout });
+      else resolve({ success: false, error: stderr || stdout || `exit code ${code}` });
+    });
+
+    proc.on('error', (err) => resolve({ success: false, error: err.message }));
+  });
 }
 
 function runCommand(command: string, cwd: string): Promise<{ success: boolean; output?: string; error?: string }> {

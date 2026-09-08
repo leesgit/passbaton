@@ -71,6 +71,26 @@ export function filterTrackedPaths(paths: string[]): string[] {
   return paths.filter((p) => !isIgnoredPath(p));
 }
 
+/**
+ * 걷어낸 것과 남은 것을 같이 돌려준다.
+ *
+ * ★ 왜 세는가 — 이 규칙의 근거는 「오염 520건이 전부 scratchpad 였다」는 **커버리지**
+ * 실측이지 정밀도가 아니다. `scratchpad` 라는 디렉터리에 진짜 소스나 픽스처가 있는
+ * 레포에서는 이 규칙이 틀린다. 그때 조용히 사라지면 아무도 모르므로, 몇 개를 왜
+ * 버렸는지 볼 수 있게 남긴다. (2026-09-08 Astra 리뷰의 지적)
+ */
+export function partitionTrackedPaths(paths: string[]): { kept: string[]; excluded: string[] } {
+  const kept: string[] = [];
+  const excluded: string[] = [];
+
+  for (const p of paths) {
+    if (isIgnoredPath(p)) excluded.push(p);
+    else kept.push(p);
+  }
+
+  return { kept, excluded };
+}
+
 /** 표시용 파일명. `path.basename` 이 Windows 경로를 못 자르는 POSIX 실행을 대비한다. */
 export function displayName(filePath: string): string {
   const normalized = normalizePath(filePath);
