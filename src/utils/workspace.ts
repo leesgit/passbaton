@@ -103,6 +103,37 @@ function resolveWorktreeMain(start: string): string | null {
   return null;
 }
 
+/**
+ * 이 경로가 **워크스페이스가 아니라 임시 작업 디렉터리**인가.
+ *
+ * ★ 실측(2026-09-08)으로 잡힌 문제다. `codex exec` 를 스크래치패드에서 돌리면
+ * detectWorkspaceRoot 의 모든 규칙(.git · apps/ · 기존 sessions.db)이 하나도 안 걸려
+ * **스크래치패드 자신이 워크스페이스 루트가 된다.** 그러면 훅이 거기에 `.claude/`
+ * 와 빈 DB 를 만들고 쓰기는 실패한다 — Codex(Astra) 쪽이 정확히 그 상태였고,
+ * **훅이 12회 발화하는 동안 프로젝트 DB 에 남은 행은 0개였다.**
+ *
+ * ⛔ 「%TEMP% 하위면 전부 임시」로 판정하지 않는다. 멀티에이전트 워크트리가 거기
+ * 생기고 그건 진짜 작업이다. 그래서 **표식이 하나도 없을 때만** 임시로 본다.
+ */
+export function isEphemeralRoot(root: string): boolean {
+  let tmp: string;
+  try {
+    tmp = path.resolve(os.tmpdir()).toLowerCase();
+  } catch {
+    return false;
+  }
+
+  const resolved = path.resolve(root);
+  if (!resolved.toLowerCase().startsWith(tmp + path.sep)) return false;
+
+  // 표식이 하나라도 있으면 진짜 워크스페이스다 (워크트리·클론 등).
+  for (const marker of ['.git', 'apps', path.join('.claude', 'sessions.db')]) {
+    if (fs.existsSync(path.join(resolved, marker))) return false;
+  }
+
+  return true;
+}
+
 export function detectWorkspaceRoot(cwd: string): string {
   if (process.env.WORKSPACE_ROOT) {
     return process.env.WORKSPACE_ROOT;

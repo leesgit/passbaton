@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import Database from 'better-sqlite3';
 import { logHookError } from '../utils/logger.js';
-import { detectWorkspaceRoot } from '../utils/workspace.js';
+import { detectWorkspaceRoot, isEphemeralRoot } from '../utils/workspace.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
 import { ignoredReason, UNPROVEN_RULES } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
@@ -100,8 +100,17 @@ function searchSolutions(db: InstanceType<typeof Database>, project: string, err
   }
 }
 
-function getDbPath(cwd: string): string {
+/**
+ * DB 경로. **임시 작업 디렉터리에는 아무것도 만들지 않는다.**
+ *
+ * 만들면 `.claude/` 와 빈 DB 가 남고 쓰기는 실패한다 — 기록이 사라지는데
+ * 디스크에는 흔적이 생겨서, 다음 사람이 「기록되고 있다」고 오독한다.
+ * null 이면 호출부가 조용히 나간다.
+ */
+function getDbPath(cwd: string): string | null {
   const workspaceRoot = detectWorkspaceRoot(cwd);
+  if (isEphemeralRoot(workspaceRoot)) return null;
+
   const claudeDir = path.join(workspaceRoot, '.claude');
   if (!fs.existsSync(claudeDir)) {
     fs.mkdirSync(claudeDir, { recursive: true });
@@ -222,6 +231,9 @@ async function main() {
         const cwd = input.cwd || process.cwd();
         const project = detectProject(cwd);
         const dbPath = getDbPath(cwd);
+        if (!dbPath) {
+          process.exit(0);   // 임시 작업 디렉터리 — 기록할 워크스페이스가 없다
+        }
         if (fs.existsSync(dbPath)) {
           try {
             const db = new Database(dbPath, { readonly: true });
@@ -279,6 +291,9 @@ async function main() {
     const cwd = input.cwd || process.cwd();
     const project = detectProject(cwd);
     const dbPath = getDbPath(cwd);
+    if (!dbPath) {
+      process.exit(0);   // 임시 작업 디렉터리 — 기록할 워크스페이스가 없다
+    }
 
     if (!fs.existsSync(dbPath)) {
       process.exit(0);

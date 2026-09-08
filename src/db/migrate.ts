@@ -48,6 +48,32 @@ const COLUMNS: Record<string, Record<string, string>> = {
  * 아래 둘은 2026-09-08 에 새로 생긴 것이라 처음부터 한 곳에서만 만든다.
  */
 const TABLES: string[] = [
+  // ★ sessions 를 여기서도 만든다. 훅이 서버보다 먼저 도는 상황이 실재하고,
+  //   그때 `session_files` 같은 새 테이블만 생기고 `sessions` 가 없으면 **INSERT 가
+  //   던져서 그 세션의 기록이 통째로 사라진다.** 2026-09-08 에 Codex(Astra) 쪽이
+  //   정확히 그 상태였다 — 훅이 12회 발화하고 행은 0개였다.
+  //   컬럼은 index.ts 쪽 정의의 부분집합이고 나머지는 아래 COLUMNS 가 채운다.
+  `CREATE TABLE IF NOT EXISTS sessions (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     project TEXT NOT NULL,
+     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+     last_work TEXT,
+     current_status TEXT,
+     next_tasks TEXT,
+     modified_files TEXT,
+     issues TEXT
+   )`,
+
+  `CREATE TABLE IF NOT EXISTS active_context (
+     project TEXT PRIMARY KEY,
+     current_state TEXT,
+     active_tasks TEXT,
+     recent_files TEXT,
+     blockers TEXT,
+     last_verification TEXT,
+     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+   )`,
+
   // 턴 단위 편집 파일. active_context.recent_files 는 프로젝트당 한 칸이라
   // 동시에 붙은 세션들이 서로를 덮었다.
   `CREATE TABLE IF NOT EXISTS session_files (

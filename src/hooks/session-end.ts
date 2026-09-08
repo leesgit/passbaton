@@ -17,7 +17,7 @@ import * as crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { logHookError, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
-import { detectWorkspaceRoot } from '../utils/workspace.js';
+import { detectWorkspaceRoot, isEphemeralRoot } from '../utils/workspace.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
@@ -51,8 +51,36 @@ interface SessionEndInput {
   }>;
 }
 
-function getDbPath(cwd: string): string {
+/**
+ * DB 경로. **임시 작업 디렉터리에는 아무것도 만들지 않는다.**
+ *
+ * 만들면 `.claude/` 와 빈 DB 가 남고 쓰기는 실패한다 — 기록이 사라지는데
+ * 디스크에는 흔적이 생겨서, 다음 사람이 「기록되고 있다」고 오독한다.
+ * null 이면 호출부가 조용히 나간다.
+ */
+/**
+ * 훅의 사람용 로그.
+ *
+ * ★ Codex·Gemini 호스트에서는 **stdout 을 쓰지 않는다.** 그 호스트들은 훅의 stdout 을
+ * 구조화 출력으로 파싱하고, 평문이 오면 **성공한 훅을 `Stop Failed` 로 보고한다.**
+ * 2026-09-08 실측: 행은 정상 저장되고 종료 코드도 0인데 화면에는 계속 Failed 가
+ * 찍혔다 — 그것 때문에 「Astra 연동이 안 된다」고 오독하기 쉬웠다.
+ *
+ * stderr 로 보내면 호스트 로그에는 남고 파서는 건드리지 않는다.
+ */
+function hookLog(message: string): void {
+  if (process.argv.includes('--codex') || process.argv.includes('--gemini')) {
+    process.stderr.write(`${message}
+`);
+  } else {
+    console.log(message);
+  }
+}
+
+function getDbPath(cwd: string): string | null {
   const workspaceRoot = detectWorkspaceRoot(cwd);
+  if (isEphemeralRoot(workspaceRoot)) return null;
+
   const claudeDir = path.join(workspaceRoot, '.claude');
   if (!fs.existsSync(claudeDir)) {
     fs.mkdirSync(claudeDir, { recursive: true });
@@ -690,6 +718,9 @@ async function main() {
     const cwd = input.cwd || process.cwd();
     const project = detectProject(cwd);
     const dbPath = getDbPath(cwd);
+    if (!dbPath) {
+      process.exit(0);   // 임시 작업 디렉터리 — 기록할 워크스페이스가 없다
+    }
 
     // 중복 호출 가드 2: transcript_path 해시 기반 5초 윈도우 파일락
     // Phase 3: session_id 5초 락 도입 (sid 있는 호출만 차단됨)
@@ -739,7 +770,7 @@ async function main() {
     fs.appendFileSync(debugLogPath, debugLine);
 
     if (!fs.existsSync(dbPath)) {
-      console.log('[SessionEnd] No DB found, skipping');
+      hookLog('[SessionEnd] No DB found, skipping');
       process.exit(0);
     }
 
@@ -840,7 +871,7 @@ async function main() {
     if (!lastWork && input.transcript) {
       const assistantMsgs = input.transcript.filter(m => m.role === 'assistant');
       if (assistantMsgs.length < 2) {
-        console.log(`[SessionEnd] Skipping empty session for ${project}`);
+        hookLog(`[SessionEnd] Skipping empty session for ${project}`);
         db.close();
         process.exit(0);
       }
@@ -948,7 +979,7 @@ async function main() {
           coverage.attribution = 'unknown — this is the project-wide snapshot, not this session';
 
           if (modifiedFiles.length > 0) {
-            console.log(`[SessionEnd] modified_files is DEGRADED for ${project}: `
+            hookLog(`[SessionEnd] modified_files is DEGRADED for ${project}: `
               + `no turn-scoped record, using the project-wide snapshot `
               + `(${modifiedFiles.length} path(s), attribution unknown)`);
           }
@@ -966,7 +997,7 @@ async function main() {
       modifiedFiles = part.kept;
       if (part.excluded.length > 0) {
         coverage.excluded = part.excluded.length;
-        console.log(`[SessionEnd] ${part.excluded.length} path(s) excluded from tracking `
+        hookLog(`[SessionEnd] ${part.excluded.length} path(s) excluded from tracking `
           + `(e.g. ${displayName(part.excluded[0])})`);
       }
     }
@@ -1144,7 +1175,7 @@ async function main() {
         || commitMessages.length > 0 || decisions.length > 0 || errorsSolved.length > 0;
 
       if (!hasAnything) {
-        console.log(`[SessionEnd] Skipping empty session for ${project} (no evidence at all)`);
+        hookLog(`[SessionEnd] Skipping empty session for ${project} (no evidence at all)`);
         db.close();
         process.exit(0);
       }
@@ -1183,7 +1214,7 @@ async function main() {
       `).get(project, sessionId, turnId);
 
       if (already) {
-        console.log(`[SessionEnd] Skipping re-fire of the same turn (${turnId.slice(0, 8)}) for ${project}`);
+        hookLog(`[SessionEnd] Skipping re-fire of the same turn (${turnId.slice(0, 8)}) for ${project}`);
         db.close();
         process.exit(0);
       }
@@ -1206,7 +1237,7 @@ async function main() {
         LIMIT 1
       `).get(project, lastWork);
       if (recentExact) {
-        console.log(`[SessionEnd] Skipping duplicate (exact, 24h) for ${project}`);
+        hookLog(`[SessionEnd] Skipping duplicate (exact, 24h) for ${project}`);
         db.close();
         process.exit(0);
       }
@@ -1222,7 +1253,7 @@ async function main() {
         for (const row of recent24h) {
           if (!row.last_work) continue;
           if (normalizeUrls(row.last_work) === normalizedLastWorkUrl) {
-            console.log(`[SessionEnd] Skipping URL-normalized duplicate for ${project}`);
+            hookLog(`[SessionEnd] Skipping URL-normalized duplicate for ${project}`);
             db.close();
             process.exit(0);
           }
@@ -1244,7 +1275,7 @@ async function main() {
         const normalizedCurrent = stripSlashPrefix(lastWork) || lastWork;
         const normalizedRow = stripSlashPrefix(row.last_work) || row.last_work;
         if (jaccardSimilarity(normalizedCurrent, normalizedRow) >= 0.85) {
-          console.log(`[SessionEnd] Skipping near-duplicate (jaccard >= 0.85) for ${project}`);
+          hookLog(`[SessionEnd] Skipping near-duplicate (jaccard >= 0.85) for ${project}`);
           db.close();
           process.exit(0);
         }
@@ -1548,12 +1579,12 @@ async function main() {
 
     db.close();
 
-    console.log(`[SessionEnd] Saved session for ${project}`);
-    console.log(`  Last work: ${lastWork.slice(0, 80)}`);
-    console.log(`  Commits: ${commitMessages.length}, Decisions: ${decisions.length}, Errors: ${errorsSolved.length}`);
-    console.log(`  Solutions auto-recorded: ${solutionsRecorded}`);
-    console.log(`  Modified files: ${modifiedFiles.length}`);
-    console.log(`  Next tasks: ${nextTasks.length}`);
+    hookLog(`[SessionEnd] Saved session for ${project}`);
+    hookLog(`  Last work: ${lastWork.slice(0, 80)}`);
+    hookLog(`  Commits: ${commitMessages.length}, Decisions: ${decisions.length}, Errors: ${errorsSolved.length}`);
+    hookLog(`  Solutions auto-recorded: ${solutionsRecorded}`);
+    hookLog(`  Modified files: ${modifiedFiles.length}`);
+    hookLog(`  Next tasks: ${nextTasks.length}`);
 
     process.exit(0);
   } catch (e) {
