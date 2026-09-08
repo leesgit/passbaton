@@ -860,6 +860,39 @@ async function main() {
     let modifiedFiles: string[] = [];
     let filesFromSession = false;
 
+    /**
+     * modified_files 가 무엇을 봤고 무엇을 못 봤는가.
+     *
+     * ★ 목록만 있으면 「비어 있음」이 **「안 고쳤다」인지 「안 봤다」인지** 구분되지
+     * 않는다. 다음 세션이 그 차이를 모르면 이미 끝난 일을 다시 하거나, 반대로
+     * 손대지 않은 파일을 손댄 줄 안다.
+     *
+     * ⛔ 그리고 이 목록은 **완전하지 않다.** PostToolUse 는 Edit·Write 로만
+     * 등록돼 있어 셸이 고친 파일을 하나도 못 본다. 실측(2026-09-08, 2일치 세션):
+     * 도구 호출 578건 중 Bash 397 + PowerShell 87 이고 Edit·Write 는 73건뿐이다.
+     * 그 세션에서 실제로 고친 소스 대부분이 python heredoc 을 거쳤다.
+     *
+     * 그 구멍을 메우는 선택지는 전부 기각·연기됐다(2026-09-08 Astra 리뷰):
+     *   • 셸 명령 문자열에서 경로 추출 → **실측 0/113.** 경로가 `"$D"` 같은 변수이거나
+     *     스크립트 본문 안에 있어 하나도 못 잡고 노이즈만 113건 나왔다
+     *   • matcher 를 넓히기 → 같은 모호한 명령 문자열을 프로세스 484회분(≈65초)
+     *     더 내고 살 뿐이다
+     *   • git 스냅샷 비교 → 유효하나 별도 설계가 필요하다(F-7 조건 참조)
+     *
+     * 그래서 지금 하는 일은 **덮는 것이 아니라 적는 것**이다.
+     */
+    const coverage: {
+      source: 'turn_scoped' | 'project_snapshot' | 'none';
+      observedVia: string;
+      unobserved: string;
+      excluded?: number;
+      attribution?: string;
+    } = {
+      source: 'none',
+      observedVia: 'edit_write_hook',
+      unobserved: 'shell-driven edits (Bash/PowerShell) and generated output are not observed',
+    };
+
     const sessionId = input.session_id || null;
 
     if (sessionId) {
@@ -882,6 +915,7 @@ async function main() {
 
           modifiedFiles = rows.map(r => r.file_path);
           filesFromSession = true;
+          coverage.source = 'turn_scoped';
         }
       } catch { /* 조회 실패 → 폴백 */ }
     }
@@ -896,6 +930,9 @@ async function main() {
           //   프로젝트당 한 칸이라 **누가 만졌든** 최근 것이 들어 있다. 구버전
           //   호스트에서 아무것도 없는 것보다는 낫지만, 「이 턴의 편집」인 척하면
           //   안 된다 — 그게 처음부터 고치려던 증상이다.
+          coverage.source = 'project_snapshot';
+          coverage.attribution = 'unknown — this is the project-wide snapshot, not this session';
+
           if (modifiedFiles.length > 0) {
             console.log(`[SessionEnd] modified_files is DEGRADED for ${project}: `
               + `no turn-scoped record, using the project-wide snapshot `
@@ -914,6 +951,7 @@ async function main() {
       const part = partitionTrackedPaths(modifiedFiles);
       modifiedFiles = part.kept;
       if (part.excluded.length > 0) {
+        coverage.excluded = part.excluded.length;
         console.log(`[SessionEnd] ${part.excluded.length} path(s) excluded from tracking `
           + `(e.g. ${displayName(part.excluded[0])})`);
       }
@@ -961,7 +999,8 @@ async function main() {
       migrateSchema(db);
       const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
         .map(c => c.name);
-      hasTurnColumns = cols.includes('session_id') && cols.includes('prompt_id') && cols.includes('user_intent');
+      hasTurnColumns = ['session_id', 'prompt_id', 'user_intent', 'file_coverage']
+        .every(c => cols.includes(c));
     } catch { /* 보강 실패 → 구스키마로 동작 */ }
 
     // ★ 턴 식별자가 있으면 그것이 정체성이다. 유사도로 추측하지 않는다.
@@ -1093,25 +1132,24 @@ async function main() {
     //   범위 밖이고 별도 결정이 필요하다.
     // ★ 원자적 조건부 INSERT. 조건도 턴 식별자가 있으면 그것으로 건다 —
     //   같은 초에 두 인스턴스가 발화해도 같은 턴이면 하나만 들어간다.
-    const insertStmt = turnId && hasTurnColumns
-      ? db.prepare(`
-          INSERT INTO sessions
-            (project, last_work, next_tasks, modified_files, issues, session_id, prompt_id, user_intent)
-          SELECT ?, ?, ?, ?, ?, ?, ?, ?
-          WHERE NOT EXISTS (
-            SELECT 1 FROM sessions
-            WHERE project = ? AND session_id IS ? AND prompt_id = ?
-          )
-        `)
-      : db.prepare(`
-          INSERT INTO sessions (project, last_work, next_tasks, modified_files, issues)
-          SELECT ?, ?, ?, ?, ?
-          WHERE NOT EXISTS (
-            SELECT 1 FROM sessions
-            WHERE project = ? AND last_work = ?
-              AND timestamp > datetime('now', '-10 seconds')
-          )
-        `);
+    // 컬럼을 조립한다. 세 가지가 서로 독립이라 미리 만든 문장 두 개로는 안 된다:
+    //   • 새 컬럼이 있는가          (구스키마 DB 면 없다)
+    //   • 턴 식별자가 있는가        (구버전 호스트면 없다)
+    //   • 커버리지는 **둘 다와 무관하다** — 무엇을 봤는지는 언제나 적을 수 있다
+    const insertCols = ['project', 'last_work', 'next_tasks', 'modified_files', 'issues'];
+    if (hasTurnColumns) {
+      insertCols.push('session_id', 'prompt_id', 'user_intent', 'file_coverage');
+    }
+
+    const dedupWhere = turnId && hasTurnColumns
+      ? 'project = ? AND session_id IS ? AND prompt_id = ?'
+      : "project = ? AND last_work = ? AND timestamp > datetime('now', '-10 seconds')";
+
+    const insertStmt = db.prepare(`
+      INSERT INTO sessions (${insertCols.join(', ')})
+      SELECT ${insertCols.map(() => '?').join(', ')}
+      WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE ${dedupWhere})
+    `);
 
     const commit = db.transaction((): { changes: number; files: string[] } => {
       // 권위 있는 재읽기 — 앞쪽 읽기 이후에 들어온 편집까지 이 행에 싣는다.
@@ -1136,9 +1174,20 @@ async function main() {
         hasMetadata ? JSON.stringify(metadata) : null,
       ];
 
-      const res = turnId && hasTurnColumns
-        ? insertStmt.run(...common, sessionId, turnId, userIntent, project, sessionId, turnId)
-        : insertStmt.run(...common, project, lastWork);
+      // 목록이 비었을 때 그것이 「안 고쳤다」인지 「안 봤다」인지 여기서 갈린다.
+      if (coverage.source === 'turn_scoped' && shipped.length === 0) {
+        coverage.attribution = 'no file edits observed in this turn';
+      }
+
+      const values = hasTurnColumns
+        ? [...common, sessionId, turnId, userIntent, JSON.stringify(coverage)]
+        : common;
+
+      const dedupArgs = turnId && hasTurnColumns
+        ? [project, sessionId, turnId]
+        : [project, lastWork];
+
+      const res = insertStmt.run(...values, ...dedupArgs);
 
       // 회수 — 행이 실제로 들어갔을 때만, 그리고 **실은 경로들만** 지운다.
       // 15개 상한에 잘려 나간 나머지는 남겨 다음 행에 실리게 한다.

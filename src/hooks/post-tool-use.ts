@@ -11,7 +11,7 @@ import Database from 'better-sqlite3';
 import { logHookError } from '../utils/logger.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
-import { isIgnoredPath } from '../utils/paths.js';
+import { ignoredReason, UNPROVEN_RULES } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
 
 interface ToolUseInput {
@@ -33,44 +33,6 @@ interface ToolUseInput {
   };
   tool_result?: string;
   transcript_path?: string;
-}
-
-// ===== Playwright 캐시 정리 (20MB 컨텍스트 초과 방지) =====
-
-function cleanPlaywrightCache(cwd: string) {
-  const MAX_TOTAL = 3 * 1024 * 1024; // 3MB 초과 시 정리
-  const MAX_FILES = 20; // 최대 파일 수
-
-  // .playwright-mcp/ 정리
-  const playwrightDir = path.join(cwd, '.playwright-mcp');
-  if (fs.existsSync(playwrightDir)) {
-    try {
-      const files = fs.readdirSync(playwrightDir)
-        .map(f => ({ name: f, path: path.join(playwrightDir, f), stat: fs.statSync(path.join(playwrightDir, f)) }))
-        .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
-
-      let totalSize = files.reduce((sum, f) => sum + f.stat.size, 0);
-
-      // 오래된 파일부터 삭제 (최근 5개만 유지)
-      while (files.length > 5 || totalSize > MAX_TOTAL) {
-        const oldest = files.shift();
-        if (!oldest) break;
-        try { fs.unlinkSync(oldest.path); totalSize -= oldest.stat.size; } catch { /* ignore */ }
-      }
-    } catch { /* ignore */ }
-  }
-
-  // 루트의 스크린샷 파일 정리 (최근 3개만 유지)
-  try {
-    const screenshots = fs.readdirSync(cwd)
-      .filter(f => /\.(png|jpeg|jpg)$/i.test(f))
-      .map(f => ({ name: f, path: path.join(cwd, f), stat: fs.statSync(path.join(cwd, f)) }))
-      .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs); // 최신순
-
-    for (let i = 3; i < screenshots.length; i++) {
-      try { fs.unlinkSync(screenshots[i].path); } catch { /* ignore */ }
-    }
-  } catch { /* ignore */ }
 }
 
 // ===== 에러 감지 → 솔루션 자동 주입 =====
@@ -280,13 +242,6 @@ async function main() {
       process.exit(0);
     }
 
-    // Playwright 도구 사용 후 캐시 정리 (20MB 컨텍스트 초과 방지)
-    if (toolName.startsWith('mcp__playwright__')) {
-      const cwd = input.cwd || process.cwd();
-      cleanPlaywrightCache(cwd);
-      process.exit(0);
-    }
-
     const TRACKED_TOOLS = ['Edit', 'Write', 'Read', 'Glob', 'Grep'];
 
     if (!TRACKED_TOOLS.includes(toolName)) {
@@ -310,7 +265,14 @@ async function main() {
     // 무시 패턴 체크 — 세그먼트 일치 + %TEMP%/scratchpad 제외 (utils/paths.ts).
     // 여기 있던 `includes('dist/')` 식 배열은 Windows 에서 5/7 이 죽어 있었고,
     // 남의 세션 스크래치패드가 그대로 통과해 modified_files 의 18% 를 채웠다.
-    if (isIgnoredPath(filePath)) {
+    const ignored = ignoredReason(filePath);
+    if (ignored) {
+      // node_modules·dist 는 조용히 버린다. 근거가 커버리지 실측뿐인 규칙만
+      // 소리 낸다 — 그래야 그 규칙이 틀렸을 때 보인다.
+      if (UNPROVEN_RULES.has(ignored)) {
+        console.log(`<passbaton>not tracking ${path.basename(filePath)} `
+          + `(matched the "${ignored}" rule; say so if that path is real work)</passbaton>`);
+      }
       process.exit(0);
     }
 

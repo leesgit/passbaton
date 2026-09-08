@@ -56,15 +56,33 @@ export function normalizePath(filePath: string): string {
  * 이미 앞에서 걸러낸다.
  */
 export function isIgnoredPath(filePath: string): boolean {
-  if (!filePath) return false;
+  return ignoredReason(filePath) !== null;
+}
+
+/**
+ * 무엇 때문에 배제됐는지. 배제 대상이 아니면 null.
+ *
+ * ★ 이유가 필요한 까닭은 규칙마다 **근거의 강도가 다르기** 때문이다.
+ * `node_modules` 는 논쟁의 여지가 없지만 `scratchpad` 는 「오염 520건이 전부
+ * 그것이었다」는 커버리지 실측일 뿐 정밀도는 입증되지 않았다. 그런 이름의
+ * 디렉터리에 진짜 소스를 둔 레포에서는 이 규칙이 틀리고, 그때 조용히 사라지면
+ * 아무도 모른다. 호출부가 근거가 약한 규칙만 골라 소리 내게 하려면 이유가 있어야
+ * 한다. (2026-09-08 Astra 리뷰)
+ */
+export function ignoredReason(filePath: string): string | null {
+  if (!filePath) return null;
 
   const segments = normalizePath(filePath).split('/').filter(Boolean);
 
-  if (segments.some((s) => IGNORED_DIRS.has(s))) return true;
+  const dir = segments.find((s) => IGNORED_DIRS.has(s));
+  if (dir !== undefined) return dir;
 
   const base = segments[segments.length - 1];
-  return base !== undefined && IGNORED_FILES.has(base);
+  return base !== undefined && IGNORED_FILES.has(base) ? base : null;
 }
+
+/** 근거가 커버리지 실측뿐이라 오탐이 보여야 하는 규칙. */
+export const UNPROVEN_RULES = new Set(['scratchpad']);
 
 /** 목록에서 제외 대상을 걷어낸다. 순서는 보존한다. */
 export function filterTrackedPaths(paths: string[]): string[] {

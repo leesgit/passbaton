@@ -213,6 +213,75 @@ describe.skipIf(!built)('modified_files — 턴 단위 diff', () => {
     expect(new Set([...turn1, ...turn2]).size).toBe(20); // 20개 모두 어딘가에 실렸다
   });
 
+  // 2026-09-08 Astra 리뷰 Q4. 목록만으로는 「비어 있음」이 「안 고쳤다」인지
+  // 「안 봤다」인지 구분되지 않는다. 다음 세션이 그 차이를 모르면 끝난 일을 다시
+  // 하거나 손대지 않은 파일을 손댄 줄 안다.
+  describe('file_coverage — 무엇을 봤고 무엇을 못 봤는가', () => {
+    const coverageOf = (ws: string) => {
+      const db = new Database(path.join(ws, '.claude', 'sessions.db'), { readonly: true });
+      const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map(c => c.name);
+      if (!cols.includes('file_coverage')) { db.close(); return null; }
+      const r = db.prepare('SELECT file_coverage FROM sessions ORDER BY id DESC LIMIT 1').get() as
+        { file_coverage: string | null } | undefined;
+      db.close();
+      return r?.file_coverage ? JSON.parse(r.file_coverage) : null;
+    };
+
+    it('턴 단위로 관측했으면 그렇게 적는다', () => {
+      const ws = makeWorkspace();
+      edit(ws, 'session-A', path.join(ws, 'a.ts'));
+      stop(ws, 'session-A', '지형 청크 로더의 경계 계산을 바로잡았다');
+
+      const c = coverageOf(ws);
+      expect(c.source).toBe('turn_scoped');
+      expect(c.observedVia).toBe('edit_write_hook');
+      expect(c.unobserved).toMatch(/shell/i);      // ★ 구멍을 숨기지 않는다
+    });
+
+    it('편집이 없던 턴은 「안 봤다」가 아니라 「안 고쳤다」로 적는다', () => {
+      const ws = makeWorkspace();
+      edit(ws, 'session-B', path.join(ws, 'theirs.ts'));   // 남의 세션만 편집
+      stop(ws, 'session-A', '식량 소비 곡선을 인구 티어별로 나눴다');
+
+      const c = coverageOf(ws);
+      expect(c.source).toBe('turn_scoped');
+      expect(c.attribution).toMatch(/no file edits observed/);
+    });
+
+    // ★ 스크래치패드는 PostToolUse 에서 이미 걸러져 session_files 에 들어오지도
+    //   않는다. 그래서 Stop 쪽 카운터가 뛰는 것은 **필터 배포 이전에 쌓인 데이터**를
+    //   폴백으로 읽을 때뿐이다. 그 경우를 재현한다.
+    it('필터 이전에 쌓인 경로를 폴백으로 읽으면 배제 수를 남긴다', () => {
+      const ws = makeWorkspace();
+      const db = new Database(path.join(ws, '.claude', 'sessions.db'));
+      db.prepare('INSERT INTO active_context (project, recent_files) VALUES (?, ?)').run(
+        path.basename(ws),
+        JSON.stringify([
+          path.join(ws, 'legacy.ts'),
+          path.join(os.tmpdir(), 'claude', 'x', 'scratchpad', 'h.py'),
+        ])
+      );
+      db.close();
+
+      stop(ws, null, '교역로 가중치를 거리 제곱으로 바꿨다');   // session_id 없음 → 폴백
+      expect(coverageOf(ws).excluded).toBe(1);
+    });
+
+    it('오탐이 보이도록 — 근거 약한 규칙으로 버릴 때만 소리 낸다', () => {
+      const ws = makeWorkspace();
+      const say = (p: string) => {
+        const r = spawnSync('node', [POST_TOOL], {
+          input: JSON.stringify({ cwd: ws, session_id: 's', tool_name: 'Edit', tool_input: { file_path: p } }),
+          encoding: 'utf-8',
+        });
+        return (r.stdout || '') + (r.stderr || '');
+      };
+
+      expect(say(path.join(ws, 'scratchpad', 'note.md'))).toContain('scratchpad');
+      expect(say(path.join(ws, 'node_modules', 'x.js'))).toBe('');   // 논쟁 없는 규칙은 조용히
+    });
+  });
+
   it('session_id 가 없으면 예전 스냅샷 경로로 떨어진다 (후퇴 금지)', () => {
     const ws = makeWorkspace();
     const f = path.join(ws, 'legacy.ts');

@@ -28,7 +28,9 @@ const COLUMNS: Record<string, Record<string, string>> = {
   // 행은 「세션」이 아니라 「유저 턴」이다. 호스트가 주는 식별자를 담아 사후에
   // 세션·턴으로 묶을 수 있게 한다. 없으면 NULL(구버전 호스트).
   // user_intent: 요청은 결과가 아니므로 last_work 에 섞지 않고 여기 따로 둔다.
-  sessions: { session_id: 'TEXT', prompt_id: 'TEXT', user_intent: 'TEXT' },
+  // file_coverage: modified_files 가 **무엇을 봤고 무엇을 못 봤는지**. 목록만으로는
+  // 「비어 있음」이 「안 고쳤다」인지 「안 봤다」인지 구분되지 않는다.
+  sessions: { session_id: 'TEXT', prompt_id: 'TEXT', user_intent: 'TEXT', file_coverage: 'TEXT' },
   session_files: { prompt_id: 'TEXT' },
 };
 
