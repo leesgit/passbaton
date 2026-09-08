@@ -31,6 +31,7 @@ import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { tokenizeQuery, buildFtsQuery } from './utils/tokenize.js';
+import { migrateSchema } from './db/migrate.js';
 
 // @xenova/transformers - 동적 import (sharp 의존성 문제 방지)
 let transformersModule: { pipeline: unknown; env: Record<string, unknown> } | null = null;
@@ -258,6 +259,10 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_hot_paths_project ON hot_paths(project);
 `);
+
+// 스키마 보강 — CREATE TABLE IF NOT EXISTS 는 기존 DB 의 컬럼을 늘리지 못한다.
+// 정본은 db/migrate.ts 하나다 (이 레포에는 sessions 를 만드는 코드가 네 군데 있다).
+migrateSchema(db);
 
 // ===== 임베딩 엔진 =====
 let embeddingPipeline: unknown = null;

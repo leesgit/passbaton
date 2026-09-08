@@ -12,11 +12,17 @@ import { logHookError } from '../utils/logger.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
 import { isIgnoredPath } from '../utils/paths.js';
+import { migrateSchema } from '../db/migrate.js';
 
 interface ToolUseInput {
   cwd?: string;
   // 실제 훅 페이로드는 snake_case 다 (camelCase 는 항상 undefined).
   session_id?: string;
+  // 호스트가 주는 턴 식별자. Claude Code 는 `prompt_id`, Codex 는 `turn_id` 를
+  // 쓴다 — Stop 훅이 받는 키 목록에서 둘 다 실측했다. PostToolUse 에도 오는지는
+  // 이 필드를 session_files 에 기록해 보고 판정한다. **선언은 증거가 아니다(R2).**
+  prompt_id?: string;
+  turn_id?: string;
   tool_name?: string;
   tool_input?: {
     file_path?: string;
@@ -390,15 +396,21 @@ async function main() {
               project TEXT NOT NULL,
               file_path TEXT NOT NULL,
               updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              prompt_id TEXT,
               PRIMARY KEY (session_id, project, file_path)
             )
           `);
+          // 먼저 만들어진 DB 에는 컬럼이 없다. 보강의 정본은 db/migrate.ts 하나다.
+          migrateSchema(db);
+
+          const turnId = input.prompt_id || input.turn_id || null;
+
           db.prepare(`
-            INSERT INTO session_files (session_id, project, file_path, updated_at)
-            VALUES (?, ?, ?, datetime('now'))
+            INSERT INTO session_files (session_id, project, file_path, updated_at, prompt_id)
+            VALUES (?, ?, ?, datetime('now'), ?)
             ON CONFLICT(session_id, project, file_path)
-            DO UPDATE SET updated_at = datetime('now')
-          `).run(input.session_id, project, filePath);
+            DO UPDATE SET updated_at = datetime('now'), prompt_id = excluded.prompt_id
+          `).run(input.session_id, project, filePath, turnId);
 
           // 회수되지 못한 찌꺼기 청소 — session-end 가 한 번도 안 뜬 세션이
           // 남긴 행이 영구히 쌓이는 것을 막는다.

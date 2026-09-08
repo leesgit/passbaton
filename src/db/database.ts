@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import type { ContentFilterPattern } from '../types.js';
+import { migrateSchema } from './migrate.js';
 
 // ===== 경로 자동 감지 =====
 
@@ -95,6 +96,9 @@ export function initDatabase() {
       issues TEXT,
       verification_result TEXT,
       duration_minutes INTEGER
+      -- session_id / prompt_id / user_intent 는 여기 두지 않는다. 기존 DB 에서는
+      -- CREATE TABLE IF NOT EXISTS 가 no-op 이라 컬럼이 절대 생기지 않는다.
+      -- 아래 migrate() 가 ALTER 로 보강한다.
     );
 
     CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
@@ -289,10 +293,13 @@ export function initDatabase() {
       project TEXT NOT NULL,
       file_path TEXT NOT NULL,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      prompt_id TEXT,
       PRIMARY KEY (session_id, project, file_path)
     );
     CREATE INDEX IF NOT EXISTS idx_session_files_lookup ON session_files(session_id, project);
   `);
+
+  migrateSchema(db);
 }
 
 // Content Filter 패턴 로드

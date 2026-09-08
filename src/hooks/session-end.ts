@@ -19,10 +19,25 @@ import { logHookError, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { filterTrackedPaths, displayName } from '../utils/paths.js';
+import { migrateSchema } from '../db/migrate.js';
+
+/**
+ * 결과를 뽑지 못했을 때 last_work 에 적는 값.
+ *
+ * 빈 문자열도, 사용자 프롬프트도 아니다. **모른다는 것을 아는 상태**를 기록한다 —
+ * 읽는 쪽이 「이 턴은 결과가 안 잡혔다」와 「이 턴은 이런 일을 했다」를 구분할 수
+ * 있어야 하고, 나중에 추출기를 고쳤을 때 개선폭을 셀 수 있어야 한다.
+ */
+const NO_OUTCOME = '(결과 요약 없음)';
 
 interface SessionEndInput {
   cwd?: string;
   session_id?: string;
+  // 호스트가 주는 턴 식별자. Claude Code = prompt_id, Codex = turn_id.
+  // 둘 다 실측했고(2026-09-08), PostToolUse 도 같은 값을 받는 것을 확인했다.
+  // 이 값이 있으면 「같은 턴인가」를 텍스트 유사도로 추측할 필요가 없다.
+  prompt_id?: string;
+  turn_id?: string;
   transcript_path?: string;
   last_assistant_message?: string;
   // Stop 이벤트가 중첩 호출되는 경우 true (Claude Code 플랫폼 동작)
@@ -752,23 +767,30 @@ async function main() {
       decisions = transcript.decisions;
     }
 
-    // lastWork 결정 (우선순위 폴백)
-    const { firstRequest: rawFirstRequest, allRequests } = transcript.userRequests;
-    // firstRequest 슬래시 prefix 제거 (예: "/mcp-dev 측정" → "측정")
-    const firstRequest = rawFirstRequest ? (stripSlashPrefix(rawFirstRequest) || rawFirstRequest) : '';
+    // === last_work 는 「무엇을 했는가」다. 요청이 아니다. ===
+    //
+    // ★ 옛 사다리는 사용자 프롬프트를 결과인 척 승격시켰다. 실측(최근 50행):
+    //   프롬프트 원문 22 / 실제 결과 요약 **3** / 슬래시·기계 토큰 오염 25.
+    //   그리고 누적이었다 — `firstRequest ... 직전 + 최신` 구조라 237행 중 94.1% 에
+    //   `' + '`, 83.1% 에 `' ... '` 가 들어 있고, 한 문장이 4일간 21행의 머리에
+    //   고착했다. 꼬리만 매번 달라지므로 COUNT(DISTINCT) 중복률은 「좋아졌는데」
+    //   실제 정보 중복은 오히려 늘었다.
+    //
+    // ⛔ 그래서 (1) 턴 사이 연결을 없애고, (2) 요청은 last_work 가 아니라 별도
+    //   컬럼(user_intent)에 넣고, (3) 결과를 못 뽑으면 **「결과 없음」이라고 적는다.**
+    //   요청으로 대체하지 않는다 — 그게 지금까지 44% 를 만든 동작이다.
+    //
+    // 누적기(summarizeUserRequests)는 지우지 않고 남긴다: user_intent 가 여러 요청을
+    // 담아야 할 때 쓸 수 있고, 무엇이 왜 폐기됐는지 코드에 남는 편이 낫다.
+    const { allRequests } = transcript.userRequests;
 
-    // 2a: 사용자 요청 + 커밋 메시지 조합 (가장 이상적)
-    if (firstRequest && commitMessages.length > 0) {
-      lastWork = `${firstRequest} → ${commitMessages.slice(0, 2).join('; ')}`;
-      if (lastWork.length > 250) lastWork = lastWork.slice(0, 250);
-    }
-    // 2b: 커밋 메시지만 (사용자 요청 없을 때)
-    else if (commitMessages.length > 0) {
+    // 이 턴의 요청 = 트랜스크립트의 마지막 사용자 발화. 슬래시 prefix 는 벗긴다.
+    const rawIntent = allRequests.length > 0 ? allRequests[allRequests.length - 1] : '';
+    const userIntent = rawIntent ? (stripSlashPrefix(rawIntent) || rawIntent).slice(0, 250) : null;
+
+    // 2a: 커밋 메시지 — 이 턴에 실제로 일어난 일 중 가장 강한 증거
+    if (commitMessages.length > 0) {
       lastWork = commitMessages.slice(0, 3).join('; ');
-    }
-    // 2c: 사용자 메시지 전체 요약 (커밋 없을 때)
-    else if (allRequests.length > 0) {
-      lastWork = summarizeUserRequests(allRequests);
     }
 
     // P1-2 (2026-08-10): nextTasks 추출을 `!lastWork` 폴백 밖으로 분리.
@@ -893,14 +915,60 @@ async function main() {
       if (stripped) lastWork = stripped;
     }
 
-    // 빈 세션 skip
+    // ★ 결과를 못 뽑았다면 그렇게 적는다. 요청으로 메우지 않는다.
+    //
+    // 단 아무 증거도 없는 턴(요청도·파일도·커밋도 없음)은 여전히 건너뛴다 — 그건
+    // 「결과 없음」이 아니라 「기록할 것이 없음」이다.
     if (!lastWork) {
-      console.log(`[SessionEnd] Skipping empty session for ${project} (no meaningful last_work)`);
-      db.close();
-      process.exit(0);
+      const hasAnything = Boolean(userIntent) || modifiedFiles.length > 0
+        || commitMessages.length > 0 || decisions.length > 0 || errorsSolved.length > 0;
+
+      if (!hasAnything) {
+        console.log(`[SessionEnd] Skipping empty session for ${project} (no evidence at all)`);
+        db.close();
+        process.exit(0);
+      }
+
+      lastWork = NO_OUTCOME;
     }
 
-    // 중복 저장 방지 — 3단계 dedup
+    // 스키마 확장 — 세션·턴 식별자와 요청을 컬럼으로 갖는다.
+    // 훅은 서버의 initDatabase 를 거치지 않고 DB 를 직접 열므로 여기서 보강한다.
+    // 이미 있으면 ALTER 가 던지고 그게 정상이다.
+    const turnId = input.prompt_id || input.turn_id || null;
+    let hasTurnColumns = false;
+    try {
+      migrateSchema(db);
+      const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
+        .map(c => c.name);
+      hasTurnColumns = cols.includes('session_id') && cols.includes('prompt_id') && cols.includes('user_intent');
+    } catch { /* 보강 실패 → 구스키마로 동작 */ }
+
+    // ★ 턴 식별자가 있으면 그것이 정체성이다. 유사도로 추측하지 않는다.
+    //
+    // 옛 3단계 dedup(exact 24h → URL 정규화 → Jaccard ≥ 0.85)은 「같은 사건인가」를
+    // **텍스트가 비슷한가**로 대신 판정했다. 그래서 둘 다 틀렸다:
+    //   • 다른 턴인데 문장이 비슷하면 삼켰다 — 하루 19발화 → 9행
+    //   • 같은 턴의 재발화인데 문장이 달라지면 통과시켰다
+    // 그리고 last_work 가 결과 요약으로 바뀌면서 「(결과 요약 없음)」이 여러 턴에
+    // 반복되므로, 텍스트 기준을 그대로 두면 정상 턴이 통째로 사라진다.
+    //
+    // 식별자가 없는 호스트에서는 아래 옛 경로가 그대로 돈다 — 후퇴시키지 않는다.
+    if (turnId && hasTurnColumns) {
+      const already = db.prepare(`
+        SELECT id FROM sessions
+        WHERE project = ? AND session_id IS ? AND prompt_id = ?
+        LIMIT 1
+      `).get(project, sessionId, turnId);
+
+      if (already) {
+        console.log(`[SessionEnd] Skipping re-fire of the same turn (${turnId.slice(0, 8)}) for ${project}`);
+        db.close();
+        process.exit(0);
+      }
+    }
+
+    // 중복 저장 방지 — 3단계 dedup (턴 식별자가 없을 때만)
     // P1-3 (2026-05-22): Q8에서 발견된 3 클러스터(25 세션) 분석 결과
     //   • Google Forms URL × 12 (1h~2h 간격) — URL 정규화 + 24h 윈도우로 해결
     //   • IAP "이어서 진행해줘" × 8 (5h 분포, 동일 텍스트) — 24h exact로 해결
@@ -908,53 +976,57 @@ async function main() {
     // 1단계: 24시간 내 exact 일치 차단 (이전 1h → 24h, 동일 last_work 반복 막음)
     // 2단계: URL 정규화 후 exact 일치 (Forms/AdMob ID 무시)
     // 3단계: stripSlashPrefix 정규화 후 Jaccard >= 0.85 (1h 윈도우)
-    const recentExact = db.prepare(`
-      SELECT id FROM sessions
-      WHERE project = ? AND last_work = ? AND timestamp > datetime('now', '-24 hour')
-      LIMIT 1
-    `).get(project, lastWork);
-    if (recentExact) {
-      console.log(`[SessionEnd] Skipping duplicate (exact, 24h) for ${project}`);
-      db.close();
-      process.exit(0);
-    }
+    // 턴 식별자가 없는 호스트에서만 도는 옛 경로. 위 정체성 검사가 성립하면
+    // 이 유사도 판정은 정상 턴을 삼키기만 한다.
+    if (!(turnId && hasTurnColumns)) {
+      const recentExact = db.prepare(`
+        SELECT id FROM sessions
+        WHERE project = ? AND last_work = ? AND timestamp > datetime('now', '-24 hour')
+        LIMIT 1
+      `).get(project, lastWork);
+      if (recentExact) {
+        console.log(`[SessionEnd] Skipping duplicate (exact, 24h) for ${project}`);
+        db.close();
+        process.exit(0);
+      }
 
-    // 2단계: URL 정규화 후 exact (24h 윈도우)
-    const normalizedLastWorkUrl = normalizeUrls(lastWork);
-    if (normalizedLastWorkUrl !== lastWork) {
-      const recent24h = db.prepare(`
+      // 2단계: URL 정규화 후 exact (24h 윈도우)
+      const normalizedLastWorkUrl = normalizeUrls(lastWork);
+      if (normalizedLastWorkUrl !== lastWork) {
+        const recent24h = db.prepare(`
+          SELECT last_work FROM sessions
+          WHERE project = ? AND timestamp > datetime('now', '-24 hour')
+          ORDER BY timestamp DESC LIMIT 20
+        `).all(project) as Array<{ last_work: string }>;
+        for (const row of recent24h) {
+          if (!row.last_work) continue;
+          if (normalizeUrls(row.last_work) === normalizedLastWorkUrl) {
+            console.log(`[SessionEnd] Skipping URL-normalized duplicate for ${project}`);
+            db.close();
+            process.exit(0);
+          }
+        }
+      }
+
+      // 3단계: Jaccard 유사도 (24h 윈도우)
+      // P2 (2026-07-08): 1h 윈도우가 너무 좁아 시간 넘는 near-dup이 통과했음.
+      //   실측: /mcp-dev 클러스터 60건이 수 시간~수일 간격으로 반복 저장됨.
+      //   1·2단계(exact/URL)가 이미 24h이므로 Jaccard만 1h인 건 불일치 → 24h로 통일.
+      //   임계값 0.85는 매우 높아 "진짜 다른 작업"은 24h로 넓혀도 통과(Phase 4 검증).
+      const recentRows = db.prepare(`
         SELECT last_work FROM sessions
         WHERE project = ? AND timestamp > datetime('now', '-24 hour')
-        ORDER BY timestamp DESC LIMIT 20
+        ORDER BY timestamp DESC LIMIT 30
       `).all(project) as Array<{ last_work: string }>;
-      for (const row of recent24h) {
+      for (const row of recentRows) {
         if (!row.last_work) continue;
-        if (normalizeUrls(row.last_work) === normalizedLastWorkUrl) {
-          console.log(`[SessionEnd] Skipping URL-normalized duplicate for ${project}`);
+        const normalizedCurrent = stripSlashPrefix(lastWork) || lastWork;
+        const normalizedRow = stripSlashPrefix(row.last_work) || row.last_work;
+        if (jaccardSimilarity(normalizedCurrent, normalizedRow) >= 0.85) {
+          console.log(`[SessionEnd] Skipping near-duplicate (jaccard >= 0.85) for ${project}`);
           db.close();
           process.exit(0);
         }
-      }
-    }
-
-    // 3단계: Jaccard 유사도 (24h 윈도우)
-    // P2 (2026-07-08): 1h 윈도우가 너무 좁아 시간 넘는 near-dup이 통과했음.
-    //   실측: /mcp-dev 클러스터 60건이 수 시간~수일 간격으로 반복 저장됨.
-    //   1·2단계(exact/URL)가 이미 24h이므로 Jaccard만 1h인 건 불일치 → 24h로 통일.
-    //   임계값 0.85는 매우 높아 "진짜 다른 작업"은 24h로 넓혀도 통과(Phase 4 검증).
-    const recentRows = db.prepare(`
-      SELECT last_work FROM sessions
-      WHERE project = ? AND timestamp > datetime('now', '-24 hour')
-      ORDER BY timestamp DESC LIMIT 30
-    `).all(project) as Array<{ last_work: string }>;
-    for (const row of recentRows) {
-      if (!row.last_work) continue;
-      const normalizedCurrent = stripSlashPrefix(lastWork) || lastWork;
-      const normalizedRow = stripSlashPrefix(row.last_work) || row.last_work;
-      if (jaccardSimilarity(normalizedCurrent, normalizedRow) >= 0.85) {
-        console.log(`[SessionEnd] Skipping near-duplicate (jaccard >= 0.85) for ${project}`);
-        db.close();
-        process.exit(0);
       }
     }
 
@@ -999,15 +1071,27 @@ async function main() {
     //   **「마지막으로 기록된 행 이후」**다. 유사도로 턴을 버리면서 정확한 턴 귀속을
     //   동시에 주장할 수는 없다. dedup 키 자체(project + 유사 텍스트)는 이 수정의
     //   범위 밖이고 별도 결정이 필요하다.
-    const insertStmt = db.prepare(`
-      INSERT INTO sessions (project, last_work, next_tasks, modified_files, issues)
-      SELECT ?, ?, ?, ?, ?
-      WHERE NOT EXISTS (
-        SELECT 1 FROM sessions
-        WHERE project = ? AND last_work = ?
-          AND timestamp > datetime('now', '-10 seconds')
-      )
-    `);
+    // ★ 원자적 조건부 INSERT. 조건도 턴 식별자가 있으면 그것으로 건다 —
+    //   같은 초에 두 인스턴스가 발화해도 같은 턴이면 하나만 들어간다.
+    const insertStmt = turnId && hasTurnColumns
+      ? db.prepare(`
+          INSERT INTO sessions
+            (project, last_work, next_tasks, modified_files, issues, session_id, prompt_id, user_intent)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (
+            SELECT 1 FROM sessions
+            WHERE project = ? AND session_id IS ? AND prompt_id = ?
+          )
+        `)
+      : db.prepare(`
+          INSERT INTO sessions (project, last_work, next_tasks, modified_files, issues)
+          SELECT ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (
+            SELECT 1 FROM sessions
+            WHERE project = ? AND last_work = ?
+              AND timestamp > datetime('now', '-10 seconds')
+          )
+        `);
 
     const commit = db.transaction((): { changes: number; files: string[] } => {
       // 권위 있는 재읽기 — 앞쪽 읽기 이후에 들어온 편집까지 이 행에 싣는다.
@@ -1024,15 +1108,17 @@ async function main() {
 
       const shipped = files.slice(0, 15);
 
-      const res = insertStmt.run(
+      const common = [
         project,
         lastWork,
         JSON.stringify([...new Set(nextTasks)].slice(0, 5)),
         JSON.stringify(shipped),
         hasMetadata ? JSON.stringify(metadata) : null,
-        project,
-        lastWork
-      );
+      ];
+
+      const res = turnId && hasTurnColumns
+        ? insertStmt.run(...common, sessionId, turnId, userIntent, project, sessionId, turnId)
+        : insertStmt.run(...common, project, lastWork);
 
       // 회수 — 행이 실제로 들어갔을 때만, 그리고 **실은 경로들만** 지운다.
       // 15개 상한에 잘려 나간 나머지는 남겨 다음 행에 실리게 한다.
