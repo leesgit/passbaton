@@ -188,6 +188,31 @@ describe.skipIf(!built)('modified_files — 턴 단위 diff', () => {
     expect(files).toEqual([real]);
   });
 
+  // Astra(gpt-6-astra)의 2026-09-08 설계 리뷰에서 나온 케이스.
+  //
+  //   Stop: session_files 읽음 → [a]
+  //   PostToolUse: b 기록          ← 읽기와 삭제 사이 (Jaccard dedup 질의 3개가 낀다)
+  //   Stop: INSERT modified_files=[a]
+  //   Stop: DELETE ... WHERE session_id=? AND project=?   ← b 까지 지운다
+  //   → b 는 어느 행에도 실리지 못하고 사라진다
+  //
+  // 훅 프로세스 내부의 그 창을 밖에서 재현할 수는 없으므로, **관측 가능한 불변식**으로
+  // 검사한다: 회수는 그 행에 실제로 실린 경로만 지운다. 그래서 상한(15개)에 잘린
+  // 나머지는 살아남아 다음 행에 실려야 한다. 옛 코드의 무범위 DELETE 는 이것을 지웠다.
+  it('상한에 잘린 파일은 회수되지 않고 다음 턴에 실린다', () => {
+    const ws = makeWorkspace();
+    const files = Array.from({ length: 20 }, (_, i) => path.join(ws, `f${String(i).padStart(2, '0')}.ts`));
+
+    for (const f of files) edit(ws, 'session-A', f);
+
+    const turn1 = stop(ws, 'session-A', '지형 청크 로더의 경계 계산을 바로잡았다');
+    expect(turn1).toHaveLength(15);
+
+    const turn2 = stop(ws, 'session-A', '식량 소비 곡선을 인구 티어별로 나눴다');
+    expect(turn2).toHaveLength(5);                       // ★ 무범위 DELETE 였다면 0
+    expect(new Set([...turn1, ...turn2]).size).toBe(20); // 20개 모두 어딘가에 실렸다
+  });
+
   it('session_id 가 없으면 예전 스냅샷 경로로 떨어진다 (후퇴 금지)', () => {
     const ws = makeWorkspace();
     const f = path.join(ws, 'legacy.ts');

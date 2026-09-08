@@ -977,7 +977,29 @@ async function main() {
     //   id 897/898처럼 동일 last_work+timestamp 2행 저장(실측 재현).
     //   INSERT ... WHERE NOT EXISTS로 "최근 10초 내 동일 project+last_work"를 원자적
     //   단일 문장에서 재확인 → race 윈도우 제거. 10초 초과 정당한 재작업은 통과.
-    const sessionInsert = db.prepare(`
+    // ★ 읽기 → 조건부 INSERT → 회수를 **한 트랜잭션 안에서** 한다.
+    //
+    // 앞쪽(=== modified_files ===)의 읽기는 last_work 폴백 문구를 만들기 위한 것이고,
+    // 그 지점과 여기 사이에는 Jaccard dedup 질의 3개가 끼어 있다. 그 창에 PostToolUse
+    // 가 파일 b 를 기록하면 다음이 벌어졌다:
+    //
+    //     Stop: session_files 읽음 → [a]
+    //     PostToolUse: b 기록
+    //     Stop: modified_files=[a] 로 INSERT
+    //     Stop: DELETE ... WHERE session_id=? AND project=?     ← b 까지 지운다
+    //     → b 는 어느 행에도 실리지 못하고 사라진다
+    //
+    // 그래서 (1) 권위 있는 읽기를 트랜잭션 안으로 옮기고, (2) 삭제를 **실제로 실은
+    // 경로들로 한정**한다. BEGIN IMMEDIATE 로 쓰기 예약을 읽기 전에 잡아, 동시
+    // Stop 은 기다리거나 busy 로 떨어진다. 커밋 전 크래시는 INSERT 와 DELETE 를 함께
+    // 되돌린다.
+    //
+    // ⚠ 다만 이것으로 「행 = 정확히 한 턴」이 되지는 않는다. dedup 에 걸려 INSERT 가
+    //   0행이면 파일을 남기므로, 그때 modified_files 의 의미는 「이 턴」이 아니라
+    //   **「마지막으로 기록된 행 이후」**다. 유사도로 턴을 버리면서 정확한 턴 귀속을
+    //   동시에 주장할 수는 없다. dedup 키 자체(project + 유사 텍스트)는 이 수정의
+    //   범위 밖이고 별도 결정이 필요하다.
+    const insertStmt = db.prepare(`
       INSERT INTO sessions (project, last_work, next_tasks, modified_files, issues)
       SELECT ?, ?, ?, ?, ?
       WHERE NOT EXISTS (
@@ -985,29 +1007,54 @@ async function main() {
         WHERE project = ? AND last_work = ?
           AND timestamp > datetime('now', '-10 seconds')
       )
-    `).run(
-      project,
-      lastWork,
-      JSON.stringify([...new Set(nextTasks)].slice(0, 5)),
-      JSON.stringify(modifiedFiles.slice(0, 15)),
-      hasMetadata ? JSON.stringify(metadata) : null,
-      project,
-      lastWork
-    );
+    `);
 
-    // 회수 — 이 턴의 파일 목록은 위 행이 **실제로 들어갔을 때만** 지운다.
-    //
-    // ★ 위 INSERT 는 dedup 조건에 걸리면 0행을 쓴다. 그때도 지워 버리면 그 편집이
-    //   어느 행에도 실리지 못하고 사라진다. changes 로 갈라야 하는 이유다.
-    // 이걸 지워야 다음 턴이 「그 턴에 고친 것」만 갖는다. 안 지우면 세션이 길수록
-    // 목록이 불어나 결국 예전의 스냅샷과 같은 것이 된다.
-    if (sessionId && filesFromSession) {
-      try {
-        if (sessionInsert.changes > 0) {
-          db.prepare('DELETE FROM session_files WHERE session_id = ? AND project = ?')
-            .run(sessionId, project);
-        }
-      } catch { /* 회수 실패는 다음 턴에 중복으로 나타날 뿐, 유실은 아니다 */ }
+    const commit = db.transaction((): { changes: number; files: string[] } => {
+      // 권위 있는 재읽기 — 앞쪽 읽기 이후에 들어온 편집까지 이 행에 싣는다.
+      let files = modifiedFiles;
+
+      if (sessionId && filesFromSession) {
+        const rows = db.prepare(`
+          SELECT file_path FROM session_files
+          WHERE session_id = ? AND project = ?
+          ORDER BY updated_at DESC
+        `).all(sessionId, project) as Array<{ file_path: string }>;
+        files = filterTrackedPaths(rows.map(r => r.file_path));
+      }
+
+      const shipped = files.slice(0, 15);
+
+      const res = insertStmt.run(
+        project,
+        lastWork,
+        JSON.stringify([...new Set(nextTasks)].slice(0, 5)),
+        JSON.stringify(shipped),
+        hasMetadata ? JSON.stringify(metadata) : null,
+        project,
+        lastWork
+      );
+
+      // 회수 — 행이 실제로 들어갔을 때만, 그리고 **실은 경로들만** 지운다.
+      // 15개 상한에 잘려 나간 나머지는 남겨 다음 행에 실리게 한다.
+      if (res.changes > 0 && sessionId && filesFromSession && shipped.length > 0) {
+        const del = db.prepare(
+          'DELETE FROM session_files WHERE session_id = ? AND project = ? AND file_path = ?'
+        );
+        for (const f of shipped) del.run(sessionId, project, f);
+      }
+
+      return { changes: res.changes, files };
+    });
+
+    let sessionInsert = { changes: 0 };
+    try {
+      const r = commit.immediate();
+      sessionInsert = { changes: r.changes };
+      modifiedFiles = r.files;
+    } catch (e) {
+      // SQLITE_BUSY 등 — 다른 Stop 이 같은 순간에 잡고 있다. 이 턴의 파일은 남으므로
+      // 다음 턴 행에 실린다. 유실이 아니라 지연이다.
+      logHookError('session-end/commit', e);
     }
 
     // 활성 컨텍스트 업데이트
