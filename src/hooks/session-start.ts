@@ -9,7 +9,8 @@ import Database from 'better-sqlite3';
 import { logHookError, emitContext, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
-import { detectWorkspaceRoot } from '../utils/workspace.js';
+import { resolveWorkspaceRoot } from '../utils/workspace.js';
+import { ensureSessionsDb } from '../db/bootstrap.js';
 
 interface SessionInput {
   cwd?: string;
@@ -451,7 +452,8 @@ async function main() {
     const input: SessionInput = inputData ? JSON.parse(inputData) : {};
     const cwd = input.cwd || process.cwd();
 
-    const workspaceRoot = detectWorkspaceRoot(cwd);
+    const resolvedRoot = resolveWorkspaceRoot(cwd);
+    const workspaceRoot = resolvedRoot.root;
     const project = getProject(cwd, workspaceRoot);
 
     // 조기 반환과 loadContext **앞**에서 찍는다. 뒤에 두면 「발화 안 함」과
@@ -466,6 +468,10 @@ async function main() {
     if (!project) {
       process.exit(0);
     }
+
+    // 여기서 만든다 — 세션 **시작**에 만들어야 이번 세션의 나머지 훅도 전부 기록된다.
+    // session-end 에서만 만들면 첫 세션은 마지막 한 줄만 남는다.
+    ensureSessionsDb(resolvedRoot);
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
     const context = loadContext(dbPath, project, input.source);

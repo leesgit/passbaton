@@ -17,7 +17,8 @@ import * as crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { logHookError, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
-import { detectWorkspaceRoot, isEphemeralRoot } from '../utils/workspace.js';
+import { detectWorkspaceRoot, isEphemeralRoot, resolveWorkspaceRoot } from '../utils/workspace.js';
+import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
@@ -762,16 +763,23 @@ async function main() {
     // P2 (audit-7 2026-07-20): log the resolved workspace root + whether it fell
     // back to cwd. A wrong root reads the wrong config/db, so a user's `config set`
     // can silently no-op. This makes that observable instead of fail-silent.
-    const wsRoot = detectWorkspaceRoot(cwd);
-    const wsFallback = wsRoot === cwd
-      && !fs.existsSync(path.join(cwd, 'apps'))
-      && !fs.existsSync(path.join(cwd, '.claude', 'sessions.db'));
-    const debugLine = `[${new Date().toISOString()}] project=${project} sid=${input.session_id?.slice(0,8) || 'none'} keys=[${inputKeys.join(',')}] transcript_path=${input.transcript_path || 'none'} last_msg_len=${lastMsgLen} ws_root=${wsRoot}${wsFallback ? ' (fallback=cwd, config/db may be off-target)' : ''}\n`;
+    const resolvedRoot = resolveWorkspaceRoot(cwd);
+    const wsRoot = resolvedRoot.root;
+    // 판정 근거를 그대로 쓴다. 예전엔 `wsRoot === cwd` 에 `apps/`·DB 유무만 봐서,
+    // `.git` 으로 옳게 잡은 레포 루트까지 「fallback=cwd」라고 잘못 불렀다.
+    const wsFallback = resolvedRoot.reason === 'cwd';
+    const debugLine = `[${new Date().toISOString()}] project=${project} sid=${input.session_id?.slice(0,8) || 'none'} keys=[${inputKeys.join(',')}] transcript_path=${input.transcript_path || 'none'} last_msg_len=${lastMsgLen} ws_root=${wsRoot} (by=${resolvedRoot.reason})${wsFallback ? ' [no marker, config/db may be off-target]' : ''}\n`;
     fs.appendFileSync(debugLogPath, debugLine);
 
     if (!fs.existsSync(dbPath)) {
-      hookLog('[SessionEnd] No DB found, skipping');
-      process.exit(0);
+      // 안전망. 정상 경로는 session-start 가 이미 만든다 — 그쪽이 안 돌았거나
+      // (SessionStart 가 없는 호스트) 그 사이에 지워진 경우다.
+      const bootstrapped = ensureSessionsDb(resolvedRoot);
+      if (bootstrapped !== 'created') {
+        hookLog(`[SessionEnd] No DB (bootstrap=${bootstrapped}, root=${wsRoot} by=${resolvedRoot.reason}), skipping`);
+        process.exit(0);
+      }
+      hookLog(`[SessionEnd] Created ${dbPath}`);
     }
 
     const db = new Database(dbPath);

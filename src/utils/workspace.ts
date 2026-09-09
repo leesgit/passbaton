@@ -134,9 +134,23 @@ export function isEphemeralRoot(root: string): boolean {
   return true;
 }
 
-export function detectWorkspaceRoot(cwd: string): string {
+/**
+ * 루트를 **무엇으로** 잡았는지. `cwd` 는 「아무 표식도 못 찾아 그냥 현재 디렉터리」라는 뜻이다.
+ *
+ * 근거를 돌려주는 이유는 하나다 — **DB 를 새로 만들어도 되는지가 여기에 걸린다.**
+ * `~/Downloads` 에서 클로드를 한 번 띄웠다고 거기에 `.claude/sessions.db` 가 생기면 안 된다.
+ * 표식 없이 잡힌 루트(`cwd`)에는 아무것도 만들지 않는다.
+ */
+export type RootReason = 'env' | 'apps' | 'db' | 'git' | 'cwd';
+
+export interface WorkspaceRoot {
+  root: string;
+  reason: RootReason;
+}
+
+export function resolveWorkspaceRoot(cwd: string): WorkspaceRoot {
   if (process.env.WORKSPACE_ROOT) {
-    return process.env.WORKSPACE_ROOT;
+    return { root: process.env.WORKSPACE_ROOT, reason: 'env' };
   }
 
   // 워크트리면 본체 레포에서 판정한다 (아래 규칙들은 본체 기준이어야 뜻이 맞는다)
@@ -148,13 +162,35 @@ export function detectWorkspaceRoot(cwd: string): string {
 
   // 2. 모노레포 루트 — 경계를 넘어서 찾는다 (자체 레포인 앱을 떼어내지 않기 위해)
   const monorepo = dirs.find((d) => fs.existsSync(path.join(d, 'apps')));
-  if (monorepo) return monorepo;
+  if (monorepo) return { root: monorepo, reason: 'apps' };
 
   // 3. sessions.db — 레포 경계 안에서만 (상위 고아 DB 로 새지 않기 위해)
   for (const d of dirs) {
-    if (fs.existsSync(path.join(d, '.claude', 'sessions.db'))) return d;
+    if (fs.existsSync(path.join(d, '.claude', 'sessions.db'))) return { root: d, reason: 'db' };
     if (d === repoRoot) break;
   }
 
-  return repoRoot ?? start;
+  if (repoRoot) return { root: repoRoot, reason: 'git' };
+  return { root: start, reason: 'cwd' };
+}
+
+export function detectWorkspaceRoot(cwd: string): string {
+  return resolveWorkspaceRoot(cwd).root;
+}
+
+/**
+ * 이 루트에 `sessions.db` 를 **새로 만들어도 되는가.**
+ *
+ * ★ 왜 필요했나 (2026-09-09, relaydesk G3 로 발견)
+ *   훅 다섯 개는 전부 DB 가 없으면 그냥 빠져나간다 — 아무도 만들지 않는다. 만드는 곳은
+ *   `src/db/database.ts` 하나뿐인데 그건 `.git` 을 모르고 홈에서 멈추지도 않았다.
+ *   그래서 `apps/` 도 없고 DB 도 아직 없는 **평범한 git 레포는 세션이 조용히 사라졌다.**
+ *   실패 로그도, 빈 DB 도 남지 않아 알아채기 어려웠다. `~/.claude/sessions.db` 에
+ *   `project` 가 윈도우 사용자명인 행 101개가 그 시절의 잔해다.
+ *
+ * 표식(`apps/`·기존 DB·`.git`)으로 잡힌 루트에만 만든다. 임시 디렉터리는 여전히 제외한다.
+ */
+export function canBootstrapDb(resolved: WorkspaceRoot): boolean {
+  if (resolved.reason === 'cwd') return false;
+  return !isEphemeralRoot(resolved.root);
 }

@@ -5,45 +5,23 @@ import * as fs from 'fs';
 import * as os from 'os';
 import type { ContentFilterPattern } from '../types.js';
 import { migrateSchema } from './migrate.js';
+import { detectWorkspaceRoot as sharedDetectWorkspaceRoot } from '../utils/workspace.js';
 
 // ===== 경로 자동 감지 =====
 
 /**
- * 워크스페이스 루트 자동 감지
- * 우선순위:
- * 1. WORKSPACE_ROOT 환경변수
- * 2. 현재 디렉토리에서 상위 탐색 (.claude/, apps/, turbo.json)
- * 3. 현재 작업 디렉토리
- * 4. 홈 디렉토리 (fallback)
+ * 워크스페이스 루트 — **훅과 같은 규칙을 쓴다** (`src/utils/workspace.ts`).
+ *
+ * ★ 2026-09-09 이전에는 여기에 별도 구현이 있었고, 훅과 답이 갈렸다:
+ *   이쪽은 `.git` 을 몰랐고(`apps/`·`.claude/`·turbo.json 만 봤다) 홈에서 멈추지도 않았다.
+ *   그래서 표식 없는 디렉터리에서 시작하면 **홈까지 걸어 올라가** `~/.claude/` 를 루트로
+ *   잡고 거기에 DB 를 만들었다. `~/.claude/sessions.db` 에 `project` 가 윈도우 사용자명인
+ *   행 101개가 그 결과다. 훅은 같은 상황에서 `.git` 루트를 옳게 잡고 있었으므로,
+ *   **한 세션을 두 컴포넌트가 서로 다른 DB 로 보고 있었다.**
+ *   relaydesk 의 G3 게이트가 이걸 드러냈다.
  */
 function detectWorkspaceRoot(): string {
-  // 1. 환경변수 우선
-  if (process.env.WORKSPACE_ROOT) {
-    return process.env.WORKSPACE_ROOT;
-  }
-
-  // 2. 현재 디렉토리에서 상위로 탐색
-  let current = process.cwd();
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    // 모노레포 root 감지
-    if (fs.existsSync(path.join(current, 'apps'))) {
-      return current;
-    }
-    // .claude 디렉토리가 있으면 여기가 프로젝트 루트
-    if (fs.existsSync(path.join(current, '.claude'))) {
-      return current;
-    }
-    // turbo.json + package.json = 모노레포
-    if (fs.existsSync(path.join(current, 'turbo.json')) && fs.existsSync(path.join(current, 'package.json'))) {
-      return current;
-    }
-    current = path.dirname(current);
-  }
-
-  // 3. 현재 작업 디렉토리 사용 (단일 프로젝트로 간주)
-  return process.cwd();
+  return sharedDetectWorkspaceRoot(process.cwd());
 }
 
 /**
