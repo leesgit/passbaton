@@ -29,3 +29,10 @@ coverage/
 .env
 .env.local
 .npmrc
+
+# passbaton data (never commit these -- .claude/settings.json is meant to be committed)
+.claude/sessions.db
+.claude/sessions.db-shm
+.claude/sessions.db-wal
+.claude/*.log
+.claude/.session-end-*.lock

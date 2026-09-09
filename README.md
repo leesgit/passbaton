@@ -183,6 +183,19 @@ Global installation is strongly recommended because:
 | **One update = everything refreshed** | `npm install -g <latest>` updates all projects at once; no per-project reinstall |
 | **Hooks resolve by bin name** | The installer writes the bare bin name (`passbaton-hook-*`) when it resolves on PATH — the normal case for `npm i -g`. Measured **135 ms** per fire vs **1,367 ms** for `npm exec -- …` (10×), and PostToolUse fires on every edit. If the name does not resolve (local install), it falls back to `npm exec -- …` |
 
+**Add the database to your project's `.gitignore`.** Since 2.4.0 passbaton creates
+`<project>/.claude/sessions.db` on the first session in any project it recognises as a
+workspace root, so a project that had no database before will get one:
+
+```gitignore
+.claude/sessions.db
+.claude/sessions.db-shm
+.claude/sessions.db-wal
+.claude/*.log
+```
+
+Do not ignore all of `.claude/` — `settings.json` there is meant to be committed.
+
 **Important**: Even with global install, you can still **disable the hook for specific projects** (see below).
 Global ≠ forced on every project.
 
