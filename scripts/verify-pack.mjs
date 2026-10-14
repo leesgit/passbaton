@@ -35,8 +35,7 @@ const check = (name, ok, detail = '') => {
   results.push({ name, ok });
   console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`);
   // CI 에서는 실패를 주석으로도 남긴다 — 단계 로그는 인증 없이 못 읽지만 주석은 공개 API 로 읽힌다
-  if (!ok && process.env.GITHUB_ACTIONS) console.log(`::error title=verify-pack::${name} — ${String(detail).replace(/?
-/g, ' ').slice(0, 900)}`);
+  if (!ok && process.env.GITHUB_ACTIONS) console.log(`::error title=verify-pack::${name} — ${String(detail).split(String.fromCharCode(10)).join(" ").slice(0, 900)}`);
   return ok;
 };
 // Windows 의 npm 은 .cmd 라 셸 없이 못 띄운다. 인자는 이 스크립트가 만든 값뿐.
