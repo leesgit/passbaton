@@ -35,6 +35,16 @@ afterEach(() => {
   }
 });
 
+/** fs.cpSync 대신 — Node 22 의 cpSync 는 Windows 에서 한글 경로로 복사하지 못했다(CI 실측: 대상에 install.js 없음). */
+function copyDir(from: string, to: string): void {
+  fs.mkdirSync(to, { recursive: true });
+  for (const e of fs.readdirSync(from, { withFileTypes: true })) {
+    const a = path.join(from, e.name);
+    const b = path.join(to, e.name);
+    if (e.isDirectory()) copyDir(a, b); else fs.copyFileSync(a, b);
+  }
+}
+
 /** node·npm 이 **없는** 최소 환경. 셸이 돌 만큼만 남긴다. */
 function barePathEnv(home: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const sys = process.env.SystemRoot ?? 'C:\\Windows';
@@ -139,7 +149,7 @@ describe.skipIf(!built)('install — Claude Code 훅은 PATH 없이 돈다', () 
     const home = tmpDir('pb-home-');
     const odd = path.join(tmpDir('pb-odd-'), '패스 바통', 'passbaton');
     fs.mkdirSync(odd, { recursive: true });
-    fs.cpSync(path.join(ROOT, 'dist'), path.join(odd, 'dist'), { recursive: true });
+    copyDir(path.join(ROOT, 'dist'), path.join(odd, 'dist'));
     fs.copyFileSync(path.join(ROOT, 'package.json'), path.join(odd, 'package.json'));
     fs.symlinkSync(path.join(ROOT, 'node_modules'), path.join(odd, 'node_modules'), 'junction');
     const r = spawnSync(process.execPath, [path.join(odd, 'dist', 'hooks', 'install.js'), 'install'], {
