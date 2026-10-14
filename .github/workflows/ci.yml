@@ -37,20 +37,25 @@ jobs:
         run: npm test
 
       # 배포 판정: 실제 tarball → 기본 설정 전역 설치 → 훅·MCP·SQLite (임시 prefix·HOME)
+      # 아래 판정들은 Tests 가 빨개도 돈다(작업은 빨강 그대로) — 기존 테스트 실패가 배포 판정을 가리지 않게
       - name: verify-pack (bundled npm)
+        if: success() || failure()
         run: node scripts/verify-pack.mjs
 
       # 역검증: 옛 postinstall 문자열로 포장하면 빨개져야 한다. POSIX sh 에서는 옛 줄이 정상 동작하므로 Windows 만.
       - name: verify-pack --break=shell (reverse check)
-        if: runner.os == 'Windows'
+        if: (success() || failure()) && runner.os == 'Windows'
         run: node scripts/verify-pack.mjs --break=shell
 
       # npm 설치 스크립트 정책(strict-allow-scripts · allow-scripts)은 npm 11.16+ 에 있다
       - name: Upgrade npm to 11
+        if: success() || failure()
         run: npm install -g npm@11
 
       - name: verify-pack --strict (install-script policy)
+        if: success() || failure()
         run: node scripts/verify-pack.mjs --strict
 
       - name: verify-pack --recover (scripts skipped → documented recovery)
+        if: success() || failure()
         run: node scripts/verify-pack.mjs --recover

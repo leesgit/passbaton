@@ -75,7 +75,12 @@ function freshEnv() {
   return { home, prefix, ws, env: { ...process.env, HOME: home, USERPROFILE: home } };
 }
 const install = (e, extra = []) => npm(['install', '-g', '--prefix', e.prefix, ...extra, tgz], { env: e.env });
-const lastLines = r => (r.stderr || '').split('\n').map(l => l.trim()).filter(Boolean).slice(-2).join(' | ');
+// 실패 진단용: npm 의 `npm error` 줄(경로·syscall 포함)을 우선, 없으면 끝 두 줄
+const lastLines = r => {
+  const lines = (r.stderr || '').split('\n').map(l => l.trim()).filter(Boolean);
+  const errs = lines.filter(l => l.startsWith('npm error') && !l.includes('A complete log'));
+  return (errs.length ? errs.slice(0, 10) : lines.slice(-2)).join(' | ');
+};
 
 /** 설치된 상태를 판정한다. 실패 수를 돌려준다. */
 async function verifyInstalled(e) {
