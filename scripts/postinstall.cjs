@@ -31,7 +31,7 @@ if (r.error || r.status !== 0) {
   const reason = r.error ? r.error.message : (lines[lines.length - 1] || `exit ${r.status}`);
   process.stderr.write(
     `passbaton: automatic hook setup did NOT complete (${reason}). ` +
-    'The package itself is installed. Retry with: npx passbaton-hooks install\n',
+    'The package itself is installed. Retry with: passbaton-hooks install  (or: npx passbaton install)\n',
   );
 }
 

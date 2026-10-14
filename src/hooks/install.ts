@@ -106,6 +106,58 @@ export function claudeHookCommand(name: string, nodePath: string, hooksDir: stri
   return `"${node}" "${file}"${extra}`;
 }
 
+/**
+ * Claude Code 가 `args`(**셸 없는 exec 형식**)를 아는 첫 판으로 잡은 값. 공식 2026-w20 요약
+ * (v2.1.139→v2.1.142)에 「hook `args: string[]` exec form」 이 있다 — 개별 판이 적혀 있지 않아 끝값을 쓴다.
+ */
+export const CLAUDE_EXEC_FORM_MIN: readonly [number, number, number] = [2, 1, 142];
+
+export function parseVersion(s: string): [number, number, number] | null {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(s);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+export function versionAtLeast(v: readonly number[], min: readonly number[]): boolean {
+  for (let i = 0; i < 3; i++) {
+    if ((v[i] ?? 0) !== (min[i] ?? 0)) return (v[i] ?? 0) > (min[i] ?? 0);
+  }
+  return true;
+}
+
+/**
+ * exec 형식을 쓸 것인가. 설치된 Claude Code 가 **확인된 옛 판**일 때만 셸 형식으로 물러난다.
+ * 판을 못 읽으면(데스크톱 앱만 · PATH 에 없음) exec — Claude Code 는 자동 갱신이 기본이다.
+ */
+export function chooseExecForm(claudeVersionOutput: string | null): boolean {
+  const v = claudeVersionOutput === null ? null : parseVersion(claudeVersionOutput);
+  return v === null || versionAtLeast(v, CLAUDE_EXEC_FORM_MIN);
+}
+
+function claudeVersionOutput(): string | null {
+  try {
+    const r = spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 15_000, shell: false });
+    return r.status === 0 ? r.stdout : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Claude Code 훅 항목 하나.
+ *
+ * **exec 형식**(`command` = node 절대 경로, `args` = [스크립트 절대 경로])이 기본이다 — Claude Code 가
+ * 셸 없이 바로 띄우므로 Git Bash 든, Git Bash 가 없는 Windows 의 PowerShell 이든 같고,
+ * 경로에 공백·특수문자가 있어도 따옴표가 필요 없다. ⚠ `command` 는 실제 실행 파일이어야 한다
+ * (npm 의 `.cmd` shim 은 셸 없이 못 띄운다) — 그래서 shim 이 아니라 node 를 쓴다.
+ * 옛 Claude Code(exec 형식 모름)에는 `claudeHookCommand` 의 셸 형식.
+ */
+export function claudeHookHandler(name: string, nodePath: string, hooksDir: string, execForm: boolean): HookHandler {
+  const script = HOOK_SCRIPTS[name];
+  if (script === undefined) throw new Error(`unknown hook: ${name}`);
+  if (!execForm) return { type: 'command', command: claudeHookCommand(name, nodePath, hooksDir) };
+  return { type: 'command', command: nodePath, args: [path.join(hooksDir, script)] };
+}
+
 /** 이 이름이 PATH 에서 실행 가능한가. 실패하면 false — 판정 불가는 안전한 쪽으로. */
 export function binResolves(name: string): boolean {
   try {
@@ -148,18 +200,35 @@ export function isOurHookCommand(command?: string, ownHooksDir: string = __dirna
   const c = command.trim();
   if (OUR_BIN_COMMAND.test(c)) return true;
   const abs = parseAbsoluteCommand(c);
-  if (!abs) return false;
-  const parts = abs.script.split(/[\\/]+/);
+  return abs !== null && isOurHookScript(abs.script, ownHooksDir);
+}
+
+/** 이 경로가 우리 훅 스크립트인가 — `<passbaton|옛 이름>/dist/hooks/<훅>.js` 이거나 지금 설치기 옆. */
+export function isOurHookScript(script: string, ownHooksDir: string = __dirname): boolean {
+  const parts = script.split(/[\\/]+/);
   const file = parts[parts.length - 1] ?? '';
   if (!OUR_SCRIPT_FILE.test(file)) return false;
   const norm = (p: string) => path.resolve(p).replace(/\\/g, '/').toLowerCase();
-  if (norm(path.dirname(abs.script)) === norm(ownHooksDir)) return true;
+  if (norm(path.dirname(script)) === norm(ownHooksDir)) return true;
   const pkg = parts[parts.length - 4] ?? '';
   return parts[parts.length - 3] === 'dist' && parts[parts.length - 2] === 'hooks'
     && (pkg === PKG_NAME || pkg === LEGACY_PKG_NAME);
 }
 
-type HookHandler = { command?: string; [k: string]: unknown };
+/**
+ * 훅 항목 하나가 우리 것인가. exec 형식(`args` 있음)은 `command` 가 node 이고
+ * `args` 가 우리 스크립트 하나일 때만 — 사용자가 node 로 자기 스크립트를 돌리는 줄은 남의 것이다.
+ */
+export function isOurHookHandler(h: HookHandler, ownHooksDir: string = __dirname): boolean {
+  if (h.args !== undefined) {
+    const args = h.args;
+    if (typeof h.command !== 'string' || !Array.isArray(args) || args.length !== 1 || typeof args[0] !== 'string') return false;
+    return /^node(?:\.exe)?$/i.test(path.basename(h.command)) && isOurHookScript(args[0], ownHooksDir);
+  }
+  return isOurHookCommand(h.command, ownHooksDir);
+}
+
+type HookHandler = { command?: string; args?: unknown; [k: string]: unknown };
 type HookEntry = { hooks?: HookHandler[]; matcher?: string; [k: string]: unknown };
 
 /**
@@ -173,7 +242,7 @@ export function stripOurHooks(entries: HookEntry[], ownHooksDir?: string): { kep
   const kept: HookEntry[] = [];
   for (const entry of entries) {
     const handlers = Array.isArray(entry.hooks) ? entry.hooks : [];
-    const others = handlers.filter(h => !isOurHookCommand(h.command, ownHooksDir));
+    const others = handlers.filter(h => !isOurHookHandler(h, ownHooksDir));
     removed += handlers.length - others.length;
     if (others.length === handlers.length) kept.push(entry);
     else if (others.length > 0) kept.push({ ...entry, hooks: others });
@@ -265,7 +334,7 @@ class InstallError extends Error {}
 function loadSettings(): Record<string, unknown> {
   const r = readJsonFile(SETTINGS_FILE);
   if (r.state === 'invalid') {
-    throw new InstallError(`${SETTINGS_FILE} is not valid JSON (${r.error}) — left untouched. Fix it, then run: npx passbaton-hooks install`);
+    throw new InstallError(`${SETTINGS_FILE} is not valid JSON (${r.error}) — left untouched. Fix it, then run: passbaton-hooks install`);
   }
   return r.state === 'ok' ? r.data : {};
 }
@@ -327,7 +396,7 @@ function installMcpServer(auto: boolean): void {
     return;
   }
   if (existing !== undefined && auto) {
-    console.log('   MCP server already registered (left as is — run `npx passbaton-hooks install` to rewrite it)');
+    console.log('   MCP server already registered (left as is — run `passbaton-hooks install` to rewrite it)');
     return;
   }
 
@@ -431,16 +500,18 @@ function install(auto: boolean): void {
   // ===== 0. Migrate from settings.local.json if needed =====
   migrateLegacyHooks();
 
-  // ===== 1. Hooks — Claude Code 는 node·스크립트 절대 경로 (claudeHookCommand 주석) =====
+  // ===== 1. Hooks — Claude Code 는 node·스크립트 절대 경로, 가능하면 셸 없는 exec 형식 (claudeHookHandler 주석) =====
   console.log('📌 Step 1: Installing Hooks...');
 
   const settings = loadSettings();
   const hooks = (settings.hooks && typeof settings.hooks === 'object'
     ? settings.hooks : {}) as Record<string, HookEntry[]>;
   const node = process.execPath;
-  const cmd = (name: string) => claudeHookCommand(name, node, __dirname);
+  const claudeVersion = claudeVersionOutput();
+  const execForm = chooseExecForm(claudeVersion);
   const entry = (name: string, matcher?: string): HookEntry =>
-    ({ ...(matcher ? { matcher } : {}), hooks: [{ type: 'command', command: cmd(name) }] });
+    ({ ...(matcher ? { matcher } : {}), hooks: [claudeHookHandler(name, node, __dirname, execForm)] });
+  console.log(`   form: ${execForm ? 'exec (no shell)' : 'shell'} — Claude Code ${claudeVersion?.trim() || 'version unknown'}`);
 
   const merge = (event: string, ours: HookEntry[]) => {
     hooks[event] = mergeEvent(hooks[event] || [], ours, auto);
@@ -454,8 +525,7 @@ function install(auto: boolean): void {
   settings.hooks = hooks;
   saveSettings(settings);
 
-  const sample = cmd('session-start');
-  if (parseAbsoluteCommand(sample) === null) {
+  if (!execForm && parseAbsoluteCommand(claudeHookCommand('session-start', node, __dirname)) === null) {
     console.error('⚠️ Install path has characters that cannot be quoted safely for every shell — hooks use `npm exec` and need npm on PATH');
   }
 
@@ -467,7 +537,7 @@ function install(auto: boolean): void {
   installGeminiHooks(auto);
 
   console.log(`✅ Hooks ${auto ? 'checked' : 'installed'} in ~/.claude/settings.json`);
-  if (auto) console.log('   (existing passbaton hook lines are kept as is — `npx passbaton-hooks install` rewrites them)');
+  if (auto) console.log('   (existing passbaton hook lines are kept as is — `passbaton-hooks install` rewrites them)');
   console.log('   SessionStart: context auto-load');
   console.log('   UserPromptSubmit: relevant memory injection');
   console.log('   PostToolUse: file change tracking (Edit, Write)');
@@ -484,7 +554,7 @@ function install(auto: boolean): void {
   console.log('✅ Installation complete. Start a new Claude Code session to activate.');
   console.log('');
   for (const line of RESTART_HINT) console.log(`   ${line}`);
-  console.log('   Check with: npx passbaton-hooks status');
+  console.log('   Check with: passbaton-hooks status');
   console.log('');
 }
 
@@ -570,13 +640,26 @@ function nodeRuns(nodePath: string): boolean {
   }
 }
 
-export type HookCheck = { form: 'absolute' | 'npm-exec' | 'npx' | 'bare'; ok: boolean; detail: string };
+export type HookCheck = { form: 'exec' | 'absolute' | 'npm-exec' | 'npx' | 'bare'; ok: boolean; detail: string };
 
 /**
  * 등록된 우리 훅 명령 하나를 **지금 이 프로세스의 환경에서** 판정한다.
  * 「등록됨」 · 「찾을 수 있음」 · 「실행됨」 을 가른다 — bare shim 이 있어도 node 가 없으면 실패다.
  * ⛔ 훅 자체는 실행하지 않는다(세션 데이터를 바꾼다). node 는 `--version` 으로만 확인한다.
  */
+/** 훅 항목 하나를 판정한다 — exec 형식(`args`)이면 node·스크립트를, 아니면 명령 문자열을. */
+export function checkHookHandler(h: HookHandler, envPath?: string): HookCheck {
+  if (Array.isArray(h.args) && typeof h.command === 'string' && typeof h.args[0] === 'string') {
+    const node = h.command;
+    const script = h.args[0];
+    if (!fs.existsSync(node)) return { form: 'exec', ok: false, detail: `node not found: ${node}` };
+    if (!fs.existsSync(script)) return { form: 'exec', ok: false, detail: `hook script not found: ${script}` };
+    if (!nodeRuns(node)) return { form: 'exec', ok: false, detail: `node does not run: ${node}` };
+    return { form: 'exec', ok: true, detail: 'node + script found, no shell, independent of PATH' };
+  }
+  return checkHookCommand(typeof h.command === 'string' ? h.command : '', envPath);
+}
+
 export function checkHookCommand(command: string, envPath?: string): HookCheck {
   const abs = parseAbsoluteCommand(command);
   if (abs) {
@@ -602,6 +685,28 @@ export function checkHookCommand(command: string, envPath?: string): HookCheck {
 
 const EXPECTED_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PreCompact', 'Stop'];
 
+/**
+ * 설치 스크립트가 있는 의존성 (이 판 기준 — npm 11.19 의 install-scripts 경고가 이 넷을 꼽았다).
+ * npm v12 는 허용 목록 밖의 설치 스크립트를 기본으로 건너뛴다. README 의 설치 명령과 같은 목록이다.
+ * ⚠ 의존성이 바뀌면 여기와 README 를 같이 고친다 — `scripts/verify-pack.mjs --strict` 가 어긋남을 잡는다.
+ */
+export const ALLOW_SCRIPTS = ['passbaton', 'better-sqlite3', 'sharp', 'protobufjs'] as const;
+
+/** 이 설치의 better-sqlite3 가 실제로 열리는가 — 별도 프로세스에서 메모리 DB 하나만 (부작용 없음). */
+function sqliteOpens(): { ok: boolean; detail: string } {
+  const pkgRoot = path.resolve(__dirname, '..', '..');
+  const code = "const D=require('better-sqlite3');new D(':memory:').prepare('select 1').get()";
+  try {
+    const r = spawnSync(process.execPath, ['-e', code], { cwd: pkgRoot, encoding: 'utf8', timeout: 20_000, shell: false });
+    if (r.status === 0) return { ok: true, detail: 'opens' };
+    const lines = (r.stderr || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const msg = lines.find(l => /Error:/.test(l)) ?? lines[0] ?? `exit ${r.status}`;
+    return { ok: false, detail: `does not load: ${msg}` };
+  } catch (e) {
+    return { ok: false, detail: `does not load: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
 /** 문제가 있으면 false (CLI 종료 1). PATH 에 기대는 항목은 실패는 아니지만 고칠 방법을 같이 보인다. */
 function status(): boolean {
   console.log('📊 passbaton status\n');
@@ -622,18 +727,18 @@ function status(): boolean {
   console.log('Claude Code hooks (~/.claude/settings.json):');
   for (const event of EXPECTED_EVENTS) {
     const ours = (hooks[event] || []).flatMap(e => (Array.isArray(e.hooks) ? e.hooks : []))
-      .map(h => h.command).filter((c): c is string => isOurHookCommand(c));
+      .filter(h => isOurHookHandler(h));
     if (ours.length === 0) {
       console.log(`  ❌ ${event}: not registered`);
       healthy = false;
       continue;
     }
-    for (const c of ours) {
-      const chk = checkHookCommand(c);
+    for (const h of ours) {
+      const chk = checkHookHandler(h);
       if (!chk.ok) healthy = false;
-      if (chk.form !== 'absolute') pathDependent = true;
+      if (chk.form !== 'absolute' && chk.form !== 'exec') pathDependent = true;
       console.log(`  ${chk.ok ? '✅' : '❌'} ${event} [${chk.form}] ${chk.detail}`);
-      console.log(`      → ${c}`);
+      console.log(`      → ${Array.isArray(h.args) ? JSON.stringify({ command: h.command, args: h.args }) : String(h.command)}`);
     }
   }
 
@@ -678,12 +783,24 @@ function status(): boolean {
     }
   }
 
+  // ⚠ 등록·경로 검사만으로는 「설치 스크립트가 건너뛰어진 설치」 를 못 잡는다(npm v12 기본 차단 · --ignore-scripts).
+  //   그때 가장 먼저 깨지는 것이 better-sqlite3 네이티브 바인딩이라 그것 하나는 실제로 연다. 다른 네이티브 의존성은 안 본다.
+  console.log('\nNative module (this install):');
+  const sqlite = sqliteOpens();
+  if (!sqlite.ok) healthy = false;
+  console.log(`  ${sqlite.ok ? '✅' : '❌'} better-sqlite3 ${sqlite.detail}`);
+  console.log('  (other install-time steps of dependencies are not checked)');
+  if (!sqlite.ok) {
+    console.log(`  Fix: reinstall allowing install scripts — npm install -g passbaton --allow-scripts=${ALLOW_SCRIPTS.join(',')}`);
+    console.log('       (re-running `passbaton-hooks install` does NOT rebuild this binding)');
+  }
+
   console.log('');
   if (!healthy || pathDependent) {
     if (!healthy) console.log('Some checks failed.');
     if (pathDependent) console.log('Some entries depend on PATH — they fail when the app running Claude Code has an old PATH.');
     console.log('Fix:');
-    console.log('  1. Run: npx passbaton-hooks install   (rewrites passbaton entries with absolute paths)');
+    console.log('  1. Run: passbaton-hooks install   (or: npx passbaton install) — rewrites passbaton entries with absolute paths');
     console.log('  2. Then restart the right way:');
     for (const line of RESTART_HINT) console.log(`     ${line}`);
   } else {
@@ -723,7 +840,7 @@ if (invokedDirectly) {
         if (!status()) process.exitCode = 1;
         break;
       default:
-        console.log('Usage: npx passbaton-hooks [install|uninstall|status]');
+        console.log('Usage: passbaton-hooks [install|uninstall|status]');
     }
   } catch (e) {
     // ⛔ 직접 실행한 install 이 실패하면 비0 으로 끝난다 — 「완료」 라고 말하지 않는다.

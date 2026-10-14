@@ -13,7 +13,8 @@ import * as path from 'path';
 import {
   hookCommand, binResolves, isOurHookCommand, claudeHookCommand, isQuotablePath, toShellPath,
   parseAbsoluteCommand, stripOurHooks, mergeEvent, readJsonFile, isOurMcpEntry, mcpServerEntry,
-  checkHookCommand, findOnPath,
+  checkHookCommand, findOnPath, claudeHookHandler, isOurHookHandler, chooseExecForm, CLAUDE_EXEC_FORM_MIN,
+  checkHookHandler,
 } from '../src/hooks/install.js';
 
 const dirs: string[] = [];
@@ -263,5 +264,69 @@ describe('binResolves', () => {
 
   it('던지지 않는다 (판정 불가는 안전한 쪽으로)', () => {
     expect(() => binResolves('')).not.toThrow();
+  });
+});
+
+// 2026-10-15 (Astra P2): Claude Code 는 Git Bash 가 없는 Windows 에서 훅을 PowerShell 로 띄운다.
+// 따옴표로 시작하는 셸 명령은 PowerShell 에서 문자열 식이 되어 아무것도 안 한다 →
+// 셸을 안 거치는 exec 형식(`command` + `args`)이 기본.
+describe('claudeHookHandler / isOurHookHandler — exec 형식', () => {
+  const hooksDir = path.join(os.tmpdir(), 'x', 'passbaton', 'dist', 'hooks');
+
+  it('exec 형식: command = node 그대로, args = [스크립트 절대 경로], 셸 따옴표 없음', () => {
+    const h = claudeHookHandler('post-tool', 'C:\\Program Files\\nodejs\\node.exe', hooksDir, true);
+    expect(h).toEqual({ type: 'command', command: 'C:\\Program Files\\nodejs\\node.exe', args: [path.join(hooksDir, 'post-tool-use.js')] });
+  });
+
+  it('exec 형식은 따옴표로 못 감싸는 경로도 그대로 쓴다 (npm exec 로 물러나지 않는다)', () => {
+    const h = claudeHookHandler('post-tool', '/opt/$weird/node', hooksDir, true);
+    expect(h.command).toBe('/opt/$weird/node');
+  });
+
+  it('셸 형식은 예전 따옴표 명령', () => {
+    expect(claudeHookHandler('session-end', '/usr/bin/node', hooksDir, false))
+      .toEqual({ type: 'command', command: claudeHookCommand('session-end', '/usr/bin/node', hooksDir) });
+  });
+
+  it('우리 exec 항목을 알아보고, node 로 남의 스크립트를 돌리는 줄은 남의 것으로 본다', () => {
+    expect(isOurHookHandler(claudeHookHandler('session-start', '/usr/bin/node', hooksDir, true))).toBe(true);
+    expect(isOurHookHandler({ command: 'C:\\nodejs\\node.exe', args: ['C:\\u\\npm\\node_modules\\passbaton\\dist\\hooks\\session-end.js'] })).toBe(true);
+    expect(isOurHookHandler({ command: '/usr/bin/node', args: ['/home/u/my-hooks/session-start.js'] })).toBe(false);
+    expect(isOurHookHandler({ command: '/usr/bin/node', args: [path.join(hooksDir, 'session-start.js'), '--fix'] })).toBe(false);
+    expect(isOurHookHandler({ command: '/usr/bin/python', args: [path.join(hooksDir, 'session-start.js')] })).toBe(false);
+    expect(isOurHookHandler({ command: 'npm exec -- passbaton-hook-post-tool' })).toBe(true);
+  });
+
+  it('stripOurHooks 가 exec 항목도 뺀다 (재설치 중복 방지)', () => {
+    const ours = { hooks: [claudeHookHandler('session-start', '/usr/bin/node', hooksDir, true)] };
+    expect(mergeEvent(mergeEvent([], [ours], false), [ours], false)).toEqual([ours]);
+  });
+});
+
+describe('chooseExecForm — 확인된 옛 Claude Code 에만 셸 형식', () => {
+  it('최소 판 이상·판 모름은 exec', () => {
+    expect(CLAUDE_EXEC_FORM_MIN).toEqual([2, 1, 142]);
+    expect(chooseExecForm('2.1.299 (Claude Code)')).toBe(true);
+    expect(chooseExecForm('2.1.142 (Claude Code)')).toBe(true);
+    expect(chooseExecForm('3.0.0')).toBe(true);
+    expect(chooseExecForm(null)).toBe(true);
+    expect(chooseExecForm('weird output')).toBe(true);
+  });
+
+  it('최소 판 미만은 셸', () => {
+    expect(chooseExecForm('2.1.141 (Claude Code)')).toBe(false);
+    expect(chooseExecForm('1.9.999')).toBe(false);
+  });
+});
+
+describe('checkHookHandler — exec 항목', () => {
+  it('지금 node + 실제 스크립트면 통과, 사라진 스크립트는 실패', () => {
+    const d = tmpDir('pb-exec-');
+    const script = path.join(d, 'session-start.js');
+    fs.writeFileSync(script, '');
+    expect(checkHookHandler({ command: process.execPath, args: [script] }, tmpDir('pb-empty3-')))
+      .toMatchObject({ form: 'exec', ok: true });
+    expect(checkHookHandler({ command: process.execPath, args: [path.join(d, 'gone.js')] }))
+      .toMatchObject({ form: 'exec', ok: false });
   });
 });

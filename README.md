@@ -146,7 +146,7 @@ npm install -g passbaton          # installs the new package
 npm uninstall -g claude-session-continuity-mcp   # optional: drop the old one
 ```
 
-To rewrite your hook entries, run `npx passbaton-hooks install` once: it replaces the old `claude-hook-*` lines with the current form and matches on both names, so you won't end up with duplicates. (The automatic install during `npm install -g` adds missing hooks but leaves existing passbaton lines as they are.) Your existing `sessions.db` is untouched: **all past sessions, memories, and solutions carry over.**
+To rewrite your hook entries, run `passbaton-hooks install` once: it replaces the old `claude-hook-*` lines with the current form and matches on both names, so you won't end up with duplicates. (The automatic install during `npm install -g` adds missing hooks but leaves existing passbaton lines as they are.) Your existing `sessions.db` is untouched: **all past sessions, memories, and solutions carry over.**
 
 Nothing else changes — same hooks, same database, same behavior.
 
@@ -170,10 +170,25 @@ npm install -g passbaton
 1. Registers MCP server in `~/.claude.json`
 2. Installs Claude Hooks in `~/.claude/settings.json`
 
+> **npm install-script policy (npm 11.16+ / v12).** passbaton needs install-time scripts:
+> its own postinstall (registers hooks and the MCP server) and `better-sqlite3`'s native
+> build. npm 11 runs them with an `install-scripts … not yet covered by allowScripts`
+> warning; with `strict-allow-scripts=true` the install fails; npm v12 is announced to skip
+> unapproved install scripts by default — passbaton would then install **without hooks and
+> without a working SQLite binding**. Approve them explicitly:
+>
+> ```bash
+> npm install -g passbaton --allow-scripts=passbaton,better-sqlite3,sharp,protobufjs
+> ```
+>
+> If an install ran with scripts skipped (`passbaton-hooks status` reports
+> `better-sqlite3 does not load`), run that same command again. Re-running
+> `passbaton-hooks install` alone does **not** rebuild the SQLite binding.
+
 Then check it and start Claude Code:
 
 ```bash
-npx passbaton-hooks status
+passbaton-hooks status
 ```
 
 > **Installed Node.js just now?** If Claude Code was already open before Node.js was
@@ -182,8 +197,12 @@ npx passbaton-hooks status
 > old PATH. No reboot is needed for this.
 >
 > npm hides postinstall output by default, so if setup could not finish you may not see a
-> message — `npx passbaton-hooks status` shows what is registered, and
-> `npx passbaton-hooks install` (re)writes it.
+> message — `passbaton-hooks status` shows what is registered, and
+> `passbaton-hooks install` (re)writes it.
+
+> `passbaton-hooks` is a command installed by the `passbaton` package — there is no npm
+> package with that name, so don't run it through `npx passbaton-hooks`. Without a global
+> install, use `npx passbaton install` / `npx passbaton status` (same installer).
 
 #### Troubleshooting: `npm: command not found` / `node: not found` in a hook
 
@@ -194,9 +213,9 @@ Failed with non-blocking status code: /usr/bin/bash: line 1: npm: command not fo
 
 The app that launched Claude Code has a PATH without Node.js (typically because it was
 opened before Node.js was installed). Hooks written by older versions call `npm exec` and
-need npm on that PATH. Run `npx passbaton-hooks install` from a terminal that has Node.js
+need npm on that PATH. Run `passbaton-hooks install` from a terminal that has Node.js
 — it rewrites passbaton's hooks and MCP entry with absolute paths — then restart as above.
-`npx passbaton-hooks status` tells you which entries still depend on PATH. Its check uses
+`passbaton-hooks status` tells you which entries still depend on PATH. Its check uses
 the PATH of the terminal you run it in, not that of an already running Claude Code session.
 
 ### Why Global (`-g`)?
@@ -210,7 +229,7 @@ Global installation is strongly recommended because:
 | **Hooks are user-scoped** | `~/.claude/settings.json` lives in your home directory, not per-project |
 | **Cross-project context** | Sessions from `app-a` and `app-b` share the same DB and search index |
 | **One update = everything refreshed** | `npm install -g <latest>` updates all projects at once; no per-project reinstall |
-| **Hooks don't depend on PATH** | Claude Code hooks are written as `"<node>" "<package>/dist/hooks/<hook>.js"` using the Node.js that ran the install, so they work even when the app running Claude Code has an old PATH. It is also fast: about **117 ms** per fire vs **1,357 ms** for `npm exec -- …` (one Windows PC; PostToolUse fires on every edit). If you move or reinstall Node.js, run `npx passbaton-hooks install` again (`status` reports a missing node or script). Codex / Gemini hooks keep the PATH-based form for now |
+| **Hooks don't depend on PATH** | Claude Code hooks are written as `"<node>" "<package>/dist/hooks/<hook>.js"` using the Node.js that ran the install, so they work even when the app running Claude Code has an old PATH. It is also fast: about **117 ms** per fire vs **1,357 ms** for `npm exec -- …` (one Windows PC; PostToolUse fires on every edit). If you move or reinstall Node.js, run `passbaton-hooks install` again (`status` reports a missing node or script). Codex / Gemini hooks keep the PATH-based form for now |
 
 **Add the database to your project's `.gitignore`.** Since 2.4.0 passbaton creates
 `<project>/.claude/sessions.db` on the first session in any project it recognises as a
@@ -315,13 +334,13 @@ Drawback: you must install separately in every project, `npm exec` may not find 
 
 ```bash
 # Check hook status
-npx passbaton-hooks status
+passbaton-hooks status
 
 # Reinstall hooks
-npx passbaton-hooks install
+passbaton-hooks install
 
 # Remove hooks
-npx passbaton-hooks uninstall
+passbaton-hooks uninstall
 ```
 
 ### 3. Restart Claude Code
@@ -489,13 +508,13 @@ The only genuinely user-flippable flags today are **`compactionHandover`, `hotPa
 
 ```bash
 # Check status
-npx passbaton-hooks status
+passbaton-hooks status
 
 # Reinstall
-npx passbaton-hooks install
+passbaton-hooks install
 
 # Remove
-npx passbaton-hooks uninstall
+passbaton-hooks uninstall
 
 # Temporarily disable
 export MCP_HOOKS_DISABLED=true

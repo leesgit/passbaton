@@ -1,91 +1,56 @@
 name: CI
 
+# ⚠ 예전 판은 `paths: tools/project-manager-mcp/**` 에만 걸려 있었는데 이 레포에 그 경로가 없다 —
+#   CI 가 한 번도 돌지 않았다(2026-10-15 발견). 레포 루트 기준으로 다시 썼다.
 on:
   push:
-    branches: [main, master]
-    paths:
-      - 'tools/project-manager-mcp/**'
+    branches: [main, 'fix/**', 'feat/**']
   pull_request:
-    branches: [main, master]
-    paths:
-      - 'tools/project-manager-mcp/**'
-
-defaults:
-  run:
-    working-directory: tools/project-manager-mcp
+    branches: [main]
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [18.x, 20.x]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24]   # engines: >=22 (better-sqlite3 프리빌드가 있는 판)
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: 'npm'
-          cache-dependency-path: tools/project-manager-mcp/package-lock.json
+          node-version: ${{ matrix.node }}
 
+      # 레포에 lockfile 이 없어 npm ci 를 못 쓴다. 이 install 은 우리 postinstall 도 돌린다 —
+      # dist 가 아직 없으니 래퍼가 「did NOT complete」 경고만 남기고 0 으로 끝나야 한다(A 의 실전 확인).
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Build
         run: npm run build
 
-      - name: Run tests
+      - name: Tests
         run: npm test
 
-      - name: Run tests with coverage
-        run: npm run test:coverage
-        if: matrix.node-version == '20.x'
+      # 배포 판정: 실제 tarball → 기본 설정 전역 설치 → 훅·MCP·SQLite (임시 prefix·HOME)
+      - name: verify-pack (bundled npm)
+        run: node scripts/verify-pack.mjs
 
-  lint:
-    runs-on: ubuntu-latest
+      # 역검증: 옛 postinstall 문자열로 포장하면 빨개져야 한다. POSIX sh 에서는 옛 줄이 정상 동작하므로 Windows 만.
+      - name: verify-pack --break=shell (reverse check)
+        if: runner.os == 'Windows'
+        run: node scripts/verify-pack.mjs --break=shell
 
-    steps:
-      - uses: actions/checkout@v4
+      # npm 설치 스크립트 정책(strict-allow-scripts · allow-scripts)은 npm 11.16+ 에 있다
+      - name: Upgrade npm to 11
+        run: npm install -g npm@11
 
-      - name: Use Node.js 20.x
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20.x
-          cache: 'npm'
-          cache-dependency-path: tools/project-manager-mcp/package-lock.json
+      - name: verify-pack --strict (install-script policy)
+        run: node scripts/verify-pack.mjs --strict
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type check
-        run: npm run build
-
-  build-check:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Use Node.js 20.x
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20.x
-          cache: 'npm'
-          cache-dependency-path: tools/project-manager-mcp/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Check dist files
-        run: |
-          test -f dist/index.js || exit 1
-          test -f dist/schemas.js || exit 1
-          test -d dist/tools-v2 || exit 1
-          echo "✅ All required dist files exist"
+      - name: verify-pack --recover (scripts skipped → documented recovery)
+        run: node scripts/verify-pack.mjs --recover

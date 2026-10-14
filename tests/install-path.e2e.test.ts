@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { claudeHookCommand } from '../src/hooks/install.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(here, '..');
@@ -52,8 +53,15 @@ function runInstaller(home: string, args: string[], env: Record<string, string> 
 }
 
 const readSettings = (home: string) => JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
-const commandsOf = (settings: { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> }, event: string) =>
-  (settings.hooks[event] ?? []).flatMap(e => e.hooks.map(h => h.command));
+type Handler = { command: string; args?: string[] };
+type Settings = { hooks: Record<string, Array<{ hooks: Handler[] }>> };
+const handlersOf = (settings: Settings, event: string) => (settings.hooks[event] ?? []).flatMap(e => e.hooks);
+/** 비교용 한 줄 — exec 형식이면 command + args */
+const commandsOf = (settings: Settings, event: string) =>
+  handlersOf(settings, event).map(h => (h.args ? [h.command, ...h.args].join(' ') : h.command));
+/** Claude Code 가 exec 형식을 띄우는 방식 그대로: 셸 없이 command 를 args 로 */
+const runExec = (h: Handler, input: string, env: NodeJS.ProcessEnv) =>
+  spawnSync(h.command, h.args ?? [], { input, env, encoding: 'utf8', timeout: 60_000, shell: false });
 
 /** 이 PC 에서 훅을 띄울 수 있는 셸들 (Claude Code 는 Windows 에서 Git Bash 로 띄운다). */
 function shells(): Array<{ name: string; run: (cmd: string, input: string, env: NodeJS.ProcessEnv) => ReturnType<typeof spawnSync> }> {
@@ -72,50 +80,60 @@ function shells(): Array<{ name: string; run: (cmd: string, input: string, env: 
 }
 
 describe.skipIf(!built)('install — Claude Code 훅은 PATH 없이 돈다', () => {
-  it('빈 HOME 에 절대 경로 훅 5종 + MCP 항목을 쓴다 (종료 0)', () => {
+  it('빈 HOME 에 exec 형식 훅 5종(node 절대 + 스크립트 절대, 셸 없음) + MCP 항목을 쓴다 (종료 0)', () => {
     const home = tmpDir('pb-home-');
     const r = runInstaller(home, ['install']);
     expect(r.status, r.stderr).toBe(0);
     const s = readSettings(home);
-    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreCompact', 'Stop']) {
-      const cs = commandsOf(s, ev);
-      expect(cs).toHaveLength(1);
-      expect(cs[0].startsWith(`"${process.execPath.replace(/\\/g, win ? '/' : '\\')}" "`)).toBe(true);
+    for (const [ev, file] of [['SessionStart', 'session-start.js'], ['UserPromptSubmit', 'user-prompt-submit.js'],
+      ['PreCompact', 'pre-compact.js'], ['Stop', 'session-end.js']]) {
+      const hs = handlersOf(s, ev);
+      expect(hs).toHaveLength(1);
+      expect(hs[0]).toEqual({ type: 'command', command: process.execPath, args: [path.join(ROOT, 'dist', 'hooks', file)] });
     }
-    expect(commandsOf(s, 'PostToolUse')).toHaveLength(2);
+    expect(handlersOf(s, 'PostToolUse')).toHaveLength(2);
     const mcp = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).mcpServers['project-manager'];
     expect(mcp).toEqual({ command: process.execPath, args: [path.join(ROOT, 'dist', 'index.js')] });
   });
 
-  it('등록된 훅을 node·npm 없는 PATH 의 셸로 돌려도 성공하고 실제로 일한다', () => {
+  it('등록된 훅을 node·npm 없는 PATH 에서 셸 없이 띄워도 성공하고 실제로 일한다', () => {
     const home = tmpDir('pb-home-');
     expect(runInstaller(home, ['install']).status).toBe(0);
     const s = readSettings(home);
+    const ws = tmpDir('pb-ws-');
+    fs.mkdirSync(path.join(ws, '.git'));
+    const env = barePathEnv(home);
+    // 대조: 같은 PATH 에서 옛 형태는 죽는다 — 시험 환경이 정말 node·npm 없는 환경인지
+    for (const sh of shells()) {
+      expect(sh.run('npm exec -- passbaton-hook-session-start', '{}', env).status, `${sh.name}: legacy form must fail here`).not.toBe(0);
+    }
+    const start = runExec(handlersOf(s, 'SessionStart')[0], JSON.stringify({ session_id: 't', cwd: ws, hook_event_name: 'SessionStart' }), env);
+    expect(start.status, start.stderr).toBe(0);
+    expect(start.stdout).toContain('<session-context');
+    expect(fs.existsSync(path.join(ws, '.claude', 'sessions.db'))).toBe(true);
+    for (const ev of ['UserPromptSubmit', 'PostToolUse', 'PreCompact', 'Stop']) {
+      const input = JSON.stringify({ session_id: 't', cwd: ws, hook_event_name: ev, prompt: 'probe',
+        tool_name: 'Edit', tool_input: { file_path: path.join(ws, 'a.txt') } });
+      const r = runExec(handlersOf(s, ev)[0], input, env);
+      expect(r.status, `${ev}: ${r.stderr}`).toBe(0);
+    }
+  });
+
+  it('옛 Claude Code 용 셸 형식도 node·npm 없는 PATH 의 각 셸(bash·sh·cmd)에서 돈다', () => {
+    const home = tmpDir('pb-home-');
     const available = shells();
     expect(available.length).toBeGreaterThan(0);
     for (const sh of available) {
       const ws = tmpDir(`pb-ws-${sh.name}-`);
       fs.mkdirSync(path.join(ws, '.git'));
-      const env = barePathEnv(home);
-      // 같은 PATH 에서 옛 형태는 죽는다 — 시험 환경이 정말 node·npm 없는 환경인지의 대조
-      const legacy = sh.run('npm exec -- passbaton-hook-session-start', '{}', env);
-      expect(legacy.status, `${sh.name}: legacy form must fail here`).not.toBe(0);
-
-      const start = sh.run(commandsOf(s, 'SessionStart')[0], JSON.stringify({ session_id: 't', cwd: ws, hook_event_name: 'SessionStart' }), env);
-      expect(start.status, `${sh.name}: ${start.stderr}`).toBe(0);
-      expect(start.stdout).toContain('<session-context');
-      expect(fs.existsSync(path.join(ws, '.claude', 'sessions.db'))).toBe(true);
-
-      for (const ev of ['UserPromptSubmit', 'PostToolUse', 'PreCompact', 'Stop']) {
-        const input = JSON.stringify({ session_id: 't', cwd: ws, hook_event_name: ev, prompt: 'probe',
-          tool_name: 'Edit', tool_input: { file_path: path.join(ws, 'a.txt') } });
-        const r = sh.run(commandsOf(s, ev)[0], input, env);
-        expect(r.status, `${sh.name} ${ev}: ${r.stderr}`).toBe(0);
-      }
+      const c = claudeHookCommand('session-start', process.execPath, path.join(ROOT, 'dist', 'hooks'));
+      const out = sh.run(c, JSON.stringify({ session_id: 't', cwd: ws, hook_event_name: 'SessionStart' }), barePathEnv(home));
+      expect(out.status, `${sh.name}: ${out.stderr}`).toBe(0);
+      expect(out.stdout).toContain('<session-context');
     }
   });
 
-  it('공백·한글이 든 설치 경로도 각 셸에서 돈다', () => {
+  it('공백·한글이 든 설치 경로: exec 형식과 셸 형식 모두 돈다', () => {
     const home = tmpDir('pb-home-');
     const odd = path.join(tmpDir('pb-odd-'), '패스 바통', 'passbaton');
     fs.mkdirSync(odd, { recursive: true });
@@ -125,12 +143,19 @@ describe.skipIf(!built)('install — Claude Code 훅은 PATH 없이 돈다', () 
     const r = spawnSync(process.execPath, [path.join(odd, 'dist', 'hooks', 'install.js'), 'install'], {
       env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
     expect(r.status, r.stderr).toBe(0);
-    const c = commandsOf(readSettings(home), 'SessionStart')[0];
-    expect(c).toContain('패스 바통');
+    const h = handlersOf(readSettings(home), 'SessionStart')[0];
+    expect(h.args?.[0]).toContain('패스 바통');
+    const input = (ws: string) => JSON.stringify({ session_id: 't', cwd: ws, hook_event_name: 'SessionStart' });
+    const ws0 = tmpDir('pb-ws-');
+    fs.mkdirSync(path.join(ws0, '.git'));
+    const ex = runExec(h, input(ws0), barePathEnv(home));
+    expect(ex.status, ex.stderr).toBe(0);
+    expect(ex.stdout).toContain('<session-context');
+    const c = claudeHookCommand('session-start', process.execPath, path.join(odd, 'dist', 'hooks'));
     for (const sh of shells()) {
       const ws = tmpDir('pb-ws-');
       fs.mkdirSync(path.join(ws, '.git'));
-      const out = sh.run(c, JSON.stringify({ session_id: 't', cwd: ws, hook_event_name: 'SessionStart' }), barePathEnv(home));
+      const out = sh.run(c, input(ws), barePathEnv(home));
       expect(out.status, `${sh.name}: ${out.stderr}`).toBe(0);
       expect(out.stdout).toContain('<session-context');
     }
@@ -217,7 +242,7 @@ describe.skipIf(!built)('postinstall — 자동 설정 실패가 패키지 설�
     expect(r.status).toBe(0);
     expect(r.stderr).toContain('did NOT complete');
     expect(r.stderr).toContain('not valid JSON');
-    expect(r.stderr).toContain('npx passbaton-hooks install');
+    expect(r.stderr).toContain('passbaton-hooks install');
     expect(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8')).toBe('{oops');
   });
 
@@ -254,17 +279,20 @@ describe.skipIf(!built)('status — 등록됨·찾을 수 있음·실행됨을 �
     const file = path.join(home, '.claude', 'settings.json');
     const s = JSON.parse(fs.readFileSync(file, 'utf8'));
     // 설치 위치가 통째로 사라진 경우: 형태는 우리 것(…/passbaton/dist/hooks/…)인데 파일이 없다
-    const gone = path.join(tmpDir('pb-gone-'), 'passbaton', 'dist', 'hooks', 'session-start.js').replace(/\\/g, '/');
-    s.hooks.SessionStart[0].hooks[0].command = `"${process.execPath.replace(/\\/g, '/')}" "${gone}"`;
+    const goneDir = path.join(tmpDir('pb-gone-'), 'passbaton', 'dist', 'hooks');
+    s.hooks.SessionStart[0].hooks[0].args = [path.join(goneDir, 'session-start.js')];                  // exec 형식
+    s.hooks.UserPromptSubmit[0].hooks[0] = { type: 'command',                                         // 셸 형식(옛 Claude Code)
+      command: `"${process.execPath.replace(/\\/g, '/')}" "${path.join(goneDir, 'user-prompt-submit.js').replace(/\\/g, '/')}"` };
     delete s.hooks.PreCompact;
-    s.hooks.Stop[0].hooks[0].command = 'npm exec -- passbaton-hook-session-end';
+    s.hooks.Stop[0].hooks[0] = { type: 'command', command: 'npm exec -- passbaton-hook-session-end' };
     fs.writeFileSync(file, JSON.stringify(s));
     const r = spawnSync(process.execPath, [INSTALLER, 'status'], { env: barePathEnv(home), encoding: 'utf8' });
     expect(r.status).toBe(1);
-    expect(r.stdout).toMatch(/SessionStart \[absolute\] hook script not found/);
+    expect(r.stdout).toMatch(/SessionStart \[exec\] hook script not found/);
+    expect(r.stdout).toMatch(/UserPromptSubmit \[absolute\] hook script not found/);
     expect(r.stdout).toContain('PreCompact: not registered');
     expect(r.stdout).toMatch(/Stop \[npm-exec\] npm not on PATH/);
-    expect(r.stdout).toContain('npx passbaton-hooks install');
+    expect(r.stdout).toContain('passbaton-hooks install');
     expect(r.stdout).toContain('No reboot is needed');
   });
 });
