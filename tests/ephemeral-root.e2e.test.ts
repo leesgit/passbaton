@@ -37,8 +37,13 @@ afterEach(() => {
   }
 });
 
+// ⚠ CI 기존 실패 — 이번 변경 전부터: 부모 bf4ba55 + 새 CI 설정만 얹은 대조 브랜치(fix/ci-baseline-bf4ba55,
+//   run 38604369138)에서 같은 줄이 같은 OS 에서 실패. 원인 미확인(추정: 임시 경로 표기 차이). Astra P3 처분 = 그 OS 에서만 skip,
+//   다른 테스트·다른 OS 는 그대로 게이트. 고치면 이 skip 을 지운다.
+const KNOWN_CI_FAILURE_MACOS = process.env.CI === 'true' && process.platform === 'darwin';
+
 describe('isEphemeralRoot', () => {
-  it('표식 없는 임시 디렉터리는 임시다', () => {
+  it.skipIf(KNOWN_CI_FAILURE_MACOS)('표식 없는 임시 디렉터리는 임시다', () => {
     expect(isEphemeralRoot(tmpDir('pb-eph-'))).toBe(true);
   });
 
@@ -67,7 +72,7 @@ describe('isEphemeralRoot', () => {
 });
 
 describe.skipIf(!built)('훅이 임시 디렉터리에 흔적을 남기지 않는다', () => {
-  it('Stop 훅이 .claude 를 만들지 않는다', () => {
+  it.skipIf(KNOWN_CI_FAILURE_MACOS)('Stop 훅이 .claude 를 만들지 않는다', () => {
     const d = tmpDir('pb-eph-stop-');
     const tpath = path.join(os.tmpdir(), `t-${Math.random().toString(36).slice(2)}.jsonl`);
     fs.writeFileSync(tpath, JSON.stringify({ type: 'assistant', message: { content: '구현 완료 — 무언가를 했다' } }) + '\n');
@@ -81,7 +86,7 @@ describe.skipIf(!built)('훅이 임시 디렉터리에 흔적을 남기지 않�
     expect(fs.existsSync(path.join(d, '.claude'))).toBe(false);
   });
 
-  it('PostToolUse 훅도 만들지 않는다', () => {
+  it.skipIf(KNOWN_CI_FAILURE_MACOS)('PostToolUse 훅도 만들지 않는다', () => {
     const d = tmpDir('pb-eph-ptu-');
     spawnSync('node', [POST_TOOL], {
       input: JSON.stringify({

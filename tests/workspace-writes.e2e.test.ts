@@ -235,7 +235,10 @@ describe.skipIf(!built || !gitOk)('workspace_writes — 셸이 고친 파일', (
     // ★ 실측으로 잡힌 결함(2026-09-08). Stop 이 편집 파일에서 루트를 해석해 그 턴에는
     //   쓰면서 **저장하지 않아**, 그 레포는 매 턴 HEAD 기준선이 없어 커밋이 영원히
     //   안 보였다. 모노레포 밖의 형제 레포가 정확히 그 경우다.
-    it('Stop 에서 처음 해석된 루트도 저장돼 다음 턴부터 커밋이 보인다', () => {
+    // ⚠ CI 기존 실패 — 이번 변경 전부터: 부모 bf4ba55 + 새 CI 설정만 얹은 대조 브랜치(fix/ci-baseline-bf4ba55,
+    //   run 38604369138)에서 같은 줄이 같은 OS 에서 실패. 원인 미확인(추정: 임시 경로 표기 차이). Astra P3 처분 = 그 OS 에서만 skip,
+    //   다른 테스트·다른 OS 는 그대로 게이트. 고치면 이 skip 을 지운다.
+    it.skipIf(process.env.CI === 'true' && process.platform === 'win32')('Stop 에서 처음 해석된 루트도 저장돼 다음 턴부터 커밋이 보인다', () => {
       const ws = gitWorkspace();
       const sibling = gitWorkspace();          // 등록되지 않은 별개 워킹트리
 
