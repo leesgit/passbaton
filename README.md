@@ -146,7 +146,7 @@ npm install -g passbaton          # installs the new package
 npm uninstall -g claude-session-continuity-mcp   # optional: drop the old one
 ```
 
-The installer rewrites your hook entries to `passbaton-hook-*` and removes the old `claude-hook-*` lines — it matches on both names, so you won't end up with duplicates. Your existing `sessions.db` is untouched: **all past sessions, memories, and solutions carry over.**
+To rewrite your hook entries, run `npx passbaton-hooks install` once: it replaces the old `claude-hook-*` lines with the current form and matches on both names, so you won't end up with duplicates. (The automatic install during `npm install -g` adds missing hooks but leaves existing passbaton lines as they are.) Your existing `sessions.db` is untouched: **all past sessions, memories, and solutions carry over.**
 
 Nothing else changes — same hooks, same database, same behavior.
 
@@ -170,6 +170,35 @@ npm install -g passbaton
 1. Registers MCP server in `~/.claude.json`
 2. Installs Claude Hooks in `~/.claude/settings.json`
 
+Then check it and start Claude Code:
+
+```bash
+npx passbaton-hooks status
+```
+
+> **Installed Node.js just now?** If Claude Code was already open before Node.js was
+> installed, fully quit the app that launched it (VS Code, your terminal app) and start it
+> again, then start Claude Code. Opening a new tab or window in the same app can keep the
+> old PATH. No reboot is needed for this.
+>
+> npm hides postinstall output by default, so if setup could not finish you may not see a
+> message — `npx passbaton-hooks status` shows what is registered, and
+> `npx passbaton-hooks install` (re)writes it.
+
+#### Troubleshooting: `npm: command not found` / `node: not found` in a hook
+
+```
+UserPromptSubmit hook error
+Failed with non-blocking status code: /usr/bin/bash: line 1: npm: command not found
+```
+
+The app that launched Claude Code has a PATH without Node.js (typically because it was
+opened before Node.js was installed). Hooks written by older versions call `npm exec` and
+need npm on that PATH. Run `npx passbaton-hooks install` from a terminal that has Node.js
+— it rewrites passbaton's hooks and MCP entry with absolute paths — then restart as above.
+`npx passbaton-hooks status` tells you which entries still depend on PATH. Its check uses
+the PATH of the terminal you run it in, not that of an already running Claude Code session.
+
 ### Why Global (`-g`)?
 
 This tool is designed to track **all your Claude Code projects** in a single unified database.
@@ -181,7 +210,7 @@ Global installation is strongly recommended because:
 | **Hooks are user-scoped** | `~/.claude/settings.json` lives in your home directory, not per-project |
 | **Cross-project context** | Sessions from `app-a` and `app-b` share the same DB and search index |
 | **One update = everything refreshed** | `npm install -g <latest>` updates all projects at once; no per-project reinstall |
-| **Hooks resolve by bin name** | The installer writes the bare bin name (`passbaton-hook-*`) when it resolves on PATH — the normal case for `npm i -g`. Measured **135 ms** per fire vs **1,367 ms** for `npm exec -- …` (10×), and PostToolUse fires on every edit. If the name does not resolve (local install), it falls back to `npm exec -- …` |
+| **Hooks don't depend on PATH** | Claude Code hooks are written as `"<node>" "<package>/dist/hooks/<hook>.js"` using the Node.js that ran the install, so they work even when the app running Claude Code has an old PATH. It is also fast: about **117 ms** per fire vs **1,357 ms** for `npm exec -- …` (one Windows PC; PostToolUse fires on every edit). If you move or reinstall Node.js, run `npx passbaton-hooks install` again (`status` reports a missing node or script). Codex / Gemini hooks keep the PATH-based form for now |
 
 **Add the database to your project's `.gitignore`.** Since 2.4.0 passbaton creates
 `<project>/.claude/sessions.db` on the first session in any project it recognises as a

@@ -38,7 +38,7 @@ const LEGACY_PKG_NAME = 'claude-session-continuity-mcp';
 const HOOK_PREFIX = 'passbaton-hook-';
 
 /**
- * 훅 실행 명령을 만든다.
+ * 훅 실행 명령을 만든다 (Codex / Gemini 용 — Claude Code 는 `claudeHookCommand`).
  *
  * 원래는 무조건 `npm exec -- <bin>` 이었다. 로컬 설치에서도 node_modules/.bin 을
  * 찾아주므로 경로 독립적이라는 이유였는데, **매 Edit/Write 마다 그 대가를 낸다.**
@@ -46,15 +46,64 @@ const HOOK_PREFIX = 'passbaton-hook-';
  *
  *   npm exec -- passbaton-hook-post-tool   1,357 ms
  *   passbaton-hook-post-tool (이름만)         125 ms   ← 10.9배
- *   node <절대 dist 경로>                      117 ms   (경로가 박혀 취약)
+ *   node <절대 dist 경로>                      117 ms
  *
- * 그래서 **설치 시점에 이름이 PATH 에서 풀리는지 확인하고**(전역 설치의 정상 상태)
- * 풀리면 이름만 쓴다. 안 풀리면 예전 그대로 `npm exec` — 즉 최악이어도 현상 유지다.
- * 절대경로는 쓰지 않는다: 설치 위치가 바뀌면 조용히 깨진다.
+ * 그래서 **설치 시점에 이름이 PATH 에서 풀리는지 확인하고** 풀리면 이름만 쓴다.
+ * ⚠ 둘 다 **훅을 띄우는 프로세스의 PATH** 에 기댄다 — Codex·Gemini 가 Windows 에서
+ * 훅을 어떤 셸로 띄우는지 확인하지 못해서(PowerShell 이면 따옴표로 시작하는 절대 경로
+ * 명령이 문자열 식이 된다) 이 둘은 바꾸지 않았다.
  */
 export function hookCommand(name: string, bareResolves: boolean, extra = ''): string {
   const bin = `${HOOK_PREFIX}${name}${extra}`;
   return bareResolves ? bin : `npm exec -- ${bin}`;
+}
+
+/** 훅 이름 → dist/hooks 안의 스크립트 파일. */
+export const HOOK_SCRIPTS: Readonly<Record<string, string>> = {
+  'session-start': 'session-start.js',
+  'user-prompt': 'user-prompt-submit.js',
+  'post-tool': 'post-tool-use.js',
+  'pre-compact': 'pre-compact.js',
+  'session-end': 'session-end.js',
+};
+
+/**
+ * 큰따옴표 하나로 감싸서 bash·sh·cmd 어디서나 글자 그대로 넘어가는 경로인가.
+ * `"` 는 따옴표를 닫고, `$` `` ` `` 는 bash 가, `%` `!` 는 cmd 가 해석한다.
+ */
+export function isQuotablePath(p: string): boolean {
+  return p.length > 0 && !/["$`%!\r\n]/.test(p);
+}
+
+/** Windows 경로를 셸에 넣을 형태로 — 백슬래시는 bash 에서 이스케이프로 읽힐 수 있다. */
+export function toShellPath(p: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32' ? p.replace(/\\/g, '/') : p;
+}
+
+/**
+ * Claude Code 훅 명령: **설치 시점의 node 와 스크립트의 절대 경로.**
+ *
+ * 이름만·`npm exec` 는 훅을 띄우는 프로세스의 PATH 에 node/npm 이 있어야 돈다.
+ * Node 를 처음 깔기 전부터 열려 있던 터미널·VS Code 에서 Claude Code 를 띄우면 그 PATH 가
+ * 옛것이라 **훅이 매번 `npm: command not found` 로 죽는다** (2026-10-15 실측, 아래 표).
+ * 절대 경로만 PATH 와 무관하게 돌았다:
+ *
+ *   PATH 에 있는 것      npm exec   이름만   node 절대 + 스크립트 절대
+ *   둘 다 없음             127       127        0
+ *   npm 전역 bin 만        127       127        —
+ *   nodejs 만               0        127        —
+ *
+ * 대가: Node 를 옮기거나 지우면 이 줄이 깨진다. 그래서 `status` 가 그걸 잡고
+ * `passbaton-hooks install` 을 다시 돌리면 현재 경로로 고쳐 쓴다(등록 수는 안 는다).
+ * 경로에 따옴표로 못 감싸는 글자가 있으면 예전 `npm exec` 로 둔다 — 명령이 깨지는 것보다 낫다.
+ */
+export function claudeHookCommand(name: string, nodePath: string, hooksDir: string, extra = ''): string {
+  const script = HOOK_SCRIPTS[name];
+  if (script === undefined) throw new Error(`unknown hook: ${name}`);
+  const node = toShellPath(nodePath);
+  const file = toShellPath(path.join(hooksDir, script));
+  if (!isQuotablePath(node) || !isQuotablePath(file)) return hookCommand(name, false, extra);
+  return `"${node}" "${file}"${extra}`;
 }
 
 /** 이 이름이 PATH 에서 실행 가능한가. 실패하면 false — 판정 불가는 안전한 쪽으로. */
@@ -70,10 +119,96 @@ export function binResolves(name: string): boolean {
 const BARE_OK = binResolves(`${HOOK_PREFIX}session-start`);
 const LEGACY_HOOK_PREFIX = 'claude-hook-';
 
-/** True if this command string is one of ours (current or legacy naming). */
-export function isOurHookCommand(command?: string): boolean {
+const HOOK_NAMES = '(?:session-start|user-prompt|post-tool|pre-compact|session-end)';
+const HOST_FLAG = '(?: --(?:codex|gemini))?';
+/** 우리가 지금까지 써 온 모든 형태 — 이름만 · npm exec · npx · npx --no (v1). */
+const OUR_BIN_COMMAND = new RegExp(
+  `^(?:npm exec -- |npx --no |npx )?(?:${HOOK_PREFIX}|${LEGACY_HOOK_PREFIX})${HOOK_NAMES}${HOST_FLAG}$`,
+);
+const OUR_SCRIPT_FILE = /^(?:session-start|user-prompt-submit|post-tool-use|pre-compact|session-end)\.js$/;
+const ABSOLUTE_COMMAND = /^"([^"]+)" "([^"]+)"( --(?:codex|gemini))?$/;
+
+/** `"<node>" "<스크립트>"` 형태를 쪼갠다. 아니면 null. */
+export function parseAbsoluteCommand(command: string): { node: string; script: string } | null {
+  const m = ABSOLUTE_COMMAND.exec(command.trim());
+  return m ? { node: m[1], script: m[2] } : null;
+}
+
+/**
+ * 이 명령이 **우리가 쓴 줄**인가 (신·구 이름, 모든 실행 형태).
+ *
+ * ⛔ 「passbaton 이라는 글자가 들어 있다」 로 판정하지 않는다. 사용자가 우리 훅을 자기
+ * 래퍼로 감싼 줄(`my-wrapper passbaton-hook-post-tool`)을 우리 것으로 보면 재설치가
+ * 그 줄을 지운다. **명령 전체가 우리 형태와 정확히 맞을 때만** 우리 것이다.
+ * 절대 경로 형태는 스크립트가 `<passbaton 또는 옛 이름 패키지>/dist/hooks/<훅>.js` 이거나
+ * 지금 설치기 옆의 훅 디렉터리일 때만.
+ */
+export function isOurHookCommand(command?: string, ownHooksDir: string = __dirname): boolean {
   if (!command) return false;
-  return command.includes(HOOK_PREFIX) || command.includes(LEGACY_HOOK_PREFIX);
+  const c = command.trim();
+  if (OUR_BIN_COMMAND.test(c)) return true;
+  const abs = parseAbsoluteCommand(c);
+  if (!abs) return false;
+  const parts = abs.script.split(/[\\/]+/);
+  const file = parts[parts.length - 1] ?? '';
+  if (!OUR_SCRIPT_FILE.test(file)) return false;
+  const norm = (p: string) => path.resolve(p).replace(/\\/g, '/').toLowerCase();
+  if (norm(path.dirname(abs.script)) === norm(ownHooksDir)) return true;
+  const pkg = parts[parts.length - 4] ?? '';
+  return parts[parts.length - 3] === 'dist' && parts[parts.length - 2] === 'hooks'
+    && (pkg === PKG_NAME || pkg === LEGACY_PKG_NAME);
+}
+
+type HookHandler = { command?: string; [k: string]: unknown };
+type HookEntry = { hooks?: HookHandler[]; matcher?: string; [k: string]: unknown };
+
+/**
+ * 한 이벤트의 항목들에서 **우리 줄만** 뺀다 (Claude·Codex 의 중첩 형태).
+ *
+ * 예전엔 항목 안에 우리 줄이 하나라도 있으면 **항목째** 지웠다 — 같은 항목에 넣어 둔
+ * 사용자 훅이 같이 사라졌다. 이제는 그 줄만 빼고, 빈 항목만 지운다. 다른 필드·순서는 그대로.
+ */
+export function stripOurHooks(entries: HookEntry[], ownHooksDir?: string): { kept: HookEntry[]; removed: number } {
+  let removed = 0;
+  const kept: HookEntry[] = [];
+  for (const entry of entries) {
+    const handlers = Array.isArray(entry.hooks) ? entry.hooks : [];
+    const others = handlers.filter(h => !isOurHookCommand(h.command, ownHooksDir));
+    removed += handlers.length - others.length;
+    if (others.length === handlers.length) kept.push(entry);
+    else if (others.length > 0) kept.push({ ...entry, hooks: others });
+  }
+  return { kept, removed };
+}
+
+/**
+ * 한 이벤트를 고친다: 우리 줄을 빼고 새 줄을 뒤에 붙인다(사용자 줄 먼저).
+ * ⛔ **자동 설치(postinstall)는 이미 있는 우리 줄을 그대로 둔다** — 기존 설치자의 등록을
+ * 소리 없이 일괄 변환하지 않는다. 바꾸는 것은 사용자가 직접 `install` 을 돌렸을 때뿐.
+ */
+export function mergeEvent(existing: HookEntry[], ours: HookEntry[], auto: boolean, ownHooksDir?: string): HookEntry[] {
+  const { kept, removed } = stripOurHooks(existing, ownHooksDir);
+  if (auto && removed > 0) return existing;
+  return [...kept, ...ours];
+}
+
+/** JSON 설정 읽기 결과. 깨진 파일은 `invalid` — ⛔ 빈 설정으로 보고 덮어쓰지 않는다. */
+export type JsonRead =
+  | { state: 'missing' }
+  | { state: 'ok'; data: Record<string, unknown> }
+  | { state: 'invalid'; error: string };
+
+export function readJsonFile(file: string): JsonRead {
+  if (!fs.existsSync(file)) return { state: 'missing' };
+  try {
+    const data: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+      return { state: 'invalid', error: 'top level is not a JSON object' };
+    }
+    return { state: 'ok', data: data as Record<string, unknown> };
+  } catch (e) {
+    return { state: 'invalid', error: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 // 설치된 패키지 경로 찾기
@@ -123,15 +258,16 @@ function migrateLegacyHooks(): void {
   }
 }
 
+/** 설치를 멈춰야 하는 실패. 메시지는 사용자에게 그대로 보인다. */
+class InstallError extends Error {}
+
+/** Claude 설정을 읽는다. 깨져 있으면 **멈춘다** — 예전엔 `{}` 로 보고 사용자 설정 전체를 덮어썼다. */
 function loadSettings(): Record<string, unknown> {
-  if (!fs.existsSync(SETTINGS_FILE)) {
-    return {};
+  const r = readJsonFile(SETTINGS_FILE);
+  if (r.state === 'invalid') {
+    throw new InstallError(`${SETTINGS_FILE} is not valid JSON (${r.error}) — left untouched. Fix it, then run: npx passbaton-hooks install`);
   }
-  try {
-    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
-  } catch {
-    return {};
-  }
+  return r.state === 'ok' ? r.data : {};
 }
 
 function saveSettings(settings: Record<string, unknown>): void {
@@ -141,58 +277,64 @@ function saveSettings(settings: Record<string, unknown>): void {
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
 }
 
-function loadMcpConfig(): Record<string, unknown> {
-  if (!fs.existsSync(MCP_CONFIG_FILE)) {
-    return {};
-  }
-  try {
-    return JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
-  } catch {
-    return {};
-  }
+/** 이 설치의 MCP 서버 항목 — PATH 의 `npx` 대신 node·서버 스크립트 절대 경로 (JSON 값이라 따옴표 없음). */
+export function mcpServerEntry(nodePath: string, distDir: string): { command: string; args: string[] } {
+  return { command: nodePath, args: [path.join(distDir, 'index.js')] };
 }
 
-function saveMcpConfig(config: Record<string, unknown>): void {
+/**
+ * MCP 서버 항목이 **우리가 쓴 것**인가. `npx [-y] passbaton[@ver]`(옛 이름 포함) 또는
+ * `<node> <passbaton>/dist/index.js`. 이름이 같아도 남의 서버면 건드리지 않는다.
+ */
+export function isOurMcpEntry(entry: unknown, ownDistDir: string = path.dirname(__dirname)): boolean {
+  if (entry === null || typeof entry !== 'object') return false;
+  const { command, args } = entry as { command?: unknown; args?: unknown };
+  if (typeof command !== 'string' || !Array.isArray(args) || !args.every(a => typeof a === 'string')) return false;
+  const a = args as string[];
+  const isPkg = (s: string) => new RegExp(`^(?:${PKG_NAME}|${LEGACY_PKG_NAME})(?:@[^\\s]+)?$`).test(s);
+  if (/^npx(?:\.cmd)?$/i.test(path.basename(command))) {
+    const rest = a.filter(x => x !== '-y' && x !== '--yes');
+    return rest.length === 1 && isPkg(rest[0]);
+  }
+  if (a.length !== 1) return false;
+  const norm = (p: string) => path.resolve(p).replace(/\\/g, '/').toLowerCase();
+  if (norm(a[0]) === norm(path.join(ownDistDir, 'index.js'))) return true;
+  const parts = a[0].split(/[\\/]+/);
+  return parts[parts.length - 1] === 'index.js' && parts[parts.length - 2] === 'dist'
+    && (parts[parts.length - 3] === PKG_NAME || parts[parts.length - 3] === LEGACY_PKG_NAME);
+}
+
+/**
+ * `~/.claude.json` 의 사용자 범위에 MCP 서버를 등록한다.
+ *
+ * - 없으면 절대 경로 항목으로 추가
+ * - 우리 항목이 있으면: 자동 설치(postinstall)는 **그대로 둔다**, 명시적 `install` 은 지금 경로로 고쳐 쓴다
+ * - 같은 이름의 남의 항목이면 건드리지 않는다
+ * ⛔ 레포의 `.mcp.json`(남과 공유)은 쓰지 않는다 — 내 PC 의 절대 경로가 퍼진다.
+ */
+function installMcpServer(auto: boolean): void {
+  const r = readJsonFile(MCP_CONFIG_FILE);
+  if (r.state === 'invalid') {
+    throw new InstallError(`${MCP_CONFIG_FILE} is not valid JSON (${r.error}) — left untouched`);
+  }
+  const config = r.state === 'ok' ? r.data : {};
+  const mcpServers = (config.mcpServers && typeof config.mcpServers === 'object'
+    ? config.mcpServers : {}) as Record<string, unknown>;
+  const existing = mcpServers['project-manager'];
+
+  if (existing !== undefined && !isOurMcpEntry(existing)) {
+    console.log('   ⚠️ "project-manager" in ~/.claude.json is not a passbaton entry — left untouched');
+    return;
+  }
+  if (existing !== undefined && auto) {
+    console.log('   MCP server already registered (left as is — run `npx passbaton-hooks install` to rewrite it)');
+    return;
+  }
+
+  mcpServers['project-manager'] = mcpServerEntry(process.execPath, path.dirname(__dirname));
+  config.mcpServers = mcpServers;
   fs.writeFileSync(MCP_CONFIG_FILE, JSON.stringify(config, null, 2));
-}
-
-function installMcpServer(): boolean {
-  console.log('🔧 Registering MCP server...');
-
-  try {
-    const config = loadMcpConfig();
-    const mcpServers = (config.mcpServers as Record<string, unknown>) || {};
-
-    // 이미 등록되어 있으면 스킵
-    if (mcpServers['project-manager']) {
-      console.log('   MCP server already registered');
-      return true;
-    }
-
-    // MCP 서버 등록
-    mcpServers['project-manager'] = {
-      command: 'npx',
-      args: [PKG_NAME]
-    };
-
-    config.mcpServers = mcpServers;
-    saveMcpConfig(config);
-
-    console.log('✅ MCP server registered in ~/.claude.json');
-    return true;
-  } catch (error) {
-    console.error('⚠️ Failed to register MCP server:', error);
-    console.log('   You can manually add to ~/.claude.json:');
-    console.log('   {');
-    console.log('     "mcpServers": {');
-    console.log('       "project-manager": {');
-    console.log('         "command": "npx",');
-    console.log(`         "args": ["${PKG_NAME}"]`);
-    console.log('       }');
-    console.log('     }');
-    console.log('   }');
-    return false;
-  }
+  console.log(`✅ MCP server ${existing === undefined ? 'registered' : 'rewritten'} in ~/.claude.json (absolute node path)`);
 }
 
 /**
@@ -200,21 +342,19 @@ function installMcpServer(): boolean {
  * Only runs if ~/.codex exists (Codex installed). Preserves user's existing hooks;
  * replaces only ours (matched by the claude-hook- command prefix).
  */
-function installCodexHooks(): void {
+function installCodexHooks(auto: boolean): void {
   if (!fs.existsSync(CODEX_DIR)) return;  // Codex not installed -> skip silently
 
-  let hooksConfig: { hooks?: Record<string, unknown[]> } = { hooks: {} };
-  if (fs.existsSync(CODEX_HOOKS_FILE)) {
-    try { hooksConfig = JSON.parse(fs.readFileSync(CODEX_HOOKS_FILE, 'utf-8')); }
-    catch { hooksConfig = { hooks: {} }; }
+  const r = readJsonFile(CODEX_HOOKS_FILE);
+  if (r.state === 'invalid') {
+    console.error(`⚠️ ${CODEX_HOOKS_FILE} is not valid JSON (${r.error}) — Codex hooks skipped, file left untouched`);
+    return;
   }
+  const hooksConfig = (r.state === 'ok' ? r.data : { hooks: {} }) as { hooks?: Record<string, unknown[]> };
   const hooks = hooksConfig.hooks || {};
 
-  const merge = (event: string, ourEntries: unknown[]): void => {
-    const existing = (hooks[event] || []) as Array<{ hooks?: Array<{ command?: string }> }>;
-    const userEntries = existing.filter(e =>
-      !(e.hooks || []).some(h => isOurHookCommand(h.command)));
-    hooks[event] = [...userEntries, ...ourEntries];
+  const merge = (event: string, ourEntries: HookEntry[]): void => {
+    hooks[event] = mergeEvent((hooks[event] || []) as HookEntry[], ourEntries, auto);
   };
 
   // Codex uses the same event names as Claude (SessionStart/UserPromptSubmit/Stop...).
@@ -240,19 +380,21 @@ function installCodexHooks(): void {
  * Gemini event names differ: BeforeAgent (≈UserPromptSubmit), PreCompress (≈PreCompact),
  * SessionEnd (≈Stop). transcript_path can be null at SessionStart, so we inject "--gemini".
  */
-function installGeminiHooks(): void {
+function installGeminiHooks(auto: boolean): void {
   if (!fs.existsSync(GEMINI_DIR)) return;  // Gemini not installed -> skip silently
 
-  let settings: { hooks?: Record<string, unknown[]> } = {};
-  if (fs.existsSync(GEMINI_SETTINGS_FILE)) {
-    try { settings = JSON.parse(fs.readFileSync(GEMINI_SETTINGS_FILE, 'utf-8')); }
-    catch { settings = {}; }
+  const r = readJsonFile(GEMINI_SETTINGS_FILE);
+  if (r.state === 'invalid') {
+    console.error(`⚠️ ${GEMINI_SETTINGS_FILE} is not valid JSON (${r.error}) — Gemini hooks skipped, file left untouched`);
+    return;
   }
+  const settings = (r.state === 'ok' ? r.data : {}) as { hooks?: Record<string, unknown[]> };
   const hooks = settings.hooks || {};
 
   const merge = (event: string, ourEntries: unknown[]): void => {
     const existing = (hooks[event] || []) as Array<{ command?: string }>;
     const userEntries = existing.filter(e => !isOurHookCommand(e.command));
+    if (auto && userEntries.length < existing.length) return;  // 자동 설치는 기존 우리 줄을 그대로 둔다
     hooks[event] = [...userEntries, ...ourEntries];
   };
 
@@ -269,73 +411,63 @@ function installGeminiHooks(): void {
   } catch { /* non-fatal: Gemini hooks are optional */ }
 }
 
-function install(): void {
+/**
+ * 훅이 「npm/node: command not found」 로 죽을 때 사용자에게 줄 안내 (Astra P1 B 로 고정한 문구).
+ * ⛔ postinstall 출력은 npm 7+ 에서 기본으로 숨는다 — 이 안내의 정본은 README 이고, 여기는 보조다.
+ */
+export const RESTART_HINT = [
+  'If Claude Code was already open before Node.js was installed, fully quit the app that launched it',
+  '(VS Code, your terminal app) and start it again, then start Claude Code. Opening a new tab or window',
+  'in the same app can keep the old PATH. No reboot is needed for this.',
+];
+
+function install(auto: boolean): void {
   console.log('');
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║   Claude Session Continuity MCP - Installation             ║');
+  console.log('║   passbaton - Installation                                 ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log('');
 
   // ===== 0. Migrate from settings.local.json if needed =====
   migrateLegacyHooks();
 
-  // ===== 1. Hooks 설치 (이름 해석 가능하면 직접 실행, 아니면 npm exec) =====
-  console.log(`📌 Step 1: Installing Hooks (${BARE_OK ? 'direct bin' : 'npm exec'} mode)...`);
+  // ===== 1. Hooks — Claude Code 는 node·스크립트 절대 경로 (claudeHookCommand 주석) =====
+  console.log('📌 Step 1: Installing Hooks...');
 
   const settings = loadSettings();
+  const hooks = (settings.hooks && typeof settings.hooks === 'object'
+    ? settings.hooks : {}) as Record<string, HookEntry[]>;
+  const node = process.execPath;
+  const cmd = (name: string) => claudeHookCommand(name, node, __dirname);
+  const entry = (name: string, matcher?: string): HookEntry =>
+    ({ ...(matcher ? { matcher } : {}), hooks: [{ type: 'command', command: cmd(name) }] });
 
-  // 기존 hooks 유지하면서 우리 훅만 추가/교체
-  const hooks = (settings.hooks as Record<string, unknown[]>) || {};
-
-  /**
-   * 기존 훅 배열에서 우리 훅만 제거하고, 새 훅을 추가
-   * 사용자 커스텀 훅은 보존됨 (우리 훅 판별 = isOurHookCommand, 신/구 이름 모두 인식)
-   */
-  function mergeHooks(event: string, ourEntries: unknown[]): void {
-    const existing = (hooks[event] || []) as Array<{ hooks?: Array<{ command?: string }>; matcher?: string }>;
-
-    // 기존 항목 중 우리 훅이 아닌 것만 보존
-    const userEntries = existing.filter(entry => {
-      const cmds = entry.hooks || [];
-      return !cmds.some(h => isOurHookCommand(h.command));
-    });
-
-    // 사용자 훅 먼저, 우리 훅 뒤에 추가
-    hooks[event] = [...userEntries, ...ourEntries];
-  }
-
-  mergeHooks('SessionStart', [
-    { hooks: [{ type: 'command', command: `${hookCommand('session-start', BARE_OK)}` }] }
-  ]);
-
-  mergeHooks('UserPromptSubmit', [
-    { hooks: [{ type: 'command', command: `${hookCommand('user-prompt', BARE_OK)}` }] }
-  ]);
-
-  mergeHooks('PostToolUse', [
-    { matcher: 'Edit', hooks: [{ type: 'command', command: `${hookCommand('post-tool', BARE_OK)}` }] },
-    { matcher: 'Write', hooks: [{ type: 'command', command: `${hookCommand('post-tool', BARE_OK)}` }] }
-  ]);
-
-  mergeHooks('PreCompact', [
-    { hooks: [{ type: 'command', command: `${hookCommand('pre-compact', BARE_OK)}` }] }
-  ]);
-
-  mergeHooks('Stop', [
-    { hooks: [{ type: 'command', command: `${hookCommand('session-end', BARE_OK)}` }] }
-  ]);
+  const merge = (event: string, ours: HookEntry[]) => {
+    hooks[event] = mergeEvent(hooks[event] || [], ours, auto);
+  };
+  merge('SessionStart', [entry('session-start')]);
+  merge('UserPromptSubmit', [entry('user-prompt')]);
+  merge('PostToolUse', [entry('post-tool', 'Edit'), entry('post-tool', 'Write')]);
+  merge('PreCompact', [entry('pre-compact')]);
+  merge('Stop', [entry('session-end')]);
 
   settings.hooks = hooks;
   saveSettings(settings);
 
+  const sample = cmd('session-start');
+  if (parseAbsoluteCommand(sample) === null) {
+    console.error('⚠️ Install path has characters that cannot be quoted safely for every shell — hooks use `npm exec` and need npm on PATH');
+  }
+
   // Codex CLI hooks (2026-07-09): register the same hooks in ~/.codex/hooks.json
   // if Codex is present. Hooks auto-detect the host and emit the right output format.
-  installCodexHooks();
+  installCodexHooks(auto);
 
   // Gemini CLI hooks (2026-07-10): same, in ~/.gemini/settings.json if Gemini is present.
-  installGeminiHooks();
+  installGeminiHooks(auto);
 
-  console.log(`✅ Hooks installed (${BARE_OK ? 'direct bin — ~10x faster per fire' : 'npm exec — bin not on PATH'})`);
+  console.log(`✅ Hooks ${auto ? 'checked' : 'installed'} in ~/.claude/settings.json`);
+  if (auto) console.log('   (existing passbaton hook lines are kept as is — `npx passbaton-hooks install` rewrites them)');
   console.log('   SessionStart: context auto-load');
   console.log('   UserPromptSubmit: relevant memory injection');
   console.log('   PostToolUse: file change tracking (Edit, Write)');
@@ -345,24 +477,14 @@ function install(): void {
 
   // ===== 2. MCP 서버 등록 =====
   console.log('📌 Step 2: Registering MCP Server...');
-  installMcpServer();
+  installMcpServer(auto);
   console.log('');
 
   // ===== 완료 메시지 =====
-  console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║   ✅ Installation Complete!                                ║');
-  console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log('║                                                            ║');
-  console.log('║   🚀 Restart Claude Code to activate:                      ║');
-  console.log('║      - 24 MCP tools (session_start, memory_store, etc.)    ║');
-  console.log('║      - Auto context injection on session start             ║');
-  console.log('║                                                            ║');
-  console.log('║   📖 Quick Start:                                          ║');
-  console.log('║      1. Start a new Claude Code session                    ║');
-  console.log('║      2. Context will be auto-injected                      ║');
-  console.log('║      3. Use session_end to save context                    ║');
-  console.log('║                                                            ║');
-  console.log('╚════════════════════════════════════════════════════════════╝');
+  console.log('✅ Installation complete. Start a new Claude Code session to activate.');
+  console.log('');
+  for (const line of RESTART_HINT) console.log(`   ${line}`);
+  console.log('   Check with: npx passbaton-hooks status');
   console.log('');
 }
 
@@ -370,21 +492,13 @@ function uninstall(): void {
   console.log('🔧 Removing Claude Code Hooks...');
 
   const settings = loadSettings();
-  const hooks = (settings.hooks as Record<string, unknown[]>) || {};
+  const hooks = (settings.hooks && typeof settings.hooks === 'object'
+    ? settings.hooks : {}) as Record<string, HookEntry[]>;
 
-  // 각 이벤트에서 우리 훅만 제거, 사용자 훅은 보존 (신/구 이름 모두 제거)
+  // 각 이벤트에서 우리 줄만 제거, 사용자 훅은 보존 (신/구 이름·모든 실행 형태)
   for (const event of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PreCompact', 'Stop']) {
-    const existing = (hooks[event] || []) as Array<{ hooks?: Array<{ command?: string }> }>;
-    const remaining = existing.filter(entry => {
-      const cmds = entry.hooks || [];
-      return !cmds.some(h => isOurHookCommand(h.command));
-    });
-
-    if (remaining.length === 0) {
-      delete hooks[event];
-    } else {
-      hooks[event] = remaining;
-    }
+    const { kept } = stripOurHooks(hooks[event] || []);
+    if (kept.length === 0) delete hooks[event]; else hooks[event] = kept;
   }
 
   if (Object.keys(hooks).length === 0) {
@@ -396,14 +510,15 @@ function uninstall(): void {
   saveSettings(settings);
 
   // Also remove our hooks from Codex (2026-07-09), preserving user's hooks.
-  if (fs.existsSync(CODEX_HOOKS_FILE)) {
+  const codex = readJsonFile(CODEX_HOOKS_FILE);
+  if (codex.state === 'invalid') console.error(`⚠️ ${CODEX_HOOKS_FILE} is not valid JSON — left untouched`);
+  if (codex.state === 'ok') {
     try {
-      const cfg = JSON.parse(fs.readFileSync(CODEX_HOOKS_FILE, 'utf-8')) as { hooks?: Record<string, unknown[]> };
+      const cfg = codex.data as { hooks?: Record<string, HookEntry[]> };
       const ch = cfg.hooks || {};
       for (const event of ['SessionStart', 'UserPromptSubmit', 'PreCompact', 'Stop']) {
-        const existing = (ch[event] || []) as Array<{ hooks?: Array<{ command?: string }> }>;
-        const remaining = existing.filter(e => !(e.hooks || []).some(h => isOurHookCommand(h.command)));
-        if (remaining.length === 0) delete ch[event]; else ch[event] = remaining;
+        const { kept } = stripOurHooks(ch[event] || []);
+        if (kept.length === 0) delete ch[event]; else ch[event] = kept;
       }
       cfg.hooks = ch;
       fs.writeFileSync(CODEX_HOOKS_FILE, JSON.stringify(cfg, null, 2));
@@ -411,9 +526,11 @@ function uninstall(): void {
   }
 
   // Also remove our hooks from Gemini (2026-07-10), preserving user's settings + hooks.
-  if (fs.existsSync(GEMINI_SETTINGS_FILE)) {
+  const gemini = readJsonFile(GEMINI_SETTINGS_FILE);
+  if (gemini.state === 'invalid') console.error(`⚠️ ${GEMINI_SETTINGS_FILE} is not valid JSON — left untouched`);
+  if (gemini.state === 'ok') {
     try {
-      const cfg = JSON.parse(fs.readFileSync(GEMINI_SETTINGS_FILE, 'utf-8')) as { hooks?: Record<string, unknown[]> };
+      const cfg = gemini.data as { hooks?: Record<string, unknown[]> };
       const gh = cfg.hooks || {};
       for (const event of ['SessionStart', 'BeforeAgent', 'PreCompress', 'SessionEnd']) {
         const existing = (gh[event] || []) as Array<{ command?: string }>;
@@ -428,31 +545,151 @@ function uninstall(): void {
   console.log('✅ Hooks removed successfully!');
 }
 
-function status(): void {
-  console.log('📊 Claude Code Hooks Status\n');
+/** PATH 에서 실행 파일을 찾는다 (Windows 는 PATHEXT 까지). 셸·프로세스를 띄우지 않는다. */
+export function findOnPath(name: string, envPath: string = process.env.PATH ?? process.env.Path ?? '',
+  platform: NodeJS.Platform = process.platform): string | null {
+  const exts = platform === 'win32'
+    ? ['', ...(process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map(e => e.toLowerCase())]
+    : [''];
+  for (const dir of envPath.split(platform === 'win32' ? ';' : ':').filter(Boolean)) {
+    for (const ext of exts) {
+      const f = path.join(dir, name + ext);
+      try { if (fs.statSync(f).isFile()) return f; } catch { /* next */ }
+    }
+  }
+  return null;
+}
 
-  if (!fs.existsSync(SETTINGS_FILE)) {
-    console.log('❌ No hooks configured');
-    return;
+/** 이 node 실행 파일이 실제로 도는가 — `--version` 만 (부작용 없음). */
+function nodeRuns(nodePath: string): boolean {
+  try {
+    const r = spawnSync(nodePath, ['--version'], { stdio: 'ignore', timeout: 10_000, shell: false });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+export type HookCheck = { form: 'absolute' | 'npm-exec' | 'npx' | 'bare'; ok: boolean; detail: string };
+
+/**
+ * 등록된 우리 훅 명령 하나를 **지금 이 프로세스의 환경에서** 판정한다.
+ * 「등록됨」 · 「찾을 수 있음」 · 「실행됨」 을 가른다 — bare shim 이 있어도 node 가 없으면 실패다.
+ * ⛔ 훅 자체는 실행하지 않는다(세션 데이터를 바꾼다). node 는 `--version` 으로만 확인한다.
+ */
+export function checkHookCommand(command: string, envPath?: string): HookCheck {
+  const abs = parseAbsoluteCommand(command);
+  if (abs) {
+    if (!fs.existsSync(abs.node)) return { form: 'absolute', ok: false, detail: `node not found: ${abs.node}` };
+    if (!fs.existsSync(abs.script)) return { form: 'absolute', ok: false, detail: `hook script not found: ${abs.script}` };
+    if (!nodeRuns(abs.node)) return { form: 'absolute', ok: false, detail: `node does not run: ${abs.node}` };
+    return { form: 'absolute', ok: true, detail: 'node + script found, independent of PATH' };
+  }
+  const c = command.trim();
+  const nodeOnPath = findOnPath('node', envPath) !== null;
+  if (c.startsWith('npm exec -- ') || c.startsWith('npx ')) {
+    const form = c.startsWith('npm exec') ? 'npm-exec' : 'npx';
+    const tool = form === 'npm-exec' ? 'npm' : 'npx';
+    if (findOnPath(tool, envPath) === null) return { form, ok: false, detail: `${tool} not on PATH` };
+    if (!nodeOnPath) return { form, ok: false, detail: 'node not on PATH' };
+    return { form, ok: true, detail: `${tool} + node on PATH (depends on PATH)` };
+  }
+  const bin = c.split(' ')[0];
+  if (findOnPath(bin, envPath) === null) return { form: 'bare', ok: false, detail: `${bin} not on PATH` };
+  if (!nodeOnPath) return { form: 'bare', ok: false, detail: `${bin} found but node not on PATH` };
+  return { form: 'bare', ok: true, detail: `${bin} + node on PATH (depends on PATH)` };
+}
+
+const EXPECTED_EVENTS = ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'PreCompact', 'Stop'];
+
+/** 문제가 있으면 false (CLI 종료 1). PATH 에 기대는 항목은 실패는 아니지만 고칠 방법을 같이 보인다. */
+function status(): boolean {
+  console.log('📊 passbaton status\n');
+  console.log('⚠️ Checked with the PATH of THIS command. A Claude Code session that is already');
+  console.log('   running may have a different (older) PATH — this cannot see it.\n');
+
+  let healthy = true;
+  let pathDependent = false;
+
+  const r = readJsonFile(SETTINGS_FILE);
+  if (r.state === 'invalid') {
+    console.log(`❌ ${SETTINGS_FILE} is not valid JSON: ${r.error}`);
+    return false;
+  }
+  const hooks = (r.state === 'ok' && r.data.hooks && typeof r.data.hooks === 'object'
+    ? r.data.hooks : {}) as Record<string, HookEntry[]>;
+
+  console.log('Claude Code hooks (~/.claude/settings.json):');
+  for (const event of EXPECTED_EVENTS) {
+    const ours = (hooks[event] || []).flatMap(e => (Array.isArray(e.hooks) ? e.hooks : []))
+      .map(h => h.command).filter((c): c is string => isOurHookCommand(c));
+    if (ours.length === 0) {
+      console.log(`  ❌ ${event}: not registered`);
+      healthy = false;
+      continue;
+    }
+    for (const c of ours) {
+      const chk = checkHookCommand(c);
+      if (!chk.ok) healthy = false;
+      if (chk.form !== 'absolute') pathDependent = true;
+      console.log(`  ${chk.ok ? '✅' : '❌'} ${event} [${chk.form}] ${chk.detail}`);
+      console.log(`      → ${c}`);
+    }
   }
 
-  const settings = loadSettings();
-  const hooks = settings.hooks as Record<string, unknown[]> | undefined;
-
-  if (!hooks) {
-    console.log('❌ No hooks configured');
-    return;
-  }
-
-  console.log('Configured hooks:');
-  for (const [event, hookList] of Object.entries(hooks)) {
-    console.log(`  ${event}:`);
-    for (const hook of hookList as Array<{ hooks: Array<{ command: string }> }>) {
-      for (const h of hook.hooks || []) {
-        console.log(`    → ${h.command}`);
+  console.log('\nMCP server (~/.claude.json):');
+  const m = readJsonFile(MCP_CONFIG_FILE);
+  if (m.state === 'invalid') {
+    console.log(`  ❌ ${MCP_CONFIG_FILE} is not valid JSON: ${m.error}`);
+    healthy = false;
+  } else {
+    const data = m.state === 'ok' ? m.data : {};
+    const servers = (data.mcpServers ?? {}) as Record<string, unknown>;
+    const user = servers['project-manager'];
+    if (user === undefined) {
+      console.log('  ❌ user scope "project-manager": not registered');
+      healthy = false;
+    } else if (!isOurMcpEntry(user)) {
+      console.log('  ⚠️ user scope "project-manager": not a passbaton entry');
+    } else {
+      const e = user as { command: string; args: string[] };
+      const isNpx = /^npx(?:\.cmd)?$/i.test(path.basename(e.command));
+      const ok = isNpx
+        ? findOnPath('npx') !== null
+        : fs.existsSync(e.command) && fs.existsSync(e.args[0]) && nodeRuns(e.command);
+      if (!ok) healthy = false;
+      if (isNpx) pathDependent = true;
+      console.log(`  ${ok ? '✅' : '❌'} user scope "project-manager" [${isNpx ? 'npx — depends on PATH' : 'absolute'}]`);
+    }
+    // local scope(~/.claude.json projects.<dir>.mcpServers) 는 같은 이름이면 user 보다 먼저 쓰인다 — 알리기만 한다.
+    const projects = (data.projects ?? {}) as Record<string, { mcpServers?: Record<string, unknown> }>;
+    for (const [dir, proj] of Object.entries(projects)) {
+      for (const [name, srv] of Object.entries(proj?.mcpServers ?? {})) {
+        if (isOurMcpEntry(srv)) console.log(`  ℹ️ local scope "${name}" for ${dir} — used instead of user scope "${name}" there`);
       }
     }
   }
+  const projectMcp = readJsonFile(path.join(process.cwd(), '.mcp.json'));
+  if (projectMcp.state === 'ok') {
+    for (const [name, srv] of Object.entries((projectMcp.data.mcpServers ?? {}) as Record<string, unknown>)) {
+      if (isOurMcpEntry(srv)) {
+        console.log(`  ℹ️ project scope "${name}" in ./.mcp.json — used instead of user scope "${name}" here (the installer never edits this file)`);
+      }
+    }
+  }
+
+  console.log('');
+  if (!healthy || pathDependent) {
+    if (!healthy) console.log('Some checks failed.');
+    if (pathDependent) console.log('Some entries depend on PATH — they fail when the app running Claude Code has an old PATH.');
+    console.log('Fix:');
+    console.log('  1. Run: npx passbaton-hooks install   (rewrites passbaton entries with absolute paths)');
+    console.log('  2. Then restart the right way:');
+    for (const line of RESTART_HINT) console.log(`     ${line}`);
+  } else {
+    console.log('✅ All passbaton hooks and the MCP server are independent of PATH.');
+  }
+  return healthy;
 }
 
 /**
@@ -470,19 +707,28 @@ const invokedDirectly =
 if (invokedDirectly) {
   const args = process.argv.slice(2);
   const command = args[0] || 'install';
+  // postinstall 래퍼(scripts/postinstall.cjs)가 붙인다. 자동 설치는 기존 우리 줄을 바꾸지 않는다.
+  const auto = process.env.PASSBATON_POSTINSTALL === '1';
 
-  switch (command) {
-    case 'install':
-      install();
-      break;
-    case 'uninstall':
-    case 'remove':
-      uninstall();
-      break;
-    case 'status':
-      status();
-      break;
-    default:
-      console.log('Usage: npx passbaton-hooks [install|uninstall|status]');
+  try {
+    switch (command) {
+      case 'install':
+        install(auto);
+        break;
+      case 'uninstall':
+      case 'remove':
+        uninstall();
+        break;
+      case 'status':
+        if (!status()) process.exitCode = 1;
+        break;
+      default:
+        console.log('Usage: npx passbaton-hooks [install|uninstall|status]');
+    }
+  } catch (e) {
+    // ⛔ 직접 실행한 install 이 실패하면 비0 으로 끝난다 — 「완료」 라고 말하지 않는다.
+    //    postinstall 은 래퍼가 이 종료 코드를 경고 한 줄로 바꾸고 0 으로 끝낸다.
+    console.error(`❌ passbaton ${command} failed: ${e instanceof Error ? e.message : String(e)}`);
+    process.exitCode = 1;
   }
 }
