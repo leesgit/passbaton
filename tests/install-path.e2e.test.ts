@@ -23,7 +23,9 @@ const win = process.platform === 'win32';
 
 const dirs: string[] = [];
 const tmpDir = (name: string) => {
-  const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), name)));
+  // .native: GitHub Windows 러너의 임시 경로는 8.3 짧은 이름(RUNNER~1)이다 — 한글 경로와 겹치면
+  // Node 22 가 모듈을 못 찾았다(CI 실측). 긴 실경로로 바꿔 둔다.
+  const d = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), name)));
   dirs.push(d);
   return d;
 };

@@ -39,7 +39,7 @@ const check = (name, ok, detail = '') => {
 // Windows 의 npm 은 .cmd 라 셸 없이 못 띄운다. 인자는 이 스크립트가 만든 값뿐.
 const npm = (args, opts = {}) => spawnSync(win ? 'npm.cmd' : 'npm', args, { encoding: 'utf8', shell: win, ...opts });
 
-const work = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-pack-')));
+const work = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-pack-')));
 process.on('exit', () => { try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* 윈도우 잠금 — 남겨도 된다 */ } });
 
 // ---- 포장 (역검증이면 package.json 을 잠시 옛 형태로) ----

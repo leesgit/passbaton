@@ -223,7 +223,9 @@ export function isOurHookHandler(h: HookHandler, ownHooksDir: string = __dirname
   if (h.args !== undefined) {
     const args = h.args;
     if (typeof h.command !== 'string' || !Array.isArray(args) || args.length !== 1 || typeof args[0] !== 'string') return false;
-    return /^node(?:\.exe)?$/i.test(path.basename(h.command)) && isOurHookScript(args[0], ownHooksDir);
+    // path.basename 은 POSIX 에서 `\` 를 안 쪼갠다 — 다른 OS 에서 쓴 설정도 알아보게 두 구분자 다
+    const exe = h.command.split(/[\\/]+/).pop() ?? '';
+    return /^node(?:\.exe)?$/i.test(exe) && isOurHookScript(args[0], ownHooksDir);
   }
   return isOurHookCommand(h.command, ownHooksDir);
 }
