@@ -214,8 +214,9 @@ describe.skipIf(!built)('audit-7 2026-08-10 regression', () => {
   describe('P0-1/P0-2 compaction recovery', () => {
     function compactTranscript(): string {
       const lines = [
-        { type: 'user', message: { content: 'pre-compact 훅이 transcript_path를 읽도록 고쳐줘' } },
-        { type: 'assistant', message: { content: 'src/hooks/pre-compact.ts 를 수정했습니다. 남은 작업: 빌드 후 재설치' } },
+        // 실제 호스트처럼 uuid 를 단다 — 컴팩션 직후 복구는 이 uuid 로 「이번 컴팩션」 을 확인한다(2.6.1)
+        { uuid: 'a1', type: 'user', message: { content: 'pre-compact 훅이 transcript_path를 읽도록 고쳐줘' } },
+        { uuid: 'a2', type: 'assistant', message: { content: 'src/hooks/pre-compact.ts 를 수정했습니다. 남은 작업: 빌드 후 재설치' } },
       ];
       return lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
     }
@@ -280,7 +281,7 @@ describe.skipIf(!built)('audit-7 2026-08-10 regression', () => {
       fs.writeFileSync(tpath, compactTranscript());
       runHook(PRE_COMPACT, { session_id: 'p01', transcript_path: tpath, cwd: ws }, ws);
 
-      const compactOut = runHook(SESSION_START, { cwd: ws, session_id: 'p01', source: 'compact' }, ws);
+      const compactOut = runHook(SESSION_START, { cwd: ws, session_id: 'p01', source: 'compact', transcript_path: tpath }, ws);
       const normalOut = runHook(SESSION_START, { cwd: ws, session_id: 'p01', source: 'startup' }, ws);
 
       expect(compactOut).toContain('Recovered after compaction');

@@ -38,7 +38,7 @@ const COLUMNS: Record<string, Record<string, string>> = {
   },
   session_files: { prompt_id: 'TEXT' },
   session_roots: { head_baseline: 'TEXT' },
-  compact_handover: { written_ms: 'INTEGER' },
+  compact_handover: { pre_uuid: 'TEXT' },
 };
 
 /**
@@ -132,7 +132,7 @@ const TABLES: string[] = [
      pending INTEGER NOT NULL DEFAULT 0,
      active_file TEXT,
      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-     written_ms INTEGER,
+     pre_uuid TEXT,
      PRIMARY KEY (session_id, project)
    )`,
 ];

@@ -14,6 +14,7 @@ import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { revalidateDirective } from '../utils/directive.js';
 import { humanText } from '../utils/human-turn.js';
 import { migrateSchema } from '../db/migrate.js';
+import { readTailLines, lastUuid } from '../utils/compact-id.js';
 
 interface CompactInput {
   cwd?: string;
@@ -360,10 +361,11 @@ async function main() {
     // ★ 행은 **이번 컴팩션의 것만** 남는다. 이번 창에 사람 요청·파일이 없거나(요약·알림뿐)
     //   transcript 를 못 읽었으면 지난 컴팩션의 행을 지운다 — 안 그러면 같은 세션의 두 번째
     //   컴팩션 뒤에 첫 번째의 요청·pending 이 최신처럼 다시 나온다(Astra reply-140 PB140-02).
-    //   보관 정책: 컴팩션 전용 **한 번 쓰는** 행. SessionStart(compact) 가 읽으면서 지우고, 쓴 지
-    //   COMPACT_HANDOVER_TTL_MS 가 지난 행은 읽지 않는다 — 여기서 쓰기·지우기가 둘 다 실패해도(잠금)
-    //   지난 컴팩션의 행이 이번 복구로 나오지 않게 하는 것은 **읽는 쪽 계약**이다(reply-141 PB141-02).
-    //   14 일 지난 행은 저장할 때 정리한다. (일반 resume 의 복구 경로가 아니다)
+    //   보관 정책: 컴팩션 전용 행 · 이 컴팩션 직전의 마지막 트랜스크립트 uuid(pre_uuid)를 같이 적는다.
+    //   여기서 쓰기·지우기가 잠금으로 둘 다 실패해도 지난 행이 이번 복구로 나오지 않게 하는 것은
+    //   **읽는 쪽 계약**이다 — SessionStart(compact) 는 pre_uuid 뒤에 대화가 이어졌으면 내지 않는다
+    //   (utils/compact-id.ts · reply-142 PB142-01). 14 일 지난 행은 저장할 때 정리한다.
+    //   (일반 resume 의 복구 경로가 아니다)
     if (input.session_id) {
       const forget = () => db.prepare('DELETE FROM compact_handover WHERE session_id = ? AND project = ?')
         .run(input.session_id, project);
@@ -371,13 +373,14 @@ async function main() {
         migrateSchema(db);
         if (handover && (handover.request || handover.activeFile)) {
           db.prepare(`
-            INSERT INTO compact_handover (session_id, project, request, pending, active_file, created_at, written_ms)
+            INSERT INTO compact_handover (session_id, project, request, pending, active_file, created_at, pre_uuid)
             VALUES (?, ?, ?, ?, ?, datetime('now'), ?)
             ON CONFLICT(session_id, project) DO UPDATE SET
               request = excluded.request, pending = excluded.pending,
               active_file = excluded.active_file, created_at = excluded.created_at,
-              written_ms = excluded.written_ms
-          `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile, Date.now());
+              pre_uuid = excluded.pre_uuid
+          `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile,
+            lastUuid(readTailLines(input.transcript_path)));
         } else {
           forget();
         }

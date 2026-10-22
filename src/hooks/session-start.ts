@@ -13,6 +13,7 @@ import { resolveWorkspaceRoot } from '../utils/workspace.js';
 import { ensureSessionsDb } from '../db/bootstrap.js';
 import { revalidateDirective } from '../utils/directive.js';
 import { buildResumeCard, clampCardChars } from '../utils/resume-card.js';
+import { readTailLines, matchCompaction } from '../utils/compact-id.js';
 
 interface SessionInput {
   cwd?: string;
@@ -108,11 +109,7 @@ function estimateTokens(text: string): number {
 // 재개 카드에 쓸 최대 글자 수. 토큰 예산(2000)과 같은 예산에서 나간다.
 const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 
-// 컴팩션 복구 행의 유효 시간. PreCompact → 요약 → SessionStart(compact) 는 보통 수 분 안이다.
-// 이보다 오래된 행은 「이번」 컴팩션의 것이라고 볼 수 없다.
-const COMPACT_HANDOVER_TTL_MS = 30 * 60 * 1000;
-
-function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string): string | null {
+function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string, transcriptPath?: string): string | null {
   // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
   const card = projectPath ? buildResumeCard(projectPath, CARD_CHARS) : null;
   if (!fs.existsSync(dbPath)) {
@@ -141,18 +138,16 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
     // [Priority 1a] 컴팩션 직후 — 같은 세션의 PreCompact 가 남긴 「마지막 사람 요청」.
     //   ⛔ 2.6.1: 요청은 결과가 아니다. 2.6.0 까지는 PreCompact 가 요청 줄로 current_state 를
     //   덮고 여기서 「Recovered」 라고 불렀다 — 하네스 알림이 그대로 「하던 일」 이 됐다.
-    //   ★ 읽는 쪽 계약(reply-141 PB141-02): **방금 쓴 행만**, **한 번만**. PreCompact 의 쓰기·지우기가
-    //   잠금으로 둘 다 실패하면 지난 컴팩션의 행이 남는다 — 그 행은 이미 한 번 읽혀 지워졌거나(소비),
-    //   TTL 보다 오래됐다. 소비가 실패해도 TTL 이 막는다.
+    //   ★ 읽는 쪽 계약(reply-142 PB142-01): **이번 컴팩션의 행만** — PreCompact 가 적은 pre_uuid 뒤에
+    //   대화가 이어졌으면 지난 컴팩션의 행이다(PreCompact 의 쓰기·지우기가 잠금으로 실패해 남은 것).
+    //   판정할 근거(트랜스크립트·pre_uuid)가 없으면 내지 않는다. 시각·소비에 기대지 않으므로
+    //   같은 컴팩션에서 다시 불려도 같은 복구가 나오고, 컴팩션이 오래 걸려도 버리지 않는다(PB142-02).
     if (source === 'compact' && sessionId) {
       try {
-        const h = db.prepare('SELECT request, pending, active_file, written_ms FROM compact_handover WHERE session_id = ? AND project = ?')
-          .get(sessionId, project) as { request: string | null; pending: number; active_file: string | null; written_ms: number | null } | undefined;
-        try {
-          db.prepare('DELETE FROM compact_handover WHERE session_id = ? AND project = ?').run(sessionId, project);
-        } catch { /* 잠금 — TTL 이 막는다 */ }
-        const fresh = !!h?.written_ms && Date.now() - h.written_ms >= 0 && Date.now() - h.written_ms < COMPACT_HANDOVER_TTL_MS;
-        if (h && fresh && (h.request || h.active_file)) {
+        const h = db.prepare('SELECT request, pending, active_file, pre_uuid FROM compact_handover WHERE session_id = ? AND project = ?')
+          .get(sessionId, project) as { request: string | null; pending: number; active_file: string | null; pre_uuid: string | null } | undefined;
+        const current = !!h && matchCompaction(readTailLines(transcriptPath), h.pre_uuid) === 'current';
+        if (h && current && (h.request || h.active_file)) {
           const bits = ['♻️ **Recovered after compaction**'];
           if (h.request) bits.push(`- Last human request (a request, not a result${h.pending ? ' · no reply yet' : ''}): ${h.request}`);
           if (h.active_file) bits.push(`- Active file: ${h.active_file}`);
@@ -565,7 +560,7 @@ async function main() {
     ensureSessionsDb(resolvedRoot);
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
-    const context = loadContext(dbPath, project, input.source, found?.dir, input.session_id);
+    const context = loadContext(dbPath, project, input.source, found?.dir, input.session_id, input.transcript_path);
 
     // 주입 결과는 별도 줄. injected 는 **문자 수**다 (토큰 아님 — 예산은 2000 토큰이고
     // 한글은 문자당 토큰이 더 든다. 대략 len/4 보다 나쁘다).

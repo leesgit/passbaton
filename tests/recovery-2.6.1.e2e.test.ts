@@ -75,11 +75,13 @@ const toolResult = (): Line => ({ type: 'user', message: { role: 'user', content
 
 const NOTIFY = '<task-notification>\n<task-id>bz6sann1w</task-id>\n<status>completed</status>\n<summary>Background command completed</summary>\n</task-notification>';
 
+/** 실제 호스트처럼 줄마다 uuid 를 단다 — 줄 번호 기반이라 앞줄이 같으면 uuid 도 같다(이어 쓴 트랜스크립트). */
 function transcript(dir: string, lines: Line[]): string {
   const p = path.join(dir, 't.jsonl');
-  fs.writeFileSync(p, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+  fs.writeFileSync(p, lines.map((l, i) => JSON.stringify({ uuid: `u${i}`, ...l })).join('\n') + '\n');
   return p;
 }
+const TP = (ws: string) => path.join(ws, 't.jsonl');
 
 /** SessionStart(부트스트랩) → 기존 State 심기 → PreCompact → SessionStart(compact) */
 function compactCycle(lines: Line[], opts: { seedState?: string } = {}) {
@@ -94,18 +96,16 @@ function compactCycle(lines: Line[], opts: { seedState?: string } = {}) {
   }
   const tp = transcript(ws, lines);
   hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: tp });
-  // 복구 행은 SessionStart(compact) 가 읽으면서 지운다(한 번 쓰는 행) — 그 전에 본다
   const pre = new Database(dbPath, { readonly: true });
   const handover = pre.prepare("SELECT request, pending, active_file FROM compact_handover WHERE session_id = 's1' AND project = 'game'").get() as
     { request: string | null; pending: number; active_file: string | null } | undefined;
   pre.close();
-  const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+  const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
   const db = new Database(dbPath, { readonly: true });
   const active = db.prepare("SELECT current_state, updated_at FROM active_context WHERE project = 'game'").get() as
     { current_state: string; updated_at: string } | undefined;
-  const left = db.prepare("SELECT COUNT(*) c FROM compact_handover WHERE session_id = 's1'").get() as { c: number };
   db.close();
-  return { ws, proj, out, active, handover, consumed: left.c === 0 };
+  return { ws, proj, out, active, handover };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,9 +239,9 @@ describe('PB139-01 컴팩션 복구 — 실측 반례', () => {
     const { ws, proj } = workspace();
     hook(SESSION_START, ws, { cwd: proj, session_id: 'A' });
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 'A', transcript_path: transcript(ws, [human('세션 A 의 요청'), reply('네')]) });
-    const outB = hook(SESSION_START, ws, { cwd: proj, session_id: 'B', source: 'compact' });
+    const outB = hook(SESSION_START, ws, { cwd: proj, session_id: 'B', source: 'compact', transcript_path: TP(ws) });
     expect(outB).not.toContain('세션 A 의 요청');
-    const outA = hook(SESSION_START, ws, { cwd: proj, session_id: 'A', source: 'compact' });
+    const outA = hook(SESSION_START, ws, { cwd: proj, session_id: 'A', source: 'compact', transcript_path: TP(ws) });
     expect(outA).toContain('세션 A 의 요청');
   });
 });
@@ -289,12 +289,12 @@ describe('PB140-02 같은 세션의 두 번째 컴팩션', () => {
     const { ws, proj } = workspace();
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('첫 컴팩션 전 요청'), machine(NOTIFY)]) });
-    const first = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+    const first = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
     expect(first).toContain('첫 컴팩션 전 요청');   // 양의 대조
 
     const summaryOnly: Line = { type: 'user', isCompactSummary: true, message: { role: 'user', content: 'This session is being continued …' } };
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [summaryOnly, machine(NOTIFY)]) });
-    const second = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+    const second = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
     expect(second).not.toContain('첫 컴팩션 전 요청');
     expect(second).not.toContain('Recovered after compaction');
   });
@@ -304,9 +304,9 @@ describe('PB140-02 같은 세션의 두 번째 컴팩션', () => {
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('옛 요청'), reply('네')]) });
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: path.join(ws, 'missing.jsonl') });
-    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' })).not.toContain('옛 요청');
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).not.toContain('옛 요청');
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('새 요청'), reply('네')]) });
-    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' })).toContain('Last human request (a request, not a result): 새 요청');
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('Last human request (a request, not a result): 새 요청');
   });
 
   it.skipIf(!built)('큰 재개 카드와 함께여도 복구 줄이 나오고 전체가 예산 안에 든다', () => {
@@ -317,7 +317,7 @@ describe('PB140-02 같은 세션의 두 번째 컴팩션', () => {
       JSON.stringify({ continuity: { sources: [{ path: 'docs/HANDOFF.md', lines: 300, label: 'HANDOFF' }] } }));
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('카드와 같이 나와야 하는 요청'), reply('네')]) });
-    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
     expect(out).toContain('## Resume card');
     expect(out).toContain('카드와 같이 나와야 하는 요청');
     expect(out.length).toBeLessThan(8000);   // 토큰 예산 2000 ≈ 8000 자(len/4 추정)
@@ -447,7 +447,7 @@ describe('PB139-02 반복 초기화 · 읽기 전용 서버', () => {
   });
 });
 
-describe('PB141 — Stop 의 명령 인자·혼합 본문 · 잠금 뒤 옛 복구 · 남은 분기', () => {
+describe('PB141·PB142 — Stop 의 명령 인자·사람 인용 · 이번 컴팩션 판정 · 남은 분기', () => {
   const command = (args: string): Line => ({ type: 'user', message: { role: 'user', content: `<command-message>ashfall</command-message>\n<command-name>/ashfall</command-name>\n<command-args>${args}</command-args>` } });
   const stopRow = (dbPath: string) => {
     const db = new Database(dbPath, { readonly: true });
@@ -458,75 +458,115 @@ describe('PB141 — Stop 의 명령 인자·혼합 본문 · 잠금 뒤 옛 복�
   };
 
   it.skipIf(!built)('PB141-01 Stop 은 3~4 자 명령 인자를 받는다(옛 Stop 그대로) · 일반 글 4 자는 여전히 버린다', () => {
-    const { ws, proj, dbPath } = workspace();
-    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
-    hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [command('중단해'), reply('중단했습니다.')]) });
-    expect(stopRow(dbPath)).toContain('중단해');
+    // 경우마다 새 작업공간 — 같은 DB 에 이어 쓰면 앞 행을 읽어 거짓 초록/빨강이 된다
+    const stopFor = (lines: Line[]) => {
+      const { ws, proj, dbPath } = workspace();
+      hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+      hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, lines) });
+      return stopRow(dbPath);
+    };
+    expect(stopFor([command('중단해'), reply('중단했습니다.')])).toContain('중단해');
+    // 4 자 명령 인자도 받는다
+    expect(stopFor([command('취소해줘'), reply('취소했습니다.')])).toContain('취소해줘');
+    // 일반 글 4 자는 요약 품질 규칙으로 버린다(옛 Stop 그대로) — 양의 대조: 5 자는 남는다
+    expect(stopFor([human('그만해요'), reply('알겠습니다 멈춥니다.')])).not.toContain('그만해요');
+    expect(stopFor([human('그만해주세요'), reply('알겠습니다 멈춥니다.')])).toContain('그만해주세요');
   });
 
-  it('PB141-03 사람 글 뒤에 붙은 하네스 출력 블록은 걷어 내고 사람 글은 남긴다', () => {
-    const t1 = '이 결과 보고 판단해줘\n<local-command-stdout>SECRET-OUTPUT</local-command-stdout>';
-    expect(humanText({ type: 'user', message: { content: t1 } })).toBe('이 결과 보고 판단해줘');
-    const t2 = '이거 봐줘 <bash-stdout>BASH-OUT</bash-stdout><bash-stderr></bash-stderr> 어때';
-    expect(humanText({ type: 'user', message: { content: t2 } })).toBe('이거 봐줘  어때');
+  it('PB142-03 사람이 붙여 넣은 태그 블록은 인용이다 — 내용까지 남긴다 · 맨 앞 봉투는 기계 줄', () => {
+    const quoted = '이 태그를 설명해줘: <bash-stdout>오류 내용</bash-stdout>';
+    expect(humanText({ type: 'user', message: { content: quoted } })).toBe(quoted);
+    const pasted = '이 결과 보고 판단해줘\n<local-command-stdout>붙여 넣은 출력</local-command-stdout>';
+    expect(humanText({ type: 'user', message: { content: pasted } })).toBe(pasted);
+    // 실제 하네스 출력 = 맨 앞 봉투(실측 194/194) → 메시지 전체가 기계 줄
+    expect(humanText({ type: 'user', message: { content: '<local-command-stdout>하네스 출력</local-command-stdout>' } })).toBe('');
+    expect(humanText({ type: 'user', message: { content: '<bash-stdout>out</bash-stdout><bash-stderr></bash-stderr>' } })).toBe('');
   });
 
-  it.skipIf(!built)('PB141-03 Stop 저장에도 하네스 출력이 들어가지 않는다', () => {
+  it.skipIf(!built)('PB142-03 Stop 저장: 사람 인용은 남고 하네스 봉투 줄은 요청이 되지 않는다', () => {
     const { ws, proj, dbPath } = workspace();
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
     hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [
-      human('이 결과 보고 판단해줘\n<local-command-stdout>SECRET-OUTPUT</local-command-stdout>'), reply('판단했습니다.'),
+      human('이 태그를 설명해줘: <bash-stdout>오류 내용</bash-stdout>'), reply('설명했습니다.'),
+      machine('<local-command-stdout>HARNESS-ONLY</local-command-stdout>'),
     ]) });
     const seen = stopRow(dbPath);
-    expect(seen).toContain('이 결과 보고 판단해줘');
-    expect(seen).not.toContain('SECRET-OUTPUT');
+    expect(seen).toContain('오류 내용');
+    expect(seen).not.toContain('HARNESS-ONLY');
   });
 
-  it.skipIf(!built)('PB141-02 다음 PreCompact 가 잠금으로 쓰기·지우기 모두 실패해도 지난 요청이 이번 복구로 나오지 않는다', () => {
-    const { ws, proj, dbPath } = workspace();
-    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
-    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('요청 A'), reply('네')]) });
-    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' })).toContain('요청 A');   // 양의 대조
-
+  /** 잠금을 쥔 채로 PreCompact 를 돌린다 — 쓰기·지우기 둘 다 busy 로 실패한다 */
+  function lockedPreCompact(ws: string, proj: string, dbPath: string, lines: Line[]): void {
     const lock = new Database(dbPath);
     lock.exec('BEGIN EXCLUSIVE');
     try {
-      hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('요청 B'), reply('네')]) });
+      hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, lines) });
     } finally {
       lock.exec('COMMIT');
       lock.close();
     }
-    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+  }
+
+  it.skipIf(!built)('PB142-01 소비되지 않은 최신 행 A + 다음 PreCompact(B) 쓰기·지우기 실패 → A 를 이번 복구로 내지 않는다 · 그 뒤 C 는 정상', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    const tA: Line[] = [human('요청 A'), reply('네 A')];
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, tA) });
+    // A 는 소비되지 않았다(SessionStart 누락) · 1 분도 안 됐다 — 시각으로는 「이번 것」 처럼 보인다
+    const pre = new Database(dbPath, { readonly: true });
+    expect((pre.prepare("SELECT request FROM compact_handover WHERE session_id = 's1'").get() as { request: string }).request).toBe('요청 A');
+    pre.close();
+    // 대화가 이어지고 다음 컴팩션의 PreCompact(B)가 잠금으로 실패
+    const tB: Line[] = [...tA, human('요청 B'), reply('네 B')];
+    lockedPreCompact(ws, proj, dbPath, tB);
+    const still = new Database(dbPath, { readonly: true });
+    expect((still.prepare("SELECT request FROM compact_handover WHERE session_id = 's1'").get() as { request: string }).request).toBe('요청 A');   // 정말 남았다
+    still.close();
+    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
     expect(out).not.toContain('요청 A');
     expect(out).not.toContain('Recovered after compaction');
+    // 그 뒤의 정상 컴팩션 C 는 복구된다
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [...tB, human('요청 C'), reply('네 C')]) });
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('요청 C');
   }, 60000);
 
-  it.skipIf(!built)('PB141-02 소비되지 않은 오래된 행(소비 실패)도 TTL 이 막는다', () => {
+  it.skipIf(!built)('PB142-01 컴팩션 산물(경계·요약·첨부)만 뒤에 붙은 트랜스크립트는 「이번 것」 이다', () => {
+    const { ws, proj } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    const t1: Line[] = [human('컴팩션 전 요청'), reply('네')];
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, t1) });
+    transcript(ws, [...t1,
+      { type: 'system', subtype: 'compact_boundary', logicalParentUuid: 'u1' },
+      { type: 'user', isCompactSummary: true, isVisibleInTranscriptOnly: true, message: { role: 'user', content: 'This session is being continued …' } },
+      { type: 'attachment', attachment: { type: 'compact_file_reference' } },
+    ]);
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('컴팩션 전 요청');
+  });
+
+  it.skipIf(!built)('PB142-01 판정 근거가 없으면 내지 않는다 — 트랜스크립트 경로 없음 · pre_uuid 없는 옛 행', () => {
     const { ws, proj, dbPath } = workspace();
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('근거 시험 요청'), reply('네')]) });
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' })).not.toContain('근거 시험 요청');
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('근거 시험 요청');   // 양의 대조
     const db = new Database(dbPath);
-    db.prepare("INSERT INTO compact_handover (session_id, project, request, pending, written_ms) VALUES ('s1', 'game', '40분 전 요청', 0, ?)")
-      .run(Date.now() - 40 * 60 * 1000);
+    db.prepare("UPDATE compact_handover SET pre_uuid = NULL WHERE session_id = 's1'").run();
     db.close();
-    const lock = new Database(dbPath);
-    lock.exec('BEGIN EXCLUSIVE');
-    try {
-      hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('요청 B'), reply('네')]) });
-    } finally {
-      lock.exec('COMMIT');
-      lock.close();
-    }
-    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
-    expect(out).not.toContain('40분 전 요청');
-    // 양의 대조: 갓 쓴 행은 나온다
-    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('요청 C'), reply('네')]) });
-    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' })).toContain('요청 C');
-  }, 60000);
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).not.toContain('근거 시험 요청');
+  });
 
-  it.skipIf(!built)('PB141-02 읽으면 소비된다 — 같은 컴팩션의 복구가 두 번 나오지 않는다', () => {
-    const { consumed, out } = compactCycle([human('한 번만 나올 요청'), reply('네')]);
-    expect(out).toContain('한 번만 나올 요청');
-    expect(consumed).toBe(true);
+  it.skipIf(!built)('PB142-02 같은 컴팩션에서 다시 불려도 같은 복구 · 오래 걸린 컴팩션도 버리지 않는다', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('다시 불릴 요청'), reply('네')]) });
+    const first = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
+    const again = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
+    expect(first).toContain('다시 불릴 요청');
+    expect(again).toContain('다시 불릴 요청');
+    const db = new Database(dbPath);
+    db.prepare("UPDATE compact_handover SET created_at = datetime('now', '-2 hours') WHERE session_id = 's1'").run();
+    db.close();
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('다시 불릴 요청');
   });
 
   it.skipIf(!built)('PB140-03 디렉터리는 (not a file now) · 확인할 수 없는 경로는 (could not check)', () => {
@@ -549,11 +589,11 @@ describe('PB141 — Stop 의 명령 인자·혼합 본문 · 잠금 뒤 옛 복�
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
     hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('예산 시험 요청'), reply('네')]) });
     // 카드 3200 자 ≈ 800 토큰 > 예산 300 → 복구 블록 자리 없음
-    const tight = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' }, { MCP_CONTEXT_BUDGET: '300' });
+    const tight = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) }, { MCP_CONTEXT_BUDGET: '300' });
     expect(tight).toContain('## Resume card');
     expect(tight).not.toContain('예산 시험 요청');
-    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('예산 시험 요청'), reply('네')]) });
-    const roomy = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+    // PreCompact 를 다시 돌리지 않는다 — 예산 때문에 빠진 복구가 같은 컴팩션의 다음 호출에서 되살아나야 한다
+    const roomy = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
     expect(roomy).toContain('예산 시험 요청');
   });
 });

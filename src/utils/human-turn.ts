@@ -16,6 +16,10 @@
  *        `<command-args>` 인용은 명령이 아니다
  *     3) 명령 인자는 진짜 명령 봉투(맨 앞이 <command-message>/<command-name>)일 때만 꺼낸다
  *     4) 길이로 사람 여부를 정하지 않는다 — 최소 길이는 Stop 의 요약 품질 규칙이고 거기서 건다
+ *     5) 글 **중간·뒤의** 완전한 태그 블록(`<bash-stdout>…</bash-stdout>` 등)은 사람이 붙여 넣은 인용이다 —
+ *        걷어 내지 않는다(Astra reply-142 PB142-03). 실측(2026-10-22, 이 PC 트랜스크립트 500 개): 하네스 출력은
+ *        194 건 모두 **메시지 맨 앞 봉투**였고 봉투 뒤에 사람 글이 이어진 경우 0 · 사람 글 뒤에 하네스 블록이
+ *        붙어 온 경우 0. 그래서 하네스 출력 = 맨 앞 봉투(→ 메시지 전체가 기계 줄)로만 판정한다
  *
  * 빈 문자열 = 사람 요청이 아니다(메타 턴·컴팩션 요약·하네스 알림·셸 입출력·도구 결과).
  */
@@ -44,22 +48,6 @@ const MACHINE_ENVELOPE = /^<(?:task-notification|bash-input|bash-stdout|bash-std
 
 /** 명령 봉투 — 맨 앞일 때만 진짜 명령이다. */
 const COMMAND_ENVELOPE = /^<(?:command-message|command-name)>/;
-
-/**
- * 사람 글 **뒤나 사이에** 붙는 하네스 출력 블록. 봉투가 맨 앞이 아니어도 블록째 걷어 낸다
- * (옛 Stop 이 하던 일 — Astra reply-141 PB141-03). 태그 **이름만** 인용한 사람 글(`<task-id> 가 뭐야`)은
- * 닫는 태그가 없으므로 남는다.
- */
-const HARNESS_BLOCKS = [
-  /<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g,
-  /<local-command-stderr>[\s\S]*?<\/local-command-stderr>/g,
-  /<bash-input>[\s\S]*?<\/bash-input>/g,
-  /<bash-stdout>[\s\S]*?<\/bash-stdout>/g,
-  /<bash-stderr>[\s\S]*?<\/bash-stderr>/g,
-  /<command-name>[\s\S]*?<\/command-name>/g,
-  /<command-message>[\s\S]*?<\/command-message>/g,
-  /<command-args>[\s\S]*?<\/command-args>/g,
-];
 
 export interface HumanTurn {
   text: string;
@@ -101,9 +89,6 @@ export function humanTurn(entry: TranscriptEntry): HumanTurn {
     // 인자 없는 명령(`/ashfall` 만)은 요청 글이 없다 — 명령 이름 보존은 2.7 라우팅(PB139-12)에서
     return { text: args, viaCommand: args.length > 0 };
   }
-
-  for (const re of HARNESS_BLOCKS) text = text.replace(re, '');
-  text = text.trim();
 
   // 시스템/메타 메시지 스킵
   if (text.startsWith('[Request interrupted')) return none;
