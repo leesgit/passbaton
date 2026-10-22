@@ -34,7 +34,8 @@ function project(): string {
 
 const cells = (row: string) => row.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
 function section(md: string, heading: string): string[] {
-  const lines = md.split('\n');
+  // Windows CI 체크아웃은 CRLF 다(autocrlf) — 줄 끝 \r 이 남으면 구분선을 데이터 행으로 읽는다
+  const lines = md.split(/\r?\n/);
   const i = lines.findIndex(l => l.startsWith('## ') && l.includes(heading));
   const rest = lines.slice(i + 1);
   const end = rest.findIndex(l => l.startsWith('## '));
@@ -96,6 +97,22 @@ describe('PB139-13 카드로 전달', () => {
     expect(cut.excerpt).toContain('| N146 |');
     expect(cut.excerpt).not.toContain('MM-02');
     for (const l of cut.excerpt!.split('\n').filter(x => x.startsWith('|'))) expect(l.trimEnd(), l).toMatch(/\|$/);
+  });
+
+  it('CRLF 색인도 같다 — 활성 행 전부 · 제외 절 없음 · 행 중간에서 안 자름', () => {
+    const dir = project();
+    const p = path.join(dir, 'docs', 'INDEX.md');
+    fs.writeFileSync(p, fs.readFileSync(p, 'utf-8').replace(/\r?\n/g, '\r\n'));
+    const card = buildResumeCard(dir, 3200)!;
+    for (const id of ['N146', 'MM-02', 'PB-07']) expect(card.text).toContain(`| ${id} |`);
+    expect(card.text).not.toContain('\r');
+    expect(card.text).not.toContain('6000 자');
+    const full = readSource(dir, { path: 'docs/INDEX.md', block: '활성 처분' }, 100000);
+    const rows = full.excerpt!.split('\n');
+    const upTo = rows.findIndex(l => l.includes('| MM-02 |'));
+    const cut = readSource(dir, { path: 'docs/INDEX.md', block: '활성 처분' }, rows.slice(0, upTo).join('\n').length + 30);
+    expect(cut.truncated).toBe(true);
+    expect(cut.excerpt).not.toContain('MM-02');
   });
 
   it('표가 아닌 긴 줄은 예전처럼 잘라서라도 보인다(빈 발췌 방지 규칙 유지)', () => {
