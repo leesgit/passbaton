@@ -93,23 +93,26 @@ const DB_PATH = path.join(CLAUDE_DIR, 'sessions.db');
 const IS_MONOREPO = existsSync(APPS_DIR);
 const DEFAULT_PROJECT = IS_MONOREPO ? null : path.basename(WORKSPACE_ROOT);
 
-// ===== 디렉토리 생성 (동기) =====
-if (!existsSync(CLAUDE_DIR)) {
-  mkdirSync(CLAUDE_DIR, { recursive: true });
-}
-
 // ===== 읽기 전용 모드 (2.6.0) =====
 // `PASSBATON_READONLY=1` 이면 상태를 바꾸지 않는 도구만 내놓는다. 다른 에이전트(예: Codex 의
 // Astra)에게 같은 기억·세션 원장을 **보여 주되 고치게 하지는 않을** 때 쓴다.
 // ★ 「읽기」 도구도 조회수(access_count)·임베딩 캐시를 쓴다 — 이 모드에서는 건너뛴다.
 // ★ DB 가 이미 있으면 SQLite 를 readonly 로 연다. 그러면 빠뜨린 쓰기 경로가 있어도
 //   조용히 쓰지 않고 오류로 드러난다(약속이 아니라 강제).
-const READONLY = /^(1|true|yes)$/i.test(process.env.PASSBATON_READONLY || '');
+// ★ 실패 시 닫힌 쪽으로: 비어 있거나 0/false/no/off 가 아니면 전부 읽기 전용이다(「on」 「 1」 도).
+const READONLY = !/^(|0|false|no|off)$/i.test((process.env.PASSBATON_READONLY ?? '').trim());
 const READONLY_DB = READONLY && existsSync(DB_PATH);
 
+// ===== 디렉토리 생성 (동기) — 읽기 전용이면 만들지 않는다 =====
+if (!READONLY && !existsSync(CLAUDE_DIR)) {
+  mkdirSync(CLAUDE_DIR, { recursive: true });
+}
+
+
 // ===== SQLite 데이터베이스 초기화 =====
-const db = READONLY_DB
-  ? new Database(DB_PATH, { readonly: true, fileMustExist: true })
+// DB 가 없을 때 읽기 전용이면 디스크에 만들지 않는다 — 빈 메모리 DB 에 스키마만 세운다.
+const db = READONLY
+  ? (READONLY_DB ? new Database(DB_PATH, { readonly: true, fileMustExist: true }) : new Database(':memory:'))
   : new Database(DB_PATH);
 
 // v5 스키마 - 세션 + 메모리 분류 체계 + 지식 그래프
@@ -294,6 +297,8 @@ async function initEmbedding() {
 initEmbedding();
 
 async function generateEmbedding(text: string, type: 'query' | 'passage' = 'query'): Promise<number[] | null> {
+  // 읽기 전용 모드에서는 임베딩 모델을 받지도(캐시 쓰기·네트워크) 돌리지도 않는다 — 키워드 검색으로 떨어진다.
+  if (READONLY) return null;
   if (!embeddingPipeline) await initEmbedding();
   if (!embeddingPipeline) return null;
 
@@ -409,6 +414,11 @@ function runCommand(cmd: string, cwd: string): { success: boolean; output: strin
 // ===== 프로젝트 경로 헬퍼 (모노레포/단일 프로젝트 호환) =====
 
 function getProjectPath(project: string): string {
+  // 2.6.0: 프로젝트 이름은 폴더 이름 하나다 — 경로 조각(../, 절대 경로)으로 워크스페이스 밖을 읽지 못하게.
+  //   (resume_card 는 읽기 전용 모드에서 승인 없이 불리므로 이 검사가 경계다)
+  if (typeof project !== 'string' || !project || project === '.' || project === '..' || /[\\/:]/.test(project) || project.includes('\0')) {
+    throw new Error(`invalid project name: ${JSON.stringify(project).slice(0, 60)}`);
+  }
   // 단일 프로젝트 모드: 프로젝트명이 workspace 이름과 같으면 루트 반환
   if (!IS_MONOREPO && project === DEFAULT_PROJECT) {
     return WORKSPACE_ROOT;
@@ -2482,8 +2492,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // ===== Prompts 핸들러 (자동 주입) =====
 
+// 읽기 전용 모드에서는 프롬프트를 내놓지 않는다 — work-context 는 꺼진 쓰기 도구를 부르라고 안내한다.
 server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-  prompts
+  prompts: READONLY ? [] : prompts
 }));
 
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {

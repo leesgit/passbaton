@@ -11,8 +11,8 @@ import { isEnabled } from '../utils/config.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
 import { resolveWorkspaceRoot } from '../utils/workspace.js';
 import { ensureSessionsDb } from '../db/bootstrap.js';
-import { isStillDirective } from '../utils/directive.js';
-import { buildResumeCard } from '../utils/resume-card.js';
+import { revalidateDirective } from '../utils/directive.js';
+import { buildResumeCard, clampCardChars } from '../utils/resume-card.js';
 
 interface SessionInput {
   cwd?: string;
@@ -26,13 +26,16 @@ interface SessionInput {
   source?: string;
 }
 
-function getProject(cwd: string, workspaceRoot: string): string | null {
+// 2.6.0: 프로젝트 이름과 **그 폴더**를 같이 돌려준다 — 재개 카드 선언은 그 폴더에서 읽는다.
+//   (전에는 apps/ 밖 하위 프로젝트에 워크스페이스 루트의 카드가 붙을 수 있었다)
+function getProject(cwd: string, workspaceRoot: string): { name: string; dir: string } | null {
   const appsDir = path.join(workspaceRoot, 'apps');
 
   // apps/ 하위인지 확인
   if (cwd.startsWith(appsDir + path.sep)) {
     const relative = path.relative(appsDir, cwd);
-    return relative.split(path.sep)[0];
+    const name = relative.split(path.sep)[0];
+    return { name, dir: path.join(appsDir, name) };
   }
 
   // apps/ 외부 하위 프로젝트 (hackathons/ 등) - package.json에서 이름 추출
@@ -43,9 +46,9 @@ function getProject(cwd: string, workspaceRoot: string): string | null {
       if (fs.existsSync(pkgPath)) {
         try {
           const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
-          return pkg.name || path.basename(current);
+          return { name: pkg.name || path.basename(current), dir: current };
         } catch {
-          return path.basename(current);
+          return { name: path.basename(current), dir: current };
         }
       }
       current = path.dirname(current);
@@ -53,14 +56,7 @@ function getProject(cwd: string, workspaceRoot: string): string | null {
   }
 
   // 워크스페이스 루트 (모노레포 포함) → 폴더명 반환
-  return path.basename(workspaceRoot);
-}
-
-/** 재개 카드 선언을 찾을 프로젝트 폴더. apps/<name> 아래면 그 폴더, 아니면 워크스페이스 루트. */
-function projectPathOf(cwd: string, workspaceRoot: string, project: string): string {
-  const appsDir = path.join(workspaceRoot, 'apps');
-  if (cwd.startsWith(appsDir + path.sep)) return path.join(appsDir, project);
-  return workspaceRoot;
+  return { name: path.basename(workspaceRoot), dir: workspaceRoot };
 }
 
 function cleanupNoiseMemories(db: InstanceType<typeof Database>): void {
@@ -75,14 +71,22 @@ function cleanupNoiseMemories(db: InstanceType<typeof Database>): void {
 
     // 2.6.0: 그 이전 판이 decision/7 로 넣은 정규식 조각을 격리한다(지우지 않는다).
     //   memory_search 로는 계속 보이고, 태그로 이유를 남긴다. 한 번 바뀌면 다시 안 걸린다.
+    //   ★ 원래 태그·종류·중요도는 지우지 않는다 — 태그는 덧붙이고, 원래 값은 metadata.quarantine 에.
+    //   사람이 승격하려면 `unverified` 태그를 떼면 된다(quarantined-2.6 이 남아 있으면 다시 안 잡는다).
     db.prepare(`
       UPDATE memories
-      SET memory_type = 'observation',
-          importance = MIN(importance, 2),
-          tags = '["auto-extracted","unverified","quarantined-2.6"]'
+      SET metadata = json_set(
+            CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+            '$.quarantine', json_object('reason', 'regex-extracted (2.6.0)', 'from_type', memory_type, 'from_importance', importance)),
+          tags = CASE WHEN json_valid(tags) AND json_type(tags) = 'array'
+                      THEN json_insert(json_insert(tags, '$[#]', 'unverified'), '$[#]', 'quarantined-2.6')
+                      ELSE '["auto-extracted","unverified","quarantined-2.6"]' END,
+          memory_type = 'observation',
+          importance = MIN(importance, 2)
       WHERE memory_type = 'decision'
-        AND tags LIKE '%auto-extracted%'
-        AND tags NOT LIKE '%commit%'
+        AND COALESCE(tags, '') LIKE '%auto-extracted%'
+        AND COALESCE(tags, '') NOT LIKE '%"commit"%'
+        AND COALESCE(tags, '') NOT LIKE '%quarantined-2.6%'
     `).run();
 
     // 14일+ auto-compact 패턴 메모리 삭제
@@ -101,7 +105,7 @@ function estimateTokens(text: string): number {
 }
 
 // 재개 카드에 쓸 최대 글자 수. 토큰 예산(2000)과 같은 예산에서 나간다.
-const CARD_CHARS = parseInt(process.env.PASSBATON_CARD_CHARS || '3200', 10);
+const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 
 function loadContext(dbPath: string, project: string, source?: string, projectPath?: string): string | null {
   // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
@@ -135,7 +139,7 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
       // P0-1: 컴팩션 직후 재시작이면 PreCompact가 저장한 복구 상태임을 밝힌다.
       // 카드가 있으면 State 는 「마지막으로 기록된 것」일 뿐이다 — 정본은 카드 쪽이다.
       const stateLabel = source === 'compact' ? '♻️ **Recovered after compaction**'
-        : card ? '📍 **Last recorded state** (DB · may be stale — the resume card above wins)'
+        : card?.anyRead ? '📍 **Last recorded state** (DB · may be stale — the resume card above wins)'
         : '📍 **State**';
       const stateBlock = `${stateLabel}: ${active.current_state}` + (active.blockers ? `\n🚧 **Blocker**: ${active.blockers}` : '');
       const cost = estimateTokens(stateBlock);
@@ -316,10 +320,13 @@ function renderFileEvidence(row: {
         WHERE project = ?
         ORDER BY CASE priority WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
                  created_at DESC
-        LIMIT 40
+        LIMIT 200
       `).all(project) as Array<{ directive: string; priority: string; context: string | null }>)
-        // 저장 뒤에 규칙이 강화됐을 수 있다 — 이미 DB 에 있는 오추출도 여기서 거른다(문장 + 출처).
-        .filter(d => isStillDirective(d.directive, d.context)).slice(0, 5);
+        // 저장 뒤에 규칙이 강화됐을 수 있다 — 이미 DB 에 있는 행도 지금 규칙(출처 + 문장)으로 다시 본다.
+        // 앞쪽 행이 전부 무효여도 뒤의 유효 지시가 밀려나지 않게 넉넉히 읽고 거른 뒤 자른다.
+        .map(d => ({ ...d, directive: revalidateDirective(d.directive, d.context) ?? '' }))
+        .filter((d, i, all) => d.directive && all.findIndex(x => x.directive === d.directive) === i)
+        .slice(0, 5);
 
       if (directives.length > 0) {
         const directiveLines = ['## Directives'];
@@ -382,8 +389,9 @@ function renderFileEvidence(row: {
           AND (tags NOT LIKE '%auto-tracked%' OR tags IS NULL)
           AND (tags NOT LIKE '%auto-compact%' OR tags IS NULL)
           -- 2.6.0: 정규식 후보(unverified)와 그 이전 판의 자동 추출 「결정」 은 주입하지 않는다
-          AND (tags NOT LIKE '%unverified%' OR tags IS NULL)
-          AND NOT (memory_type = 'decision' AND tags LIKE '%auto-extracted%')
+          AND COALESCE(tags, '') NOT LIKE '%unverified%'
+          -- ⚠ tags 가 NULL 이면 NOT(TRUE AND NULL) = NULL 이라 사람이 넣은 decision 이 빠졌다 — COALESCE 필수
+          AND NOT (memory_type = 'decision' AND COALESCE(tags, '') LIKE '%auto-extracted%')
         ORDER BY importance DESC, accessed_at DESC LIMIT 30
       `).all(project) as Array<{ content: string; memory_type: string; importance: number; created_at: string; access_count: number }>;
 
@@ -500,7 +508,8 @@ async function main() {
 
     const resolvedRoot = resolveWorkspaceRoot(cwd);
     const workspaceRoot = resolvedRoot.root;
-    const project = getProject(cwd, workspaceRoot);
+    const found = getProject(cwd, workspaceRoot);
+    const project = found?.name ?? null;
 
     // 조기 반환과 loadContext **앞**에서 찍는다. 뒤에 두면 「발화 안 함」과
     // 「발화했으나 도중에 죽음」이 로그상 같아진다.
@@ -520,7 +529,7 @@ async function main() {
     ensureSessionsDb(resolvedRoot);
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
-    const context = loadContext(dbPath, project, input.source, projectPathOf(cwd, workspaceRoot, project));
+    const context = loadContext(dbPath, project, input.source, found?.dir);
 
     // 주입 결과는 별도 줄. injected 는 **문자 수**다 (토큰 아님 — 예산은 2000 토큰이고
     // 한글은 문자당 토큰이 더 든다. 대략 len/4 보다 나쁘다).

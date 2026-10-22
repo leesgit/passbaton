@@ -408,15 +408,17 @@ function extractAndSaveDirectives(dbPath: string, project: string, prompt: strin
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
 
     // 2.6.0: 출처 규칙 + 문장 규칙은 extractDirectives 한 곳에서.
-    for (const { directive, priority } of extractDirectives(prompt)) {
-      // UPSERT directive
+    for (const { directive, priority, context } of extractDirectives(prompt)) {
+      // UPSERT directive — context 도 갱신한다. 안 그러면 옛 판이 긴 붙여넣기에서 넣은 행이
+      // 사람이 같은 말을 짧게 다시 해도 영영 「출처 불량」 으로 가려진다.
       db.prepare(`
         INSERT INTO user_directives (project, directive, context, source, priority)
         VALUES (?, ?, ?, 'explicit', ?)
         ON CONFLICT(project, directive) DO UPDATE SET
           priority = ?,
+          context = excluded.context,
           created_at = CURRENT_TIMESTAMP
-      `).run(project, directive, prompt.slice(0, 300), priority, priority);
+      `).run(project, directive, context, priority, priority);
     }
 
     // P1-1 (2026-08-10): 90일 지난 지시문 정리.

@@ -11,7 +11,7 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
-import { isStillDirective } from '../utils/directive.js';
+import { revalidateDirective } from '../utils/directive.js';
 
 interface CompactInput {
   cwd?: string;
@@ -325,10 +325,13 @@ async function main() {
         WHERE project = ?
         ORDER BY CASE priority WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
                  created_at DESC
-        LIMIT 40
+        LIMIT 200
       `).all(project) as Array<{ directive: string; priority: string; context: string | null }>)
-        // 저장 뒤에 규칙이 강화됐을 수 있다 — 이미 DB 에 있는 오추출도 여기서 거른다(문장 + 출처).
-        .filter(d => isStillDirective(d.directive, d.context)).slice(0, 10);
+        // 저장 뒤에 규칙이 강화됐을 수 있다 — 이미 DB 에 있는 행도 지금 규칙(출처 + 문장)으로 다시 본다.
+        // 앞쪽 행이 전부 무효여도 뒤의 유효 지시가 밀려나지 않게 넉넉히 읽고 거른 뒤 자른다.
+        .map(d => ({ ...d, directive: revalidateDirective(d.directive, d.context) ?? '' }))
+        .filter((d, i, all) => d.directive && all.findIndex(x => x.directive === d.directive) === i)
+        .slice(0, 10);
 
       if (directives.length > 0) {
         recoveryLines.push('## DIRECTIVES (MUST FOLLOW)');

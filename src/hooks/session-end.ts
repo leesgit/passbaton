@@ -1426,7 +1426,14 @@ async function main() {
     // ⛔ 2.6.0: 일한 증거(커밋·파일)가 없는 턴은 State 를 **덮지 않는다.** 경로 한 줄 묻고
     //    끝난 세션이 앞선 긴 작업 세션의 State 를 「(결과 요약 없음)」이나 그 한 줄 답으로
     //    바꿔 놓았다(Ashfall 2026-10-22 실측). 증거가 없으면 recent_files 만 갱신한다.
-    const workedThisTurn = commitMessages.length > 0 || modifiedFiles.length > 0;
+    //    증거는 **이번 턴 범위**만 센다:
+    //      - workspaceWrites: 턴 시작 이후 파일시스템에 쓰인 것·커밋된 것(셸 편집도 잡는 유일한 증거)
+    //      - modifiedFiles: 이번 세션의 Edit/Write 관측일 때만(filesFromSession). 폴백인
+    //        project_snapshot 은 다른 세션의 파일이라 증거가 아니다
+    //    ⛔ commitMessages 는 쓰지 않는다 — 트랜스크립트 전체에서 모은 것이라, 커밋이 한 번 있던
+    //       긴 세션은 뒤의 질문 턴까지 「일함」 이 됐다(2.6.0 검토).
+    const workedThisTurn = workspaceWrites.some(w => w.written.length > 0 || (w.committed?.length ?? 0) > 0)
+      || (filesFromSession && modifiedFiles.length > 0);
     const hadState = db.prepare(
       "SELECT 1 FROM active_context WHERE project = ? AND current_state IS NOT NULL AND current_state != ''"
     ).get(project);
@@ -1439,11 +1446,9 @@ async function main() {
         lastWork,
         JSON.stringify(modifiedFiles.slice(0, 15))
       );
-    } else {
-      db.prepare(`
-        UPDATE active_context SET recent_files = ?, updated_at = datetime('now') WHERE project = ?
-      `).run(JSON.stringify(modifiedFiles.slice(0, 15)), project);
     }
+    // 일한 증거가 없는 턴은 active_context 를 건드리지 않는다 — updated_at 을 올리면 오래된 State 가
+    // 최신처럼 보이고, recent_files 를 덮으면 직전 작업의 파일 목록이 사라진다.
 
     // 에러→솔루션 자동 기록 (solutions 테이블)
     // P1-4 (2026-05-22): 품질 필터 + 동일 solution 텍스트 dedup 추가
