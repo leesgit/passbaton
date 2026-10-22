@@ -140,14 +140,51 @@ Declare which **commands** select which project in the root `.claude/passbaton.c
 ```
 
 - Only a registered command at the **very start** of what you type selects a project (`/ashfall …`). The same text
-  inside a sentence, a quote, code, a path mention or a harness notification does not
+  inside a sentence, a quote, code, a path mention or a harness notification does not. (Claude Code passes the typed
+  text to the hook as-is — checked with a no-output probe hook, `tests/fixtures/hook-input-claude-code-2026-10-23.json` —
+  so the expanded `<command-name>` form seen in transcripts is not accepted)
+- Routing runs only when the hook's `cwd` **is** the workspace root (same real path — a sub-app with the root's name
+  does not count; no `cwd` in the input means no routing)
+- A **release command** (mapped to `"."`) is required. Without one, routing is off as a whole
 - The choice is **per session** and survives compaction/resume of that session; a new session starts unrouted.
-  Another routed command switches; a command mapped to `"."` releases
-- The card is sent when the choice changes, when the card's content changes, and after compaction — not every turn
+  Another routed command switches; the release command releases. If the chosen mapping disappears from the config,
+  the next turn says once that the route was cleared
+- The card is sent when the choice changes, when the card (or its header — e.g. a renamed release command) changes,
+  and after compaction — not every turn. If the post-compaction card did not fit the budget, it is sent on the next turn
 - The card says what selected it and that the conversation is **still recorded under the root project** —
   passbaton does not re-file root sessions under the sub-project
-- Paths must be real directories inside the workspace; invalid entries are ignored
+- Paths must be real directories inside the workspace (checked after links/junctions); invalid entries are ignored
 - All of this goes out in the hook's single output (Codex/Gemini receive one JSON object)
+- Cost (Ashfall data, 15 runs, median, Windows): 94 ms (2.6.1) → 100 ms with nothing selected, 112 ms with a selection held
+
+### Decision index through the card (v2.7.0+)
+
+When work is steered by written decisions (reviews, replies from another agent), keep a short **index** in the repo and
+declare its active section as a source. The index points to the original text; passbaton does not judge whether a
+decision is valid.
+
+```markdown
+## Active
+| ID | Decision | Decided by | Source | Resume condition | Unmet condition / evidence | State (A / H) | Replaces / invalidated |
+|---|---|---|---|---|---|---|---|
+| PB-07 | keep card cap 3200 | delegated reviewer | reply-132.md:70-81 (correction) | a measured case where truncation blocked a resume | none yet | A closed / H none | replaces reply-132.md:60-69 |
+
+## Excluded — invalidated or replaced (not in force)
+| Original location | Why excluded | Replaced by |
+|---|---|---|
+| reply-132.md:60-69 (first answer) | based on a miscounted figure | reply-132.md:70-81 |
+```
+
+```json
+{ "continuity": { "sources": [ { "path": "docs/INDEX.md", "block": "Active", "label": "decision index" } ] } }
+```
+
+- Table rows are never cut in the middle: a row that does not fit the card budget is left out and the source is marked
+  `truncated`, so a half row (missing its resume condition) cannot read as a complete decision
+- Use `block` on the active heading so excluded answers never reach the card as "active"; keep the excluded heading
+  free of the active heading's text (otherwise the card reports an ambiguous match)
+- Record who edits the index and which commit it was checked against at the top; an entry whose source is missing or
+  conflicting should say so (`unverified — do not act on it`) rather than be dropped
 
 ## Read-only MCP mode (v2.6.0+)
 
