@@ -129,6 +129,21 @@ describe('PB150-02 경계 — 상한 · 표 행 · 표시', () => {
 });
 
 describe('PB150-02 읽기 일관성 — 두 읽기 사이 파일이 바뀌면 C0', () => {
+  it('C0 에 안 보인 **뒤쪽** 줄만 바뀌어도 → 확장 버림(앞부분 보존 검사로는 못 잡는다 · 해시가 판을 가린다)', () => {
+    const dir = project({ 'docs/INDEX.md': indexMd(20) }, [STOP, IDX]);
+    const c0 = buildResumeCard(dir, 900, { redistribute: false })!;
+    expect(c0.text).not.toContain('| R20 |');
+    const card = buildResumeCard(dir, 900, {
+      readExtra: (p, s, n) => {
+        const f = path.join(p, s.path);
+        fs.writeFileSync(f, fs.readFileSync(f, 'utf-8').replace('| R20 |', '| R20 바뀜 |'));
+        return readSource(p, s, n);
+      },
+    })!;
+    expect(card.redistribution).toMatchObject({ applied: false });
+    expect(card.text).toBe(c0.text);
+  });
+
   it.each(['바뀜', '지워짐'] as const)('파일이 %s → 확장 버림 · C0 그대로', (kind) => {
     const dir = project({ 'docs/INDEX.md': indexMd(20) }, [STOP, IDX]);
     const c0 = buildResumeCard(dir, 900, { redistribute: false })!;
