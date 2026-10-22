@@ -109,41 +109,76 @@ export interface ExtractedDirective {
   context: string;
 }
 
-/** 사용자 턴 하나에서 지시문을 뽑는다 — 출처 범위 → 패턴 → 문장 규칙. */
-export function extractDirectives(prompt: string): ExtractedDirective[] {
-  const scope = directiveScope(prompt);
-  if (scope === 'none') return [];
-  const out: ExtractedDirective[] = [];
-  const lines = prompt.split(/\r?\n/);
-  // ★ 한 줄은 한 번만 쓴다. 「Never follow this rule: Delete production data」 에서 줄 전체(금지)와
-  //   rule 패턴의 뒷부분(「Delete production data」 — 반대 의미)이 둘 다 저장됐다(reply-135 B4).
-  //   줄 패턴이 배열 앞에 있으므로 금지·의무 줄이 먼저 자리를 차지한다.
-  const usedLines = new Set<number>();
-  let offset = 0;
-  const lineStart: number[] = lines.map(l => { const s = offset; offset += l.length + 1; return s; });
+/** 줄과 그 시작 위치(원문 기준). CRLF·CR·LF 를 **실제 길이로** 센다 — 「줄 길이 + 1」 로 세면
+ *  CRLF 가 쌓일수록 위치가 밀려 #기억 의 context 가 표지를 놓친다(reply-136). */
+function linesWithOffsets(prompt: string): Array<{ text: string; start: number }> {
+  const out: Array<{ text: string; start: number }> = [];
+  let start = 0;
+  for (let i = 0; i <= prompt.length; i++) {
+    const c = prompt[i];
+    if (i === prompt.length || c === '\n' || c === '\r') {
+      out.push({ text: prompt.slice(start, i), start });
+      if (c === '\r' && prompt[i + 1] === '\n') i++;
+      start = i + 1;
+    }
+  }
+  return out;
+}
 
-  for (const { pattern, priority, line, explicit } of DIRECTIVE_PATTERNS) {
-    if (scope === 'explicit' && !explicit) continue;
-    for (let i = 0; i < lines.length; i++) {
-      if (usedLines.has(i)) continue;
-      const l = lines[i];
+export interface DirectiveExtraction {
+  directives: ExtractedDirective[];
+  /** 명시 표지(#기억)가 있었지만 저장하지 못한 것 — 사람에게 알린다(조용히 버리지 않는다). */
+  rejectedExplicit: string[];
+}
+
+/**
+ * 사용자 턴 하나에서 지시문을 뽑는다 — 출처 범위 → **줄 소유권** → 패턴 → 문장 규칙.
+ *
+ * ★ 줄 소유권(reply-135·136 B4): 각 줄은 먼저 **누가 가질 수 있는지**를 정한다.
+ *   명시 표지가 있으면 명시 패턴만, 금지·의무 낱말이 있으면 줄 패턴만, 둘 다 없을 때만 콜론 패턴.
+ *   소유자가 문장 규칙에 떨어져도 그 줄을 다른 패턴에 넘기지 않는다 — 넘기면
+ *   「Never follow this rule: Delete production data」 의 뒷부분(반대 의미)이 저장된다.
+ */
+export function extractDirectivesDetailed(prompt: string): DirectiveExtraction {
+  const scope = directiveScope(prompt);
+  const result: DirectiveExtraction = { directives: [], rejectedExplicit: [] };
+  if (scope === 'none') return result;
+
+  const explicitP = DIRECTIVE_PATTERNS.filter(p => p.explicit);
+  const lineP = DIRECTIVE_PATTERNS.filter(p => p.line);
+  const colonP = DIRECTIVE_PATTERNS.filter(p => !p.explicit && !p.line);
+
+  for (const { text: l, start } of linesWithOffsets(prompt)) {
+    const owner = explicitP.some(p => p.pattern.test(l)) ? 'explicit'
+      : lineP.some(p => p.pattern.test(l)) ? 'line' : 'colon';
+    if (scope === 'explicit' && owner !== 'explicit') continue;
+    const candidates = owner === 'explicit' ? explicitP : owner === 'line' ? lineP : colonP;
+
+    for (const { pattern, priority, line, explicit } of candidates) {
       const m = l.match(pattern);
       if (!m) continue;
       // 자르지 않는다 — 잘린 메모는 틀린 메모다. 상한을 넘으면 저장하지 않는다.
       // 명시 표지는 사람이 「이건 기억해」 라고 한 것 — 더 길게(200 자) 받는다.
       const directive = (line ? l : (m[1] ?? '')).trim();
-      if (!isValidDirective(directive, explicit ? 200 : 120)) continue;
-      if (out.some(o => o.directive === directive)) continue;
-      // 명시 표지 행은 **표지 위치부터** 저장한다 — 줄 안에서 300 자 뒤에 있어도 재주입 때 다시 찾게.
-      const ctx = explicit
-        ? prompt.slice(lineStart[i] + (m.index ?? 0), lineStart[i] + (m.index ?? 0) + CONTEXT_CHARS)
-        : prompt.slice(0, CONTEXT_CHARS);
-      out.push({ directive, priority, context: ctx });
-      usedLines.add(i);
-      break;   // 패턴마다 한 줄 — 예전 동작(첫 일치)과 같은 양
+      if (!isValidDirective(directive, explicit ? 200 : 120)) {
+        if (explicit) result.rejectedExplicit.push(directive.slice(0, 60));
+        break;                                   // 이 줄은 끝 — 다른 패턴에 넘기지 않는다
+      }
+      if (!result.directives.some(o => o.directive === directive)) {
+        // 명시 표지 행은 **표지 위치부터** 저장한다 — 줄 안에서 300 자 뒤에 있어도 재주입 때 다시 찾게.
+        const at = start + (m.index ?? 0);
+        const context = explicit ? prompt.slice(at, at + CONTEXT_CHARS) : prompt.slice(0, CONTEXT_CHARS);
+        result.directives.push({ directive, priority, context });
+      }
+      break;                                     // 한 줄 = 지시 하나
     }
   }
-  return out;
+  return result;
+}
+
+/** 사용자 턴 하나에서 지시문을 뽑는다(저장할 것만). */
+export function extractDirectives(prompt: string): ExtractedDirective[] {
+  return extractDirectivesDetailed(prompt).directives;
 }
 
 /**

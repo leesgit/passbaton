@@ -762,3 +762,119 @@ describe.skipIf(!built)('PB135-04 읽기 전용 · DB 가 없다는 것을 알�
     expect(fs.existsSync(path.join(ws, '.claude'))).toBe(false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reply-136(3 차 NO-GO) 반례 — PB136-01~03 · Astra 가 제시한 입력을 그대로 쓴다
+
+describe('PB136-01 줄 소유권 — 반대 의미 조각을 어떤 경로로도 저장하지 않는다', () => {
+  it('금지 줄이 둘이어도 둘째 줄의 콜론 뒷부분이 따로 나오지 않는다', () => {
+    const got = extractDirectives('Never modify production data.\nNever follow this rule: Delete production data').map(d => d.directive);
+    expect(got).not.toContain('Delete production data');
+    expect(got).toEqual(['Never modify production data.', 'Never follow this rule: Delete production data']);
+  });
+
+  it('금지 줄이 길어서 탈락해도 그 줄을 콜론 패턴에 넘기지 않는다', () => {
+    const long = 'Never ' + 'touch the cluster config by hand '.repeat(5) + 'rule: Delete production data';
+    expect(long.length).toBeGreaterThan(120);
+    expect(extractDirectives(long)).toEqual([]);
+  });
+
+  it.skipIf(!built)('훅 경로: 저장(DB)·주입(SessionStart) 어디에도 반대 조각이 없다', () => {
+    const { ws, proj, dbPath } = monorepo('game');
+    hook(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: 'Never modify production data.\nNever follow this rule: Delete production data' });
+    const db = new Database(dbPath, { readonly: true });
+    const stored = (db.prepare('SELECT directive FROM user_directives').all() as Array<{ directive: string }>).map(r => r.directive);
+    db.close();
+    expect(stored).toContain('Never modify production data.');         // 양의 효과
+    expect(stored).not.toContain('Delete production data');
+    const out = sessionStart(proj, ws);
+    expect(out).toContain('Never modify production data.');
+    expect(out).toContain('Never follow this rule: Delete production data');
+    expect(out).not.toMatch(/^- \S+ Delete production data$/m);      // 반대 조각이 독립 지시로 나오지 않는다
+  });
+});
+
+describe('PB136-02 개행과 무관한 명시 지시', () => {
+  it.each([
+    ['CRLF', '\r\n'.repeat(350)],
+    ['LF', '\n'.repeat(350)],
+    ['혼합', '\r\n\n\r'.repeat(120)],
+  ])('%s 350 개 뒤의 #기억 — context 가 표지에서 시작하고 다시 찾아진다', (_n, pad) => {
+    const prompt = pad + '#기억 항상 답변은 한국어로';
+    const got = extractDirectives(prompt);
+    expect(got.map(d => d.directive)).toEqual(['항상 답변은 한국어로']);
+    expect(got[0].context.startsWith('#기억')).toBe(true);
+    expect(revalidateDirective(got[0].directive, got[0].context)).toBe('항상 답변은 한국어로');
+  });
+
+  it.skipIf(!built)('저장하지 못한 #기억 은 알린다(조용히 버리지 않는다)', () => {
+    const { ws, proj, dbPath } = monorepo('game');
+    const out = hook(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '#기억 ' + '서버 설정 메모 '.repeat(30) });
+    expect(out).toContain('passbaton-notice');
+    const db = new Database(dbPath, { readonly: true });
+    expect((db.prepare('SELECT COUNT(*) AS n FROM user_directives').get() as { n: number }).n).toBe(0);
+    db.close();
+    // 역검증: 저장된 경우에는 알림이 없다
+    expect(hook(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '#기억 스테이징 서버는 10.0.0.5 이다' })).not.toContain('passbaton-notice');
+  });
+});
+
+describe('PB136-03 최종 카드 본문과 읽음 상태 일치', () => {
+  function consistent(card: ReturnType<typeof buildResumeCard>): void {
+    const c = card!;
+    expect(c.anyRead).toBe(c.items.some(i => i.outcome === 'ok'));
+    for (const it of c.items.filter(i => i.outcome === 'ok')) {
+      expect(c.text).toContain(it.excerpt!);                    // 「읽음」 이면 그 발췌가 출력에 있다
+      expect((it.excerpt ?? '').replace(/…$/, '').trim()).not.toBe('');
+    }
+  }
+
+  it('최후 축소 단계를 밟아도 — 예산 400 · 긴 label · 긴 invalid 4', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    fs.writeFileSync(path.join(p, 'H.md'), '# 절\n' + '본문 줄 '.repeat(200));
+    writeCardConfig(p, [
+      { path: 'H.md', lines: 10, label: 'L'.repeat(80) },
+      ...Array.from({ length: 4 }, (_, i) => ({ path: `bad${i}`.padEnd(90, 'x'), lines: -1 })),
+    ]);
+    const card = buildResumeCard(p, 400);
+    expect(card!.text.length).toBeLessThanOrEqual(400);
+    consistent(card);
+  });
+
+  it('첫 줄이 공백 500 + BODY — 「…」 만 남은 발췌는 읽은 것이 아니다', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    fs.writeFileSync(path.join(p, 'H.md'), ' '.repeat(500) + 'BODY\n');
+    writeCardConfig(p, [{ path: 'H.md', lines: 5 }]);
+    const card = buildResumeCard(p, 400)!;
+    expect(card.items[0].outcome).toBe('empty');
+    expect(card.anyRead).toBe(false);
+    consistent(card);
+  });
+
+  it('발췌 속 # 제목은 펜스 안에 남는다', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    fs.writeFileSync(path.join(p, 'H.md'), '첫 줄\n# 발췌 속 제목\n끝\n');
+    writeCardConfig(p, [{ path: 'H.md', lines: 5 }]);
+    const text = buildResumeCard(p, 1000)!.text;
+    const fenceAt = text.indexOf('```');
+    expect(fenceAt).toBeGreaterThan(-1);
+    expect(text.indexOf('# 발췌 속 제목')).toBeGreaterThan(fenceAt);
+    expect(text.lastIndexOf('```')).toBeGreaterThan(text.indexOf('# 발췌 속 제목'));
+  });
+
+  it.skipIf(!built)('SessionStart: 예산 때문에 하나도 못 보이면 State 를 강등하지 않는다', () => {
+    const { ws, proj, dbPath } = monorepo('game');
+    fs.writeFileSync(path.join(proj, 'docs', 'HANDOFF.md'), ' '.repeat(500) + 'BODY\n');
+    writeCardConfig(proj, [{ path: 'docs/HANDOFF.md', lines: 5 }]);
+    const db = new Database(dbPath);
+    db.prepare("INSERT INTO active_context (project, current_state) VALUES ('game', 'PRIOR STATE')").run();
+    db.close();
+    const r = spawnSync('node', [SESSION_START], { input: JSON.stringify({ cwd: proj }), encoding: 'utf-8', env: { ...process.env, WORKSPACE_ROOT: ws, PASSBATON_CARD_CHARS: '400' } });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('none of the declared sources could be read');
+    expect(r.stdout).toContain('**State**: PRIOR STATE');
+  });
+});

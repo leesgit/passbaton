@@ -315,7 +315,8 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
   }
 
   const excerpt = kept.join('\n');
-  if (!excerpt.trim()) {
+  // ⚠ 자를 때 붙이는 「…」 는 본문이 아니다 — 공백 + 「…」 만 남은 발췌를 읽었다고 하면 안 된다.
+  if (!excerpt.replace(/…$/, '').trim()) {
     // 범위에는 본문이 있는데 예산 안에 보인 것이 공백뿐 — 읽었다고 하면 안 된다.
     return { ...base, outcome: 'empty', why: 'nothing but blank lines fits in the card budget', from, to, totalLines: lines.length, partialFile: partial, sha };
   }
@@ -339,55 +340,70 @@ export interface ResumeCard {
   anyRead: boolean;
 }
 
+function renderItem(it: CardItem): string[] {
+  if (it.outcome === 'ok') {
+    const total = `of ${it.totalLines}${it.partialFile ? '+' : ''}`;
+    const bits = [`sha1 ${it.sha}`];
+    if (it.truncated) bits.push(`truncated — shown to line ${it.shownTo}`);
+    if (it.matches && it.matches > 1) bits.push(`${it.matches} matches — first heading/item used`);
+    const fence = fenceFor(it.excerpt ?? '');
+    return [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`, fence, it.excerpt ?? '', fence];
+  }
+  return [`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`];
+}
+
+function renderCard(items: CardItem[], invalid: string[], maxInvalid: number): { text: string; anyRead: boolean } {
+  // ★ 읽음 상태는 **실제로 출력에 들어간 발췌**로 정한다 — 머리글을 문자열에서 추정하지 않는다.
+  const anyRead = items.some(i => i.outcome === 'ok');
+  const out: string[] = [anyRead
+    ? '## Resume card — repo source of truth (read this before the DB summary below)'
+    : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)'];
+  for (const it of items) out.push(...renderItem(it));
+  if (invalid.length && maxInvalid > 0) {
+    const shown = invalid.slice(0, maxInvalid).map(s => s.slice(0, 100));
+    out.push(`⚠ ignored continuity entries: ${shown.join(', ')}${invalid.length > maxInvalid ? ` … +${invalid.length - maxInvalid}` : ''}`);
+  } else if (invalid.length) {
+    out.push(`⚠ ${invalid.length} continuity entr${invalid.length === 1 ? 'y' : 'ies'} ignored`);
+  }
+  return { text: out.join('\n'), anyRead };
+}
+
 export function buildResumeCard(projectPath: string, maxChars: number): ResumeCard | null {
   const decl = readContinuityDeclaration(projectPath);
   if (decl.sources.length === 0 && decl.invalid.length === 0) return null;
 
   const budget = clampCardChars(maxChars, 3200);
   // ★ 예산은 카드 **전체**(머리글·펜스·경고 포함)의 상한이다(reply-135 B5).
-  //   원천이 예산에 비해 많으면 뒤쪽 원천을 빼고 그렇다고 적는다 — 원천당 최소 몫을 보장하느라
-  //   상한을 넘기지 않는다.
   const fit = Math.max(1, Math.floor(budget / (HEADER_RESERVE + 200)));
   const sources = decl.sources.slice(0, fit);
   const invalid = [...decl.invalid];
   for (const s of decl.sources.slice(fit)) invalid.push(`${s.path}: dropped — card budget ${budget} fits ${fit} source(s)`);
 
-  const render = (per: number) => {
-    const items = sources.map(s => readSource(projectPath, s, per));
-    const anyRead = items.some(i => i.outcome === 'ok');
-    const out: string[] = [anyRead
-      ? '## Resume card — repo source of truth (read this before the DB summary below)'
-      : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)'];
-    for (const it of items) {
-      if (it.outcome === 'ok') {
-        const total = `of ${it.totalLines}${it.partialFile ? '+' : ''}`;
-        const bits = [`sha1 ${it.sha}`];
-        if (it.truncated) bits.push(`truncated — shown to line ${it.shownTo}`);
-        if (it.matches && it.matches > 1) bits.push(`${it.matches} matches — first heading/item used`);
-        out.push(`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`);
-        const fence = fenceFor(it.excerpt ?? '');
-        out.push(fence, it.excerpt ?? '', fence);
-      } else {
-        out.push(`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`);
-      }
-    }
-    if (invalid.length) {
-      const shown = invalid.slice(0, 4).map(s => s.slice(0, 100));
-      out.push(`⚠ ignored continuity entries: ${shown.join(', ')}${invalid.length > 4 ? ` … +${invalid.length - 4}` : ''}`);
-    }
-    return { text: out.join('\n'), items, anyRead };
-  };
-
   let per = Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
-  let card = render(per);
+  let items = sources.map(s => readSource(projectPath, s, per));
+  let maxInvalid = 4;
+  let card = renderCard(items, invalid, maxInvalid);
+
+  // 1) 발췌를 줄인다
   for (let k = 0; k < 4 && card.text.length > budget && per > 60; k++) {
     per = Math.max(60, Math.floor(per * budget / card.text.length) - 20);
-    card = render(per);
+    items = sources.map(s => readSource(projectPath, s, per));
+    card = renderCard(items, invalid, maxInvalid);
   }
-  if (card.text.length > budget) {
-    // 마지막 안전장치 — 머리글만으로도 넘치는 경우. 발췌를 버리고 머리글만 남긴다.
-    const heads = card.text.split('\n').filter(l => l.startsWith('#') || l.startsWith('⚠'));
-    card = { ...card, text: heads.join('\n').slice(0, budget) };
+  // 2) 경고 목록을 개수만 남긴다
+  if (card.text.length > budget) { maxInvalid = 0; card = renderCard(items, invalid, maxInvalid); }
+  // 3) 뒤쪽 원천부터 「예산 때문에 안 보임」 으로 바꾼다 — 구조로, 그리고 그 사실을 적는다
+  for (let i = items.length - 1; i >= 0 && card.text.length > budget; i--) {
+    if (items[i].outcome !== 'ok') continue;
+    items = items.map((it, j) => j === i
+      ? { label: it.label, path: it.path, outcome: 'empty' as CardOutcome, why: 'not shown — card budget too small', from: it.from, to: it.to, totalLines: it.totalLines, sha: it.sha }
+      : it);
+    card = renderCard(items, invalid, maxInvalid);
   }
-  return { text: card.text, items: card.items, invalid, anyRead: card.anyRead };
+  // 4) 그래도 넘치면(머리글만으로 넘침) 원천 줄을 뒤에서부터 뺀다
+  while (card.text.length > budget && items.length > 0) {
+    items = items.slice(0, -1);
+    card = renderCard(items, [...invalid, 'some sources omitted — card budget too small'], 0);
+  }
+  return { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead };
 }

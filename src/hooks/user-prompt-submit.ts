@@ -6,13 +6,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import Database from 'better-sqlite3';
-import { logHookError, emitContext } from '../utils/logger.js';
+import { logHookError, emitContext, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { tokenizeQuery } from '../utils/tokenize.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { migrateSchema } from '../db/migrate.js';
 import { findWorktreeRoot, readHead, MAX_ROOTS } from '../utils/worktree.js';
 import { readWorkspaceDeclaration } from '../utils/workspace-config.js';
-import { extractDirectives } from '../utils/directive.js';
+import { extractDirectivesDetailed } from '../utils/directive.js';
 
 interface PromptInput {
   prompt?: string;
@@ -402,13 +402,14 @@ const MAX_DIRECTIVES = 20;
 
 // directive 품질 게이트는 ../utils/directive.ts — 주입 쪽(SessionStart·PreCompact)과 공유한다.
 
-function extractAndSaveDirectives(dbPath: string, project: string, prompt: string): void {
+function extractAndSaveDirectives(dbPath: string, project: string, prompt: string, transcriptPath?: string): void {
   try {
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
 
     // 2.6.0: 출처 규칙 + 문장 규칙은 extractDirectives 한 곳에서.
-    for (const { directive, priority, context } of extractDirectives(prompt)) {
+    const extraction = extractDirectivesDetailed(prompt);
+    for (const { directive, priority, context } of extraction.directives) {
       // UPSERT directive — context 도 갱신한다. 안 그러면 옛 판이 긴 붙여넣기에서 넣은 행이
       // 사람이 같은 말을 짧게 다시 해도 영영 「출처 불량」 으로 가려진다.
       db.prepare(`
@@ -419,6 +420,12 @@ function extractAndSaveDirectives(dbPath: string, project: string, prompt: strin
           context = excluded.context,
           created_at = CURRENT_TIMESTAMP
       `).run(project, directive, context, priority, priority);
+    }
+
+    // 명시 표지(#기억)인데 저장하지 못한 것은 알린다 — 사람은 저장된 줄 안다.
+    // Codex·Gemini 는 stdout 에 JSON 하나를 기대하므로 Claude 에게만 낸다.
+    if (extraction.rejectedExplicit.length > 0 && !isCodexHost(transcriptPath) && !isGeminiHost(transcriptPath)) {
+      console.log(`\n<passbaton-notice>#기억 not saved (must be one complete sentence, 200 chars max): ${extraction.rejectedExplicit.map(r => `「${r}」`).join(' ')}</passbaton-notice>\n`);
     }
 
     // P1-1 (2026-08-10): 90일 지난 지시문 정리.
@@ -478,7 +485,7 @@ async function main() {
 
     // 사용자 프롬프트에서 지시사항 추출 (DB 저장, 출력 0 토큰)
     if (input.prompt) {
-      extractAndSaveDirectives(dbPath, project, input.prompt);
+      extractAndSaveDirectives(dbPath, project, input.prompt, input.transcript_path);
     }
 
     // 1. 명시적 과거 참조 ("저번에", "예전에" 등) — 기존 동작 유지
