@@ -245,7 +245,12 @@ function extractNextTasks(content: string): string[] {
 }
 
 // 사람 요청 판별은 ../utils/human-turn.ts — PreCompact 와 같은 규칙을 쓴다(2.6.1).
-const parseUserText = humanText;
+// 최소 길이 5 는 **요약 품질** 규칙이라 여기(Stop)에만 건다 — 사람 여부 판정이 아니다.
+//   PreCompact 는 「중단해」 같은 짧은 요청도 마지막 요청으로 봐야 한다(Astra reply-140 PB140-01).
+function parseUserText(entry: Parameters<typeof humanText>[0]): string {
+  const text = humanText(entry);
+  return text.length < 5 ? '' : text;
+}
 
 /**
  * 메시지 content에서 텍스트 추출 (assistant/human 공통)

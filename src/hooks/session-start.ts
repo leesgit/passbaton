@@ -146,8 +146,12 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
           if (h.request) bits.push(`- Last human request (a request, not a result${h.pending ? ' · no reply yet' : ''}): ${h.request}`);
           if (h.active_file) bits.push(`- Active file: ${h.active_file}`);
           const block = bits.join('\n');
-          lines.push(block, '');
-          tokenBudget -= estimateTokens(block);
+          // 카드 다음 자리다. 카드가 예산을 다 먹었으면 넣지 않는다 — 예산을 넘기지 않는 것이 먼저
+          const cost = estimateTokens(block);
+          if (tokenBudget > cost) {
+            lines.push(block, '');
+            tokenBudget -= cost;
+          }
         }
       } catch { /* 테이블이 아직 없는 DB */ }
     }

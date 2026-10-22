@@ -21,6 +21,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_START = path.resolve(here, '../dist/hooks/session-start.js');
 const USER_PROMPT = path.resolve(here, '../dist/hooks/user-prompt-submit.js');
 const PRE_COMPACT = path.resolve(here, '../dist/hooks/pre-compact.js');
+const SESSION_END = path.resolve(here, '../dist/hooks/session-end.js');
+const SERVER = path.resolve(here, '../dist/index.js');
 const built = [SESSION_START, USER_PROMPT, PRE_COMPACT].every(f => fs.existsSync(f));
 if (process.env.CI && !built) throw new Error('dist/ missing — run `npm run build` before the e2e tests');
 
@@ -138,7 +140,7 @@ describe('PB139-01 컴팩션 복구 — 실측 반례', () => {
     expect(out).not.toContain('<task-notification>');
     expect(out).not.toContain('passbaton@2.6.0');
     expect(handover?.active_file ?? null).toBeNull();
-    // 알림이 마지막 줄이어도 앞의 사람 요청은 이미 답을 받았다 → 미완료 아님
+    // pending = 「요청 뒤에 assistant 글이 없다」 뿐이다(완료 증거 아님) — 알림이 마지막 줄이어도 앞 요청 뒤에 글이 있다
     expect(handover?.pending).toBe(0);
     expect(out).not.toContain('no reply yet');
   });
@@ -177,21 +179,34 @@ describe('PB139-01 컴팩션 복구 — 실측 반례', () => {
     expect(out).toContain('(a request, not a result · no reply yet): 이번 요청은 아직 답 전');
   });
 
-  it.skipIf(!built)('작업 파일은 도구가 실제로 쓴 경로가 먼저 · 지워진 파일은 (deleted)', () => {
+  it.skipIf(!built)('작업 파일은 도구가 실제로 쓴 경로가 먼저 · 지금 없는 파일은 「삭제」 가 아니라 「not found now」', () => {
     const { ws } = workspace('probe');
     const live = path.join(ws, 'live.ts');
     fs.writeFileSync(live, 'x');
-    const gone = path.join(ws, 'gone.ts');
+    const never = path.join(ws, 'never-existed.ts');   // 만든 적도 지운 적도 없다
 
     const a = compactCycle([
       human('고쳐줘'),
-      reply('`README.md` 를 봤고 고칩니다.', [{ name: 'Read', file_path: gone }, { name: 'Edit', file_path: live }]),
+      reply('`README.md` 를 봤고 고칩니다.', [{ name: 'Read', file_path: never }, { name: 'Edit', file_path: live }]),
     ]);
     expect(a.handover?.active_file).toBe(live);
     expect(a.out).toContain(`- Active file: ${live}`);
 
-    const b = compactCycle([human('지워줘'), reply('지웠습니다.', [{ name: 'Write', file_path: gone }])]);
-    expect(b.handover?.active_file).toBe(`${gone} (deleted)`);
+    const b = compactCycle([human('써줘'), reply('씁니다.', [{ name: 'Write', file_path: never }])]);
+    expect(b.handover?.active_file).toBe(`${never} (not found now)`);
+    expect(b.out).not.toContain('(deleted)');
+  });
+
+  it.skipIf(!built)('상대 도구 경로는 훅 프로세스 cwd 가 아니라 입력 cwd 기준으로 확인한다', () => {
+    const { ws, proj, dbPath } = workspace();
+    fs.writeFileSync(path.join(proj, 'rel.ts'), 'x');
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    // 훅 프로세스 cwd = 이 테스트의 cwd(레포 루트) · 입력 cwd = proj — rel.ts 는 proj 에만 있다
+    expect(fs.existsSync(path.resolve(process.cwd(), 'rel.ts'))).toBe(false);
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('고쳐'), reply('고침', [{ name: 'Edit', file_path: 'rel.ts' }])]) });
+    const db = new Database(dbPath, { readonly: true });
+    expect((db.prepare("SELECT active_file FROM compact_handover WHERE session_id = 's1'").get() as { active_file: string }).active_file).toBe('rel.ts');
+    db.close();
   });
 
   it.skipIf(!built)('텍스트 후보는 실제로 있는 파일만 — 패키지 이름·URL 은 버리고 README.md 는 받는다', () => {
@@ -224,6 +239,84 @@ describe('PB139-01 컴팩션 복구 — 실측 반례', () => {
     expect(outB).not.toContain('세션 A 의 요청');
     const outA = hook(SESSION_START, ws, { cwd: proj, session_id: 'A', source: 'compact' });
     expect(outA).toContain('세션 A 의 요청');
+  });
+});
+
+describe('PB140-01 사람 요청은 길이로 거르지 않고 · 봉투로 판정한다', () => {
+  it('문맥 봉투 뒤의 사람 글은 남고, 알림 속 command-args 인용은 명령이 아니다', () => {
+    expect(humanText({ type: 'user', message: { content: '<system-reminder>오늘 날짜 …</system-reminder>\n중단해' } })).toBe('중단해');
+    expect(humanText({ type: 'user', message: { content: '중단해' } })).toBe('중단해');
+    expect(humanText({ type: 'user', message: { content: '<task-notification>\n<summary>ran <command-args>배포해줘</command-args></summary>\n</task-notification>' } })).toBe('');
+    // 사람이 글 중간에 태그를 인용해도 사람 글이다
+    expect(humanText({ type: 'user', message: { content: '로그에 <task-id> 가 찍히는 이유가 뭐야' } })).toBe('로그에 <task-id> 가 찍히는 이유가 뭐야');
+  });
+
+  it.skipIf(!built)('짧은 최신 요청(「중단해」)이 마지막 요청이 된다 — 앞 요청으로 돌아가지 않는다', () => {
+    const { out, handover } = compactCycle([
+      human('배포 준비해줘'),
+      reply('준비합니다.'),
+      human('중단해'),
+      machine(NOTIFY),
+    ]);
+    expect(handover?.request).toBe('중단해');
+    expect(handover?.pending).toBe(1);
+    expect(out).toContain('(a request, not a result · no reply yet): 중단해');
+    expect(out).not.toContain('배포 준비해줘');
+  });
+
+  it.skipIf(!built)('Stop 도 같은 규칙 — 알림은 요청이 아니다', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    const tp = transcript(ws, [human('지도 화면 버그 고쳐줘'), reply('고쳤습니다.'), machine(NOTIFY)]);
+    hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: tp });
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare("SELECT last_work, user_intent FROM sessions WHERE project = 'game' ORDER BY id DESC").get() as
+      { last_work: string; user_intent: string | null } | undefined;
+    db.close();
+    expect(row).toBeDefined();
+    const seen = `${row!.last_work} ${row!.user_intent ?? ''}`;
+    expect(seen).toContain('지도 화면 버그 고쳐줘');
+    expect(seen).not.toContain('task-notification');
+  });
+});
+
+describe('PB140-02 같은 세션의 두 번째 컴팩션', () => {
+  it.skipIf(!built)('이번 창에 사람 요청이 없으면 지난 컴팩션의 요청·pending 을 다시 내지 않는다', () => {
+    const { ws, proj } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('첫 컴팩션 전 요청'), machine(NOTIFY)]) });
+    const first = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+    expect(first).toContain('첫 컴팩션 전 요청');   // 양의 대조
+
+    const summaryOnly: Line = { type: 'user', isCompactSummary: true, message: { role: 'user', content: 'This session is being continued …' } };
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [summaryOnly, machine(NOTIFY)]) });
+    const second = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+    expect(second).not.toContain('첫 컴팩션 전 요청');
+    expect(second).not.toContain('Recovered after compaction');
+  });
+
+  it.skipIf(!built)('transcript 를 못 읽어도(경로 없음) 옛 행을 남기지 않는다 · 새 요청은 정상 복구', () => {
+    const { ws, proj } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('옛 요청'), reply('네')]) });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: path.join(ws, 'missing.jsonl') });
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' })).not.toContain('옛 요청');
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('새 요청'), reply('네')]) });
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' })).toContain('Last human request (a request, not a result): 새 요청');
+  });
+
+  it.skipIf(!built)('큰 재개 카드와 함께여도 복구 줄이 나오고 전체가 예산 안에 든다', () => {
+    const { ws, proj } = workspace();
+    fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'docs', 'HANDOFF.md'), Array.from({ length: 300 }, (_, i) => `- 줄 ${i} ` + '가'.repeat(90)).join('\n'));
+    fs.writeFileSync(path.join(proj, '.claude', 'passbaton.config.json'),
+      JSON.stringify({ continuity: { sources: [{ path: 'docs/HANDOFF.md', lines: 300, label: 'HANDOFF' }] } }));
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('카드와 같이 나와야 하는 요청'), reply('네')]) });
+    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact' });
+    expect(out).toContain('## Resume card');
+    expect(out).toContain('카드와 같이 나와야 하는 요청');
+    expect(out.length).toBeLessThan(8000);   // 토큰 예산 2000 ≈ 8000 자(len/4 추정)
   });
 });
 
@@ -267,5 +360,65 @@ describe('PB139-02 훅만 쓰는 설치 — MCP 서버 없이', () => {
     // 양의 대조: SessionStart 뒤에는 생긴다
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
     expect(fs.existsSync(dbPath)).toBe(true);
+  });
+});
+
+describe('PB139-02 반복 초기화 · 읽기 전용 서버', () => {
+  const schemaOf = (dbPath: string) => {
+    const db = new Database(dbPath, { readonly: true });
+    const s = (db.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").all() as Array<{ sql: string | null }>)
+      .map(r => JSON.stringify(r)).join('\n');
+    db.close();
+    return s;
+  };
+
+  it.skipIf(!built)('SessionStart·UserPromptSubmit 를 반복해도 스키마는 같고 같은 지시는 한 행', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '#기억 항상 답변은 한국어로' });
+    const before = schemaOf(dbPath);
+    for (let i = 0; i < 3; i++) {
+      hook(SESSION_START, ws, { cwd: proj, session_id: `r${i}` });
+      hook(USER_PROMPT, ws, { cwd: proj, session_id: `r${i}`, prompt: '#기억 항상 답변은 한국어로' });
+    }
+    expect(schemaOf(dbPath)).toBe(before);
+    const db = new Database(dbPath, { readonly: true });
+    expect((db.prepare("SELECT COUNT(*) c FROM user_directives WHERE directive = '항상 답변은 한국어로'").get() as { c: number }).c).toBe(1);
+    db.close();
+  });
+
+  function serverReadonly(ws: string, cwd: string): string {
+    const msgs = [
+      { jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } } },
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'resume_card', arguments: { project: 'game' } } },
+    ];
+    const r = spawnSync('node', [SERVER], {
+      input: msgs.map(m => JSON.stringify(m)).join('\n') + '\n',
+      encoding: 'utf-8', cwd, timeout: 60000,
+      env: { ...process.env, WORKSPACE_ROOT: ws, PASSBATON_READONLY: '1' },
+    });
+    return r.stdout;
+  }
+
+  it.skipIf(!built || !fs.existsSync(SERVER))('읽기 전용 서버: DB 가 없으면 파일을 만들지 않는다', () => {
+    const { ws, proj, dbPath } = workspace();
+    const out = serverReadonly(ws, proj);
+    expect(out).toContain('"id":1');            // 양의 효과: 서버가 실제로 답했다
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(fs.existsSync(path.dirname(dbPath))).toBe(false);
+  });
+
+  it.skipIf(!built || !fs.existsSync(SERVER))('읽기 전용 서버: 훅이 만든 DB 의 내용·스키마를 바꾸지 않는다', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '#기억 항상 답변은 한국어로' });
+    // WAL 을 본 파일에 접어 두고 비교한다 — 안 그러면 체크포인트만으로 바이트가 달라진다
+    const c = new Database(dbPath); c.pragma('wal_checkpoint(TRUNCATE)'); c.close();
+    const bytes = fs.readFileSync(dbPath);
+    const schema = schemaOf(dbPath);
+    const out = serverReadonly(ws, proj);
+    expect(out).toContain('"id":1');
+    expect(schemaOf(dbPath)).toBe(schema);
+    expect(Buffer.compare(fs.readFileSync(dbPath), bytes)).toBe(0);
   });
 });

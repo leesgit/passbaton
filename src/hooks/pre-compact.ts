@@ -190,17 +190,27 @@ function buildHandoverContext(
       .map(l => l.trim())
       .filter(l => l.length > 0 && !l.startsWith('|') && !l.startsWith('---'));
     if (cleaned.length > 0) context.request = stripMarkdown(cleaned[0]).slice(0, 200);
-    // pending: 그 요청 **뒤에** Claude 의 글이 하나도 없을 때만. 도구 호출만 있었다면 작업 중이다.
-    //   기계 줄은 이미 빠졌으므로 「알림이 마지막 줄」 이라는 이유로 앞선 사람 요청이 미완료가 되지 않는다.
+    // pending = 그 요청 **뒤에 assistant 글이 없다.** 그 이상의 뜻은 없다 — 「곧 하겠다」 한 줄도
+    //   글이므로 pending 이 아니고, 그렇다고 작업이 끝났다는 증거도 아니다(Astra reply-140).
+    //   기계 줄은 이미 빠졌으므로 알림이 마지막 줄이어도 이 판정은 바뀌지 않는다.
     context.pending = !transcript.slice(lastHuman + 1).some(m => m.role === 'assistant' && m.content.trim());
   }
 
   // 2. activeFile: 도구가 실제로 건드린 경로가 먼저(쓰기 > 읽기, 최근 것). 없을 때만 텍스트 후보.
+  //   ⛔ 「지금 없음」 은 「삭제됨」 이 아니다 — 실패한 Write·원래 없던 Read·권한 오류도 stat 이
+  //   실패한다. 삭제 증거를 보지 않으므로 삭제라고 쓰지 않는다(Astra reply-140 PB140-03).
+  //   상대 경로는 훅 프로세스 cwd 가 아니라 **입력 cwd** 기준이다.
   const observed = transcript.flatMap(m => m.toolPaths);
   const pick = [...observed].reverse().find(p => p.write) ?? [...observed].reverse()[0];
   if (pick) {
-    const exists = (() => { try { return fs.statSync(pick.path).isFile(); } catch { return false; } })();
-    context.activeFile = exists ? pick.path : `${pick.path} (deleted)`;
+    const abs = path.isAbsolute(pick.path) ? pick.path : path.resolve(bases[0], pick.path);
+    let mark = '';
+    try {
+      if (!fs.statSync(abs).isFile()) mark = ' (not a file now)';
+    } catch (e) {
+      mark = (e as NodeJS.ErrnoException).code === 'ENOENT' ? ' (not found now)' : ' (could not check)';
+    }
+    context.activeFile = pick.path + mark;
   } else {
     const filePatterns = [
       /(?:file_path|파일)[:\s]*["']?([^\s"',]+\.\w{1,6})/,
@@ -347,18 +357,32 @@ async function main() {
     //   고친 원칙이 여기엔 없어서, 하네스 알림 한 줄이 State 가 됐다(2026-10-22).
     //   요청은 세션별 compact_handover 에 따로 두고, 같은 세션의 SessionStart(compact) 가
     //   「요청이지 결과가 아님」 으로 표시한다.
-    if (input.session_id && handover && (handover.request || handover.activeFile)) {
+    // ★ 행은 **이번 컴팩션의 것만** 남는다. 이번 창에 사람 요청·파일이 없거나(요약·알림뿐)
+    //   transcript 를 못 읽었으면 지난 컴팩션의 행을 지운다 — 안 그러면 같은 세션의 두 번째
+    //   컴팩션 뒤에 첫 번째의 요청·pending 이 최신처럼 다시 나온다(Astra reply-140 PB140-02).
+    //   보관 정책: 컴팩션 전용 임시 행. 다음 컴팩션이 덮거나 지우고, 14 일 지난 행은 저장할 때 정리한다.
+    //   (일반 resume 의 복구 경로가 아니다 — 읽는 쪽은 source=compact 뿐이다)
+    if (input.session_id) {
+      const forget = () => db.prepare('DELETE FROM compact_handover WHERE session_id = ? AND project = ?')
+        .run(input.session_id, project);
       try {
         migrateSchema(db);
-        db.prepare(`
-          INSERT INTO compact_handover (session_id, project, request, pending, active_file, created_at)
-          VALUES (?, ?, ?, ?, ?, datetime('now'))
-          ON CONFLICT(session_id, project) DO UPDATE SET
-            request = excluded.request, pending = excluded.pending,
-            active_file = excluded.active_file, created_at = excluded.created_at
-        `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile);
+        if (handover && (handover.request || handover.activeFile)) {
+          db.prepare(`
+            INSERT INTO compact_handover (session_id, project, request, pending, active_file, created_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(session_id, project) DO UPDATE SET
+              request = excluded.request, pending = excluded.pending,
+              active_file = excluded.active_file, created_at = excluded.created_at
+          `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile);
+        } else {
+          forget();
+        }
         db.prepare("DELETE FROM compact_handover WHERE created_at < datetime('now', '-14 days')").run();
-      } catch { /* 잠금 등 — 복구 줄이 없을 뿐 컴팩션은 막지 않는다 */ }
+      } catch {
+        // 잠금 등 — 새 행을 못 썼으면 옛 행도 남기지 않는다(복구 줄이 없는 편이 낡은 줄보다 낫다)
+        try { forget(); } catch { /* 테이블도 없다 */ }
+      }
     }
 
     // === 컨텍스트 재주입: systemMessage로 반환 ===
