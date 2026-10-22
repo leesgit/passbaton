@@ -903,6 +903,8 @@ async function main() {
         checked: number;
         elapsedMs: number;
         uncovered: string[];
+        /** 설정(`workspace.roots`)이 선언한 루트 수 — 등록·관측과 따로 센다(2.7 PB139-11) */
+        declared?: number;
         artifacts?: { patterns: number; matched: number; problems: string[] };
       };
     } = {
@@ -1023,10 +1025,16 @@ async function main() {
         // ★ 기준선이 없으면 델타를 **만들어내지 않는다.** 「검사 안 함」이지
         //   「변경 없음」이 아니다. UserPromptSubmit 이 안 돌았거나 이 세션의
         //   첫 턴이다.
+        // ★ 2.7 (PB139-11): 이유를 **항상** 적는다. 전에는 루트가 0 이면 이유를 비워
+        //   「0/0 roots」 만 남았다 — 「볼 곳이 없었다」 와 「기준선이 없어 못 봤다」 가 같은 줄이 됐다
+        //   (10-22: 재설치로 passbaton 이 잠깐 없던 사이 UserPromptSubmit 이 안 돌았던 턴).
+        let declaredRoots: number | undefined;
+        try { declaredRoots = readWorkspaceDeclaration(wsRoot).roots.length; } catch { declaredRoots = undefined; }
         coverage.workspace = {
           boundary: 'none', scope: 'registered roots only',
           roots: roots.length, checked: 0, elapsedMs: 0,
-          uncovered: roots.length > 0 ? ['no turn-start baseline'] : [],
+          uncovered: ['no turn-start baseline (UserPromptSubmit did not record this turn)'],
+          declared: declaredRoots,
         };
       } else if (roots.length > 0) {
         const started = Date.now();

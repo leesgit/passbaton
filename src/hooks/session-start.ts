@@ -207,7 +207,7 @@ function renderFileEvidence(row: {
 
   const edited = parse<string[]>(row.modified_files, []);
   const groups = parse<Array<{ root: string; written: string[]; committed?: string[] }>>(row.workspace_writes, []);
-  const coverage = parse<{ workspace?: { boundary?: string; scope?: string; roots?: number; checked?: number; uncovered?: string[] } } | null>(row.file_coverage, null);
+  const coverage = parse<{ workspace?: { boundary?: string; scope?: string; roots?: number; checked?: number; uncovered?: string[]; declared?: number } } | null>(row.file_coverage, null);
 
   const key = (p: string) => p.split(String.fromCharCode(92)).join('/').toLowerCase();
   const sampled = new Set<string>();
@@ -239,9 +239,16 @@ function renderFileEvidence(row: {
   const ws = coverage?.workspace;
   const out: string[] = [];
 
+  // 2.7 (PB139-11): 확인 범위 뒤에 **선언 수와 못 본 이유**를 붙인다 — 「0/0 roots」 만으로는
+  //   「볼 곳이 없었다」 인지 「기준선이 없어 못 봤다」 인지 모른다.
+  const why = (w: NonNullable<typeof ws>) => [
+    w.declared !== undefined ? `declared ${w.declared}` : '',
+    w.uncovered?.length ? `skipped: ${w.uncovered.slice(0, 2).join('; ')}` : '',
+  ].filter(Boolean).join(', ');
+
   if (byRoot.size === 0) {
     out.push(ws
-      ? `  files: no qualifying observations within checked scope (${ws.checked ?? 0}/${ws.roots ?? 0} roots, boundary=${ws.boundary ?? '?'})`
+      ? `  files: no qualifying observations within checked scope (${ws.checked ?? 0}/${ws.roots ?? 0} roots, boundary=${ws.boundary ?? '?'}${why(ws) ? `, ${why(ws)}` : ''})`
       : '  files: not recorded');
     return out;
   }
@@ -249,7 +256,7 @@ function renderFileEvidence(row: {
   // 커버리지를 **파일 바로 앞에** 둔다. 목록의 부재와 포함을 해석하는 근거다.
   if (ws) {
     const bits = [`boundary=${ws.boundary ?? '?'}`, `${ws.checked ?? 0}/${ws.roots ?? 0} roots`];
-    if (ws.uncovered?.length) bits.push(`skipped: ${ws.uncovered.slice(0, 2).join('; ')}`);
+    if (why(ws)) bits.push(why(ws));
     out.push(`  coverage: ${bits.join(', ')} (${ws.scope ?? 'registered roots only'})`);
   }
   out.push('  files [E=edit/write, M=filesystem sample] — state and authorship unverified:');
