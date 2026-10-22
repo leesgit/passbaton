@@ -309,7 +309,9 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
       continue;
     }
     const room = maxChars - used - (kept.length ? 1 : 0);
-    if (room > 20) { kept.push(l.slice(0, room) + '…'); shownTo++; }
+    // ⛔ 표 행(`|` 로 시작)은 자르지 않는다(2.7 · reply-147 PB139-13). 결정 색인의 한 행이 「재개 조건」 칸 앞에서
+    //    잘리면 반쪽 처분이 온전한 결정처럼 읽힌다. 통째로 빼고 「truncated」 로만 알린다.
+    if (room > 20 && !/^\s*\|/.test(l)) { kept.push(l.slice(0, room) + '…'); shownTo++; }
     truncated = true;
     break;
   }
