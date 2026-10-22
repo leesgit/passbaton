@@ -1179,7 +1179,21 @@ async function main() {
     // 스키마 확장 — 세션·턴 식별자와 요청을 컬럼으로 갖는다.
     // 훅은 서버의 initDatabase 를 거치지 않고 DB 를 직접 열므로 여기서 보강한다.
     // 이미 있으면 ALTER 가 던지고 그게 정상이다.
-    const turnId = input.prompt_id || input.turn_id || null;
+    // ★ 2.7.1 (Astra reply-148 PB148-20): 호스트가 턴 식별자를 안 주면 아래 옛 텍스트 경로가 돌았다 —
+    //   「project + 같은 요약 + 10 초/24 시간」 은 **세션을 가리지 않아** 다른 세션의 기록을 삼켰다
+    //   (같은 「(결과 요약 없음)」 두 기록 중 하나가 사라짐 · 2026-10-23 시험 작성 중 재현).
+    //   중복 억제가 막아야 하는 것은 「같은 Stop 이벤트의 재전달」 뿐이다. 그 정체성을 트랜스크립트에서 만든다:
+    //   세션 + 사람 요청 수(턴마다 는다) + 마지막 응답. 재전달은 셋이 같고, 같은 세션의 다음 턴은 요청 수가,
+    //   다른 세션은 세션이 다르다. 세션이 없으면 가를 근거가 없으므로 옛 경로 그대로 둔다(후퇴시키지 않는다).
+    //   `tx:` 접두사 = 호스트가 준 값이 아니라는 표시(prompt_id 칸은 이 중복 판정만 읽는다).
+    const hostTurnId = input.prompt_id || input.turn_id || null;
+    const lastReply = transcript.recentAssistantMessages[transcript.recentAssistantMessages.length - 1] ?? '';
+    const derivedTurnId = !hostTurnId && sessionId && input.transcript_path
+      ? 'tx:' + crypto.createHash('sha1')
+        .update(`${sessionId}\u0000${transcript.userRequests.allRequests.length}\u0000${lastReply}`)
+        .digest('hex').slice(0, 16)
+      : null;
+    const turnId = hostTurnId ?? derivedTurnId;
     let hasTurnColumns = false;
     try {
       migrateSchema(db);
