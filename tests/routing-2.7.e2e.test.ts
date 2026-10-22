@@ -43,8 +43,8 @@ function workspace(routing: Record<string, string> = { '/ashfall': 'apps/game', 
   return { ws, root: path.basename(ws) };
 }
 
-function hook(file: string, ws: string, payload: Record<string, unknown>, argv: string[] = []): string {
-  const r = spawnSync('node', [file, ...argv], { input: JSON.stringify(payload), encoding: 'utf-8', env: { ...process.env, WORKSPACE_ROOT: ws } });
+function hook(file: string, ws: string, payload: Record<string, unknown>, argv: string[] = [], env: Record<string, string> = {}): string {
+  const r = spawnSync('node', [file, ...argv], { input: JSON.stringify(payload), encoding: 'utf-8', env: { ...process.env, WORKSPACE_ROOT: ws, ...env } });
   expect(r.status, `${path.basename(file)} exit (stderr: ${r.stderr?.slice(0, 300)})`).toBe(0);
   return r.stdout;
 }
@@ -55,7 +55,9 @@ describe('leadingCommand — 맨 앞의 실제 명령만', () => {
   it.each([
     ['/ashfall 랄프로 이어서', '/ashfall'],
     ['  /Ashfall', '/ashfall'],
-    ['<command-message>ashfall</command-message>\n<command-name>/ashfall</command-name>\n<command-args>x</command-args>', '/ashfall'],
+    // 실측(2026-10-23)한 훅 입력 그대로
+    [JSON.parse(fs.readFileSync(path.join(here, 'fixtures', 'hook-input-claude-code-2026-10-23.json'), 'utf-8'))
+      .entries.find((e: { event: string }) => e.event === 'UserPromptSubmit').prompt, '/probe'],
   ])('인정: %s', (p, want) => expect(leadingCommand(p)).toBe(want));
   it.each([
     ['이거 /ashfall 명령 고쳐줘'],
@@ -63,6 +65,8 @@ describe('leadingCommand — 맨 앞의 실제 명령만', () => {
     ['<task-notification>\n/ashfall\n</task-notification>'],
     ['apps/kenshi-fantasy 봐줘'],
     ['/ashfall-fleet 돌려'.replace('-fleet', 'x')],   // /ashfallx — 다른 명령(부분 일치 아님)
+    // reply-147 ⑥: 실측한 훅 입력에는 봉투가 없다 — 봉투 모양은 사람 입력으로 보지 않는다
+    ['<command-message>ashfall</command-message>\n<command-name>/ashfall</command-name>\n<command-args>x</command-args>'],
   ])('거부(또는 다른 명령): %s', (p) => expect(leadingCommand(p) === '/ashfall').toBe(false));
 });
 
@@ -132,6 +136,98 @@ describe('PB139-12 라우팅 — 실제 훅', () => {
     const out = hook(USER_PROMPT, ws, { cwd: ws, session_id: 's1', prompt: '/ashfall' }, ['--codex']);
     const obj = JSON.parse(out.trim());
     expect(obj.hookSpecificOutput.additionalContext).toContain('<routed-context project="game"');
+  });
+});
+
+// reply-147 PB139-12 수정 지시의 반례 — 각 수정을 되돌리면 여기서 빨개져야 한다
+describe('reply-147 반례', () => {
+  const setRouting = (ws: string, routing: Record<string, string>) =>
+    fs.writeFileSync(path.join(ws, '.claude', 'passbaton.config.json'), JSON.stringify({ routing: { commands: routing } }));
+
+  it.skipIf(!built)('① 루트와 같은 이름의 하위 앱 · cwd 없는 입력에서는 라우팅하지 않는다', () => {
+    const { ws, root } = workspace();
+    const twin = path.join(ws, 'apps', root);
+    fs.mkdirSync(twin, { recursive: true });
+    start(ws, 's1');
+    expect(ask(ws, 's1', '/ashfall', twin)).not.toContain('routed-context');
+    expect(hook(USER_PROMPT, ws, { session_id: 's1', prompt: '/ashfall' })).not.toContain('routed-context');
+    expect(ask(ws, 's1', '/ashfall')).toContain('routed-context');              // 진짜 루트에서는 된다
+  });
+
+  it('② 워크스페이스 밖으로 나가는 링크(junction)는 받지 않는다', () => {
+    const { ws } = workspace();
+    const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-27out-')));
+    roots.push(outside);
+    fs.symlinkSync(outside, path.join(ws, 'apps', 'link'), 'junction');
+    setRouting(ws, { '/ashfall': 'apps/game', '/link': 'apps/link', '/home': '.' });
+    const d = readRoutingDeclaration(ws);
+    expect(d.commands.has('/link')).toBe(false);
+    expect(d.invalid).toContain('/link');
+  });
+
+  it.skipIf(process.platform === 'win32' || process.platform === 'darwin')('② 대소문자만 다른 바깥 형제 경로는 안이 아니다(대소문자 구분 FS)', () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-27case-')));
+    roots.push(base);
+    const ws = path.join(base, 'Repo');
+    fs.mkdirSync(path.join(ws, '.claude'), { recursive: true });
+    fs.mkdirSync(path.join(base, 'repo', 'app'), { recursive: true });
+    setRouting(ws, { '/sib': '../repo/app', '/home': '.' });
+    const d = readRoutingDeclaration(ws);
+    expect(d.commands.has('/sib')).toBe(false);
+    expect(d.invalid).toContain('/sib');
+  });
+
+  it.skipIf(!built)('③ 본문은 그대로 · 해제 명령 이름만 바뀜 → 다음 턴 안내가 바뀐 카드로 다시', () => {
+    const { ws } = workspace();
+    start(ws, 's1');
+    expect(ask(ws, 's1', '/ashfall')).toContain('send `/home` to return');
+    setRouting(ws, { '/ashfall': 'apps/game', '/other': 'apps/other', '/pb-root': '.' });
+    const next = ask(ws, 's1', '이어서');
+    expect(next).toContain('send `/pb-root` to return');
+    expect(ask(ws, 's1', '이어서')).not.toContain('routed-context');           // 바뀐 카드도 한 번만
+  });
+
+  it.skipIf(!built)('④ 해제 명령이 없는 설정은 라우팅 전체를 끈다 — 남은 선택은 한 번 알리고 지운다', () => {
+    const { ws } = workspace({ '/ashfall': 'apps/game' });
+    expect(readRoutingDeclaration(ws).disabled).toMatch(/no release command/);
+    start(ws, 's1');
+    expect(ask(ws, 's1', '/ashfall')).not.toContain('routed-context');
+    // 해제 명령이 있던 때 고른 선택 → 해제 명령을 지우면
+    setRouting(ws, { '/ashfall': 'apps/game', '/home': '.' });
+    expect(ask(ws, 's1', '/ashfall')).toContain('project="game"');
+    setRouting(ws, { '/ashfall': 'apps/game' });
+    const cleared = ask(ws, 's1', '이어서');
+    expect(cleared).toContain('Route cleared');
+    expect(cleared).toContain('no release command');
+    expect(cleared).not.toContain('N146-000');
+    expect(ask(ws, 's1', '이어서')).not.toContain('routed-context');           // 알림은 한 번
+  });
+
+  it.skipIf(!built)('④ 고른 매핑이 지워지면 다음 턴 한 번 알리고 지운다 · 컴팩션 복원도 선택을 암시하지 않는다', () => {
+    const { ws } = workspace();
+    start(ws, 's1');
+    ask(ws, 's1', '/ashfall');
+    setRouting(ws, { '/other': 'apps/other', '/home': '.' });
+    const cleared = ask(ws, 's1', '이어서');
+    expect(cleared).toContain('Route cleared — `/ashfall` → game');
+    expect(ask(ws, 's1', '이어서')).not.toContain('routed-context');
+    // 컴팩션 쪽: 선택 → 매핑 삭제 → 컴팩션 → 알림 한 번 · 카드 없음 · 다음 턴 조용
+    ask(ws, 's1', '/other');
+    setRouting(ws, { '/ashfall': 'apps/game', '/home': '.' });
+    const compact = start(ws, 's1', 'compact');
+    expect(compact).toContain('Route cleared — `/other` → other');
+    expect(compact).not.toContain('다른 앱 일');
+    expect(ask(ws, 's1', '이어서')).not.toContain('routed-context');
+  });
+
+  it.skipIf(!built)('⑤ 컴팩션 복원 카드가 예산 부족으로 빠지면 다음 턴에 낸다(옛 해시로 영구 억제 안 함)', () => {
+    const { ws } = workspace();
+    start(ws, 's1');
+    ask(ws, 's1', '/ashfall');
+    const compact = hook(SESSION_START, ws, { cwd: ws, session_id: 's1', source: 'compact' }, [], { MCP_CONTEXT_BUDGET: '20' });
+    expect(compact).not.toContain('<routed-context project="game"');
+    expect(ask(ws, 's1', '이어서')).toContain('<routed-context project="game"');
+    expect(ask(ws, 's1', '이어서')).not.toContain('routed-context');
   });
 });
 

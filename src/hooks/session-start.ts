@@ -14,7 +14,7 @@ import { ensureSessionsDb } from '../db/bootstrap.js';
 import { revalidateDirective } from '../utils/directive.js';
 import { buildResumeCard, clampCardChars } from '../utils/resume-card.js';
 import { readTailLines, matchCompaction } from '../utils/compact-id.js';
-import { readRoutingDeclaration, releaseCommand, routedBlock } from '../utils/routing.js';
+import { readRoutingDeclaration, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd } from '../utils/routing.js';
 
 interface SessionInput {
   cwd?: string;
@@ -110,7 +110,7 @@ function estimateTokens(text: string): number {
 // 재개 카드에 쓸 최대 글자 수. 토큰 예산(2000)과 같은 예산에서 나간다.
 const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 
-function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string, transcriptPath?: string): string | null {
+function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string, transcriptPath?: string, hookCwd?: string): string | null {
   // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
   const card = projectPath ? buildResumeCard(projectPath, CARD_CHARS) : null;
   if (!fs.existsSync(dbPath)) {
@@ -138,20 +138,29 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
 
     // [Priority 0b] 2.7 (PB139-12): 이 세션이 루트에서 고른 하위 프로젝트 — 컴팩션·재개 뒤에도 선택을 잇는다.
     //   새 세션(startup)은 선택이 없다(세션별). 설정에서 사라진 선택은 내지 않는다.
-    if (sessionId && (source === 'compact' || source === 'resume') && projectPath && path.resolve(projectPath) === path.resolve(workspaceRoot)) {
+    //   ★ 루트 판별은 UserPromptSubmit 과 같은 규칙(실제 cwd ↔ 루트 실제 경로 · reply-147 ①).
+    if (sessionId && (source === 'compact' || source === 'resume') && isWorkspaceRootCwd(hookCwd, workspaceRoot)) {
       try {
         const row = db.prepare('SELECT command, target_rel, target_name FROM session_route WHERE session_id = ? AND project = ?')
           .get(sessionId, project) as { command: string; target_rel: string; target_name: string } | undefined;
         if (row) {
           const decl = readRoutingDeclaration(workspaceRoot);
-          const t = decl.commands.get(row.command);
-          if (t && t.rel === row.target_rel) {
+          const t = decl.commands.size > 0 ? currentRoute(decl, row.command, row.target_rel) : null;
+          if (!t) {
+            // 골랐던 매핑이 사라졌다 — 한 번 알리고 지운다(UPS 와 같은 처리)
+            db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project);
+            lines.push(routeClearedBlock(row.command, row.target_name, project,
+              decl.disabled ?? (decl.commands.size === 0 ? 'routing is no longer declared' : `${row.command} no longer maps to ${row.target_rel}`)));
+          } else {
             const block = routedBlock(row.command, t, project, releaseCommand(decl), CARD_CHARS);
             const cost = estimateTokens(block.text);
             if (tokenBudget > cost) {
               lines.push(block.text);
               tokenBudget -= cost;
               db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
+            } else {
+              // ⛔ 예산이 모자라 못 냈다 — 컴팩션으로 앞 카드는 사라졌으니 옛 해시로 다음 턴까지 억제하면 안 된다(reply-147 ⑤)
+              db.prepare("UPDATE session_route SET card_hash = NULL, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(sessionId, project);
             }
           }
         }
@@ -590,7 +599,7 @@ async function main() {
     ensureSessionsDb(resolvedRoot);
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
-    const context = loadContext(dbPath, project, input.source, found?.dir, input.session_id, input.transcript_path);
+    const context = loadContext(dbPath, project, input.source, found?.dir, input.session_id, input.transcript_path, input.cwd);
 
     // 주입 결과는 별도 줄. injected 는 **문자 수**다 (토큰 아님 — 예산은 2000 토큰이고
     // 한글은 문자당 토큰이 더 든다. 대략 len/4 보다 나쁘다).

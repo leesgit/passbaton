@@ -1,0 +1,101 @@
+{
+  "note": "Observed with a no-output local hook in an isolated project (claude -p, 2026-10-23). cwd/session/transcript removed. Sequence: /probe probe-marker-147 -> --resume /compact -> --resume plain prompt.",
+  "entries": [
+    {
+      "event": "SessionStart",
+      "source": "startup",
+      "session": "S1",
+      "keys": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "hook_event_name",
+        "source"
+      ]
+    },
+    {
+      "event": "UserPromptSubmit",
+      "prompt": "/probe probe-marker-147",
+      "session": "S1",
+      "keys": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "prompt_id",
+        "permission_mode",
+        "hook_event_name",
+        "prompt"
+      ]
+    },
+    {
+      "event": "SessionStart",
+      "source": "resume",
+      "session": "S1",
+      "keys": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "hook_event_name",
+        "source",
+        "seconds_since_last_response",
+        "context_tokens",
+        "prompt_cache_likely_expired",
+        "estimated_cache_write_usd"
+      ]
+    },
+    {
+      "event": "PreCompact",
+      "trigger": "manual",
+      "session": "S1",
+      "keys": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "prompt_id",
+        "hook_event_name",
+        "trigger",
+        "custom_instructions"
+      ]
+    },
+    {
+      "event": "SessionStart",
+      "source": "compact",
+      "session": "S1",
+      "keys": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "prompt_id",
+        "hook_event_name",
+        "source",
+        "model"
+      ]
+    },
+    {
+      "event": "SessionStart",
+      "source": "resume",
+      "session": "S1",
+      "keys": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "hook_event_name",
+        "source"
+      ]
+    },
+    {
+      "event": "UserPromptSubmit",
+      "prompt": "plain follow-up, reply OK",
+      "session": "S1",
+      "keys": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "prompt_id",
+        "permission_mode",
+        "hook_event_name",
+        "prompt"
+      ]
+    }
+  ]
+}

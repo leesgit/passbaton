@@ -13,7 +13,7 @@ import { migrateSchema } from '../db/migrate.js';
 import { findWorktreeRoot, readHead, MAX_ROOTS } from '../utils/worktree.js';
 import { readWorkspaceDeclaration } from '../utils/workspace-config.js';
 import { extractDirectivesDetailed } from '../utils/directive.js';
-import { readRoutingDeclaration, leadingCommand, releaseCommand, routedBlock } from '../utils/routing.js';
+import { readRoutingDeclaration, leadingCommand, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd } from '../utils/routing.js';
 import { clampCardChars } from '../utils/resume-card.js';
 
 interface PromptInput {
@@ -478,14 +478,25 @@ const ROUTE_CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 function routeTurn(dbPath: string, project: string, workspaceRoot: string, input: PromptInput): string | null {
   const sessionId = input.session_id;
   if (!sessionId || !fs.existsSync(dbPath)) return null;
-  if (project !== path.basename(workspaceRoot)) return null;
+  // ★ 이름이 아니라 실제 경로로 — 루트와 같은 이름의 하위 앱에서 라우팅하지 않는다(reply-147 ①).
+  //   훅 입력에 cwd 가 없으면 루트라고 추정하지 않는다(process.cwd() 로 대신하지 않는다).
+  if (!isWorkspaceRootCwd(input.cwd, workspaceRoot)) return null;
   const decl = readRoutingDeclaration(workspaceRoot);
-  if (decl.commands.size === 0) return null;
   try {
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL');
     migrateSchema(db);
     try {
+      const row = db.prepare('SELECT command, target_rel, target_name, card_hash FROM session_route WHERE session_id = ? AND project = ?')
+        .get(sessionId, project) as { command: string; target_rel: string; target_name: string; card_hash: string | null } | undefined;
+      const clear = (why: string): string | null => {
+        if (!row) return null;
+        db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project);
+        return routeClearedBlock(row.command, row.target_name, project, why);
+      };
+      // 라우팅이 꺼졌거나(해제 명령 없음 등) 선언이 사라졌다 — 남은 선택은 한 번 알리고 지운다
+      if (decl.commands.size === 0) return clear(decl.disabled ?? 'routing is no longer declared');
+
       const cmd = leadingCommand(input.prompt);
       const target = cmd ? decl.commands.get(cmd) : undefined;
       const release = releaseCommand(decl);
@@ -493,8 +504,6 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
         const had = db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project).changes > 0;
         return had ? `\n<routed-context project="${project}" via="${cmd}">\nRoute released — back to ${project} (no routed project in this session)\n</routed-context>\n` : null;
       }
-      const row = db.prepare('SELECT command, target_rel, target_name, card_hash FROM session_route WHERE session_id = ? AND project = ?')
-        .get(sessionId, project) as { command: string; target_rel: string; target_name: string; card_hash: string | null } | undefined;
       if (cmd && target) {
         const block = routedBlock(cmd, target, project, release, ROUTE_CARD_CHARS);
         const same = row && row.target_rel === target.rel && row.card_hash === block.hash;
@@ -508,8 +517,9 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
       }
       if (row) {
         // 명령 없는 턴: 선택은 유지 · 카드 내용이 바뀐 때만 다시
-        const t = [...decl.commands.entries()].find(([c, v]) => c === row.command && v.rel === row.target_rel)?.[1];
-        if (!t) return null;   // 설정에서 사라진 선택은 지어내지 않는다
+        const t = currentRoute(decl, row.command, row.target_rel);
+        // 설정에서 사라지거나 바뀐 선택은 계속 암시하지 않는다 — 한 번 알리고 지운다
+        if (!t) return clear(`${row.command} no longer maps to ${row.target_rel}`);
         const block = routedBlock(row.command, t, project, release, ROUTE_CARD_CHARS);
         if (block.hash === row.card_hash) return null;
         db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
