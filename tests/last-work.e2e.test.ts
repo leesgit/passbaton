@@ -199,11 +199,23 @@ describe.skipIf(!built)('턴 정체성 — 텍스트가 아니라 prompt_id', ()
     expect(all.map(r => r.user_intent)).toEqual(['p1 에서의 요청', 'p2 에서의 요청', 'p3 에서의 요청']);
   });
 
-  it('prompt_id 가 없는 호스트에서는 옛 텍스트 dedup 이 그대로 돈다 (후퇴 금지)', () => {
+  it('턴 식별자도 세션도 없는 호스트에서는 옛 텍스트 dedup 이 그대로 돈다 (후퇴 금지)', () => {
+    const ws = makeWorkspace();
+    const turn: Turn = { requests: ['빌드'], assistant: ['빌드 성공 — 경고 없이 통과했습니다.'] };
+    stop(ws, {}, turn);
+    stop(ws, {}, turn);
+    expect(rows(ws)).toHaveLength(1);                  // exact 24h 차단이 살아 있다
+  });
+
+  // 2.7.1 (reply-148 PB148-20 · reply-149): 세션이 있으면 텍스트가 아니라 **이벤트**(트랜스크립트의 완료 레코드)로 가른다.
+  //   두 트랜스크립트는 두 이벤트다 — 요약이 같다고 둘째를 버리지 않는다. 같은 이벤트의 재전달은 stop-dedup 시험이 본다.
+  it('턴 식별자 없이 세션만 있으면: 다른 트랜스크립트의 같은 요약은 둘 다 남는다', () => {
     const ws = makeWorkspace();
     const turn: Turn = { requests: ['빌드'], assistant: ['빌드 성공 — 경고 없이 통과했습니다.'] };
     stop(ws, { session: 's1' }, turn);
     stop(ws, { session: 's1' }, turn);
-    expect(rows(ws)).toHaveLength(1);                  // exact 24h 차단이 살아 있다
+    const r = rows(ws);
+    expect(r).toHaveLength(2);
+    expect(r.every(x => x.prompt_id?.startsWith('tx:'))).toBe(true);
   });
 });

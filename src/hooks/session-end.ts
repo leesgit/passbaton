@@ -380,6 +380,15 @@ interface TranscriptData {
   errorFixPairs: Array<{ error: string; fix: string }>;
   firstTimestamp: string | null; // 세션 시작 시각 (transcript 첫 entry)
   lastTimestamp: string | null;  // 세션 종료 시각 (transcript 마지막 entry)
+  /**
+   * 마지막 응답(assistant) **레코드**의 정체성 — Stop 이벤트 식별용 (2.7.1 · reply-149 PB149-01).
+   * 줄 위치(뒤에 덧붙어도 그대로 · 새 완료는 더 뒤) + 레코드 ID(Claude uuid · 있으면 다른 호스트 id) + 시각.
+   * ⛔ 사람 의도 추출용 필터(요청 수·응답 문장)는 쓰지 않는다 — 기계 알림 턴이 같은 말로 끝나면 합쳐진다.
+   * null = 응답 레코드를 못 찾음(빈 파일 · 미지원 형식 · 읽기 실패) — 고정 키를 만들지 않는다.
+   */
+  completion: string | null;
+  /** 트랜스크립트를 끝까지 읽었는가 — 없음·읽기 실패와 「읽었는데 응답이 없음」 을 가른다 */
+  readOutcome: 'ok' | 'missing' | 'failed';
 }
 
 /**
@@ -396,6 +405,8 @@ async function parseTranscriptSinglePass(transcriptPath: string): Promise<Transc
     errorFixPairs: [],
     firstTimestamp: null,
     lastTimestamp: null,
+    completion: null,
+    readOutcome: 'missing',
   };
 
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return result;
@@ -428,7 +439,9 @@ async function parseTranscriptSinglePass(transcriptPath: string): Promise<Transc
     const fileStream = fs.createReadStream(transcriptPath, { encoding: 'utf-8' });
     const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
+    let lineNo = 0;
     for await (const line of rl) {
+      lineNo++;
       if (!line.trim()) continue;
       try {
         const rawEntry = JSON.parse(line);
@@ -439,9 +452,16 @@ async function parseTranscriptSinglePass(transcriptPath: string): Promise<Transc
           : rawEntry;
         if (!normalized) continue;
         const entries = Array.isArray(normalized) ? normalized : [normalized];
-        for (const entry of entries) {
+        for (const [k, entry] of entries.entries()) {
         const role = entry.type || entry.role || '';
         const content = entry.message?.content;
+
+        // === 완료 레코드 (Stop 이벤트 식별) ===
+        if (role === 'assistant') {
+          const raw = rawEntry as { uuid?: unknown; id?: unknown; payload?: { id?: unknown } };
+          const rid = [raw.uuid, raw.payload?.id, raw.id].find(v => typeof v === 'string' && v) ?? '';
+          result.completion = `${lineNo}.${k}|${rid}|${entry.timestamp ?? ''}`;
+        }
 
         // === 0. Timestamp 추출 (세션 duration 계산용) ===
         if (entry.timestamp) {
@@ -509,7 +529,12 @@ async function parseTranscriptSinglePass(transcriptPath: string): Promise<Transc
 
       } catch { /* skip malformed lines */ }
     }
-  } catch { /* file read error */ }
+    result.readOutcome = 'ok';
+  } catch {
+    // 읽다가 실패 — 그때까지 본 완료 레코드는 「마지막」 이라고 할 수 없다
+    result.readOutcome = 'failed';
+    result.completion = null;
+  }
 
   // === Post-processing ===
 
@@ -693,9 +718,16 @@ async function main() {
     // Phase 5: 실측에서 모든 stop이 [sid 있는 호출 + sid 없는 호출] 페어로 들어옴
     //          → transcript_path 해시를 우선 키로 사용해야 같은 페어가 같은 락을 공유
     //          → transcript_path 없을 때만 session_id 폴백
+    // ★ 2.7.1 (reply-149 PB149-03): 경로만으로 잠그면 5 초 안에 끝난 **별개의 턴**도 막혔다(락이 기록을 버림).
+    //   락은 같은 이벤트의 동시 재전달만 막으면 된다 — 키에 턴(호스트 id, 없으면 트랜스크립트 크기 = 새 완료가 붙으면
+    //   커진다)을 넣는다. 락이 놓친 재전달은 아래 DB 정체성 판정이 한 번 더 거른다.
+    let turnPart = input.prompt_id || input.turn_id || '';
+    if (!turnPart && input.transcript_path) {
+      try { turnPart = `size:${fs.statSync(input.transcript_path).size}`; } catch { /* 없으면 경로만 */ }
+    }
     const lockKey = input.transcript_path
-      ? crypto.createHash('md5').update(input.transcript_path).digest('hex').slice(0, 16)
-      : (input.session_id || null);
+      ? crypto.createHash('md5').update(`${input.transcript_path}\u0000${turnPart}`).digest('hex').slice(0, 16)
+      : (input.session_id ? `${input.session_id}-${turnPart}` : null);
     if (lockKey) {
       const lockPath = path.join(path.dirname(dbPath), `.session-end-${lockKey}.lock`);
       const now = Date.now();
@@ -765,6 +797,8 @@ async function main() {
       errorFixPairs: [],
       firstTimestamp: null,
       lastTimestamp: null,
+      completion: null,
+      readOutcome: 'missing',
     };
     if (input.transcript_path) {
       transcript = await parseTranscriptSinglePass(input.transcript_path);
@@ -895,6 +929,8 @@ async function main() {
       unobserved: string;
       excluded?: number;
       attribution?: string;
+      /** 이 기록의 Stop 이벤트를 식별하지 못해 중복 억제 없이 남겼다(2.7.1 · reply-149 PB149-02) */
+      dedup?: string;
       workspace?: {
         boundary: 'turn_start' | 'none';
         /** ⛔ 「등록된 루트만」이다. uncovered 가 놓친 것 전부를 열거하지 않는다. */
@@ -1182,19 +1218,23 @@ async function main() {
     // ★ 2.7.1 (Astra reply-148 PB148-20): 호스트가 턴 식별자를 안 주면 아래 옛 텍스트 경로가 돌았다 —
     //   「project + 같은 요약 + 10 초/24 시간」 은 **세션을 가리지 않아** 다른 세션의 기록을 삼켰다
     //   (같은 「(결과 요약 없음)」 두 기록 중 하나가 사라짐 · 2026-10-23 시험 작성 중 재현).
-    //   중복 억제가 막아야 하는 것은 「같은 Stop 이벤트의 재전달」 뿐이다. 그 정체성을 트랜스크립트에서 만든다:
-    //   (세션) + 사람 요청 수(턴마다 는다) + 마지막 응답. 세션은 아래 판정 질의의 `session_id IS ?` 가 가르고,
-    //   해시는 그 세션 안의 턴을 가른다 — 재전달은 둘 다 같고, 다음 턴은 요청 수가 다르다.
-    //   세션이 없으면 가를 근거가 없으므로 옛 경로 그대로 둔다(후퇴시키지 않는다).
+    //   중복 억제가 막아야 하는 것은 「같은 Stop 이벤트의 재전달」 뿐이다. 그 정체성 = 트랜스크립트의 **마지막 응답
+    //   레코드**(줄 위치 · 레코드 ID · 시각 — TranscriptData.completion). 재전달은 같은 레코드를 보고, 다음 완료는
+    //   (기계 알림 턴이라도) 더 뒤의 새 레코드다. 세션은 판정 질의의 `session_id IS ?` 가 가른다.
+    //   ⚠ 한계: 트랜스크립트를 고쳐 쓰는 호스트(앞부분 삭제·재작성)면 줄 위치가 움직여 재전달이 한 번 더 남을 수 있다.
+    //   응답 레코드를 못 찾으면(빈 파일 · 미지원 형식 · 읽기 실패) **키를 만들지 않고 보존**한다(reply-149 PB149-02) —
+    //   이 경로는 중복을 완전히 막지 못한다(coverage.dedup 에 적는다). 세션이 없으면 가를 근거가 없어 옛 경로 그대로.
     //   `tx:` 접두사 = 호스트가 준 값이 아니라는 표시(prompt_id 칸은 이 중복 판정만 읽는다).
     const hostTurnId = input.prompt_id || input.turn_id || null;
-    const lastReply = transcript.recentAssistantMessages[transcript.recentAssistantMessages.length - 1] ?? '';
-    const derivedTurnId = !hostTurnId && sessionId && input.transcript_path
-      ? 'tx:' + crypto.createHash('sha1')
-        .update(`${transcript.userRequests.allRequests.length}\u0000${lastReply}`)
-        .digest('hex').slice(0, 16)
+    const derivedTurnId = !hostTurnId && sessionId && transcript.completion
+      // 레코드 위치는 **그 파일 안에서만** 정체성이다 — 다른 트랜스크립트의 같은 줄 번호는 다른 이벤트
+      ? 'tx:' + crypto.createHash('sha1').update(`${input.transcript_path}\u0000${transcript.completion}`).digest('hex').slice(0, 16)
       : null;
     const turnId = hostTurnId ?? derivedTurnId;
+    const keepUnidentified = !hostTurnId && !derivedTurnId && !!sessionId;
+    if (keepUnidentified) {
+      coverage.dedup = `unidentified Stop event (transcript ${transcript.readOutcome === 'ok' ? 'has no assistant record' : transcript.readOutcome}) — kept without duplicate suppression`;
+    }
     let hasTurnColumns = false;
     try {
       migrateSchema(db);
@@ -1238,7 +1278,7 @@ async function main() {
     // 3단계: stripSlashPrefix 정규화 후 Jaccard >= 0.85 (1h 윈도우)
     // 턴 식별자가 없는 호스트에서만 도는 옛 경로. 위 정체성 검사가 성립하면
     // 이 유사도 판정은 정상 턴을 삼키기만 한다.
-    if (!(turnId && hasTurnColumns)) {
+    if (!(turnId && hasTurnColumns) && !keepUnidentified) {
       const recentExact = db.prepare(`
         SELECT id FROM sessions
         WHERE project = ? AND last_work = ? AND timestamp > datetime('now', '-24 hour')
@@ -1344,7 +1384,10 @@ async function main() {
 
     const dedupWhere = turnId && hasTurnColumns
       ? 'project = ? AND session_id IS ? AND prompt_id = ?'
-      : "project = ? AND last_work = ? AND timestamp > datetime('now', '-10 seconds')";
+      : keepUnidentified
+        // 식별 못 한 이벤트는 보존 — 같은 인자 모양을 유지한 채 절대 일치하지 않는 조건
+        ? 'project = ? AND last_work = ? AND 0'
+        : "project = ? AND last_work = ? AND timestamp > datetime('now', '-10 seconds')";
 
     const insertStmt = db.prepare(`
       INSERT INTO sessions (${insertCols.join(', ')})

@@ -106,6 +106,61 @@ describe.skipIf(!built)('PB148-20 Stop 중복 억제 = 같은 이벤트 재전�
     expect(r[0].prompt_id).toBeNull();
   });
 
+  // ── reply-149 보완 ──
+  it('PB149-01 사람 요청 수·마지막 응답이 같고 완료 레코드만 다른 두 이벤트(기계 알림 턴) → 둘 다 · 락 유지', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 'A' });
+    const t = transcript(ws, 'a.jsonl', ['지도 화면 봐줘']);
+    hook(SESSION_END, ws, { cwd: proj, session_id: 'A', transcript_path: t });
+    // 사람 입력이 아닌 하네스 알림으로 이어진 턴 — 사람 요청 수는 그대로, 응답 문장도 같다
+    fs.appendFileSync(t, [
+      { uuid: 'n1', type: 'user', message: { role: 'user', content: '<task-notification>\n<task-id>x</task-id>\n<status>completed</status>\n</task-notification>' } },
+      { uuid: 'n1a', type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '확인했습니다.' }] } },
+    ].map(l => JSON.stringify(l)).join('\n') + '\n');
+    hook(SESSION_END, ws, { cwd: proj, session_id: 'A', transcript_path: t });   // 락을 지우지 않는다
+    expect(rows(dbPath)).toHaveLength(2);
+  });
+
+  it('PB149-02 빈 파일 · 없는 파일 · JSON 아닌 파일 → 고정 키를 만들지 않고 보존 · 「식별 못 함」 을 기록', () => {
+    for (const kind of ['empty', 'missing', 'garbage'] as const) {
+      const { ws, proj, dbPath } = workspace();
+      hook(SESSION_START, ws, { cwd: proj, session_id: 'A' });
+      const t = path.join(ws, `${kind}.jsonl`);
+      if (kind === 'empty') fs.writeFileSync(t, '');
+      if (kind === 'garbage') fs.writeFileSync(t, 'not json\n{oops\n');
+      // 트랜스크립트는 못 읽어도 근거는 있다(Stop 입력의 마지막 응답) — 근거가 아예 없는 턴은 원래 안 적는다
+      const last = '지도 화면의 깜빡임을 고치고 회귀 시험을 붙였습니다. 다음은 미니맵입니다.';
+      hook(SESSION_END, ws, { cwd: proj, session_id: 'A', transcript_path: t, last_assistant_message: last });
+      dropLocks(ws);
+      hook(SESSION_END, ws, { cwd: proj, session_id: 'A', transcript_path: t, last_assistant_message: last });
+      const db = new Database(dbPath, { readonly: true });
+      const r = db.prepare("SELECT prompt_id, file_coverage FROM sessions WHERE project = 'game'").all() as Array<{ prompt_id: string | null; file_coverage: string }>;
+      db.close();
+      expect(r, kind).toHaveLength(2);                            // 중복 가능성을 감수하고 보존
+      for (const x of r) {
+        expect(x.prompt_id, kind).toBeNull();
+        expect(JSON.parse(x.file_coverage).dedup, kind).toMatch(/unidentified Stop event/);
+      }
+    }
+  });
+
+  it('PB149-03 락을 유지한 채: 빠른 p1 → p2 는 둘 · 같은 이벤트 재전달(바로 다시)은 하나', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 'A' });
+    const t = transcript(ws, 'a.jsonl', ['지도 화면 봐줘']);
+    hook(SESSION_END, ws, { cwd: proj, session_id: 'A', prompt_id: 'p1', transcript_path: t });
+    hook(SESSION_END, ws, { cwd: proj, session_id: 'A', prompt_id: 'p2', transcript_path: t });   // 5 초 안 · 다른 턴
+    hook(SESSION_END, ws, { cwd: proj, session_id: 'A', prompt_id: 'p2', transcript_path: t });   // 재전달
+    expect(rows(dbPath).map(x => x.prompt_id)).toEqual(['p1', 'p2']);
+    // ID 없는 호스트: 같은 트랜스크립트 그대로 바로 다시 → 하나
+    const b = workspace();
+    hook(SESSION_START, b.ws, { cwd: b.proj, session_id: 'B' });
+    const tb = transcript(b.ws, 'b.jsonl', ['상점 정렬 고쳐줘']);
+    hook(SESSION_END, b.ws, { cwd: b.proj, session_id: 'B', transcript_path: tb });
+    hook(SESSION_END, b.ws, { cwd: b.proj, session_id: 'B', transcript_path: tb });
+    expect(rows(b.dbPath)).toHaveLength(1);
+  });
+
   it('호스트가 턴 식별자를 주면 그것이 정체성 — 다른 id 는 둘 · 같은 id 재전달은 하나', () => {
     const { ws, proj, dbPath } = workspace();
     hook(SESSION_START, ws, { cwd: proj, session_id: 'A' });
