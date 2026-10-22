@@ -127,20 +127,24 @@ describe('PB139-10 UserPromptSubmit 단일 출력', () => {
     expect(out.indexOf('<past-context')).toBeLessThan(out.indexOf('<routed-context'));
   });
 
-  it.skipIf(!built)('Codex 루트 턴: 과거 문맥 + 라우팅 카드가 JSON 객체 하나 안에 둘 다', () => {
+  // reply-148 PB148-02: JSON 호스트는 Codex 와 Gemini 둘 다 — Codex 결과를 Gemini 로 승계하지 않고 실제 분기로 돌린다
+  it.skipIf(!built).each([['--codex'], ['--gemini']])('%s 루트 턴: 과거 문맥 + 라우팅 카드가 JSON 객체 하나 안에 둘 다', (host) => {
     const { ws, root, dbPath } = routedWorkspace();
-    run(SESSION_START, ws, { cwd: ws, session_id: 's1' }, ['--codex']);
+    run(SESSION_START, ws, { cwd: ws, session_id: 's1' }, [host]);
     seedPast(dbPath, root);
-    const out = run(USER_PROMPT, ws, { cwd: ws, session_id: 's1', prompt: '/ashfall ' + PROMPT }, ['--codex']);
-    const ctx: string = JSON.parse(out.trim()).hookSpecificOutput.additionalContext;
+    const out = run(USER_PROMPT, ws, { cwd: ws, session_id: 's1', prompt: '/ashfall ' + PROMPT }, [host]);
+    const obj = JSON.parse(out.trim());   // 객체가 둘이면 여기서 던진다
+    expect(obj.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+    const ctx: string = obj.hookSpecificOutput.additionalContext;
     expect(count(ctx, `<past-context project="${root}">`)).toBe(1);
     expect(count(ctx, '<routed-context project="game"')).toBe(1);
     expect(ctx).toContain('미니맵 렌더러 깜빡임을 고쳤다');
     expect(ctx).toContain('다음: N146-000 목표판');
+    expect(ctx).not.toContain('<passbaton-notice>');
   });
 
-  it.skipIf(!built)('트리거 분기: 트리거 문맥 + 라우팅 카드 — Claude 는 순서대로 한 번씩 · Codex 는 객체 하나', () => {
-    for (const argv of [[], ['--codex']]) {
+  it.skipIf(!built)('트리거 분기: 트리거 문맥 + 라우팅 카드 — Claude 는 순서대로 한 번씩 · Codex·Gemini 는 객체 하나', () => {
+    for (const argv of [[], ['--codex'], ['--gemini']]) {
       const { ws, root, dbPath } = routedWorkspace();
       run(SESSION_START, ws, { cwd: ws, session_id: 's1' }, argv);
       seedMemories(dbPath, root);
@@ -153,10 +157,13 @@ describe('PB139-10 UserPromptSubmit 단일 출력', () => {
     }
   });
 
-  it.skipIf(!built)('낼 것이 없으면 아무것도 내지 않는다(Codex 에 빈 객체도 안 냄)', () => {
+  it.skipIf(!built).each([['--codex'], ['--gemini']])('%s: 낼 것이 없으면 아무것도 내지 않는다(빈 객체도 안 냄 · 루트 라우팅 턴 포함)', (host) => {
     const { ws, proj } = workspace();
-    run(SESSION_START, ws, { cwd: proj, session_id: 's1' }, ['--codex']);
-    const out = run(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '안녕' }, ['--codex']);
-    expect(out.trim()).toBe('');
+    run(SESSION_START, ws, { cwd: proj, session_id: 's1' }, [host]);
+    expect(run(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '안녕' }, [host]).trim()).toBe('');
+    const r = routedWorkspace();
+    run(SESSION_START, r.ws, { cwd: r.ws, session_id: 's2' }, [host]);
+    run(USER_PROMPT, r.ws, { cwd: r.ws, session_id: 's2', prompt: '/ashfall' }, [host]);
+    expect(run(USER_PROMPT, r.ws, { cwd: r.ws, session_id: 's2', prompt: '안녕' }, [host]).trim()).toBe('');   // 카드 반복 억제 턴
   });
 });

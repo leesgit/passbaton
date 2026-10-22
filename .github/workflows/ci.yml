@@ -9,6 +9,20 @@ on:
     branches: [main]
 
 jobs:
+  # 역검증(Astra reply-148 PB148-01): 대소문자 구분 FS 에서만 도는 라우팅 경계 시험이 옛 구현을 실제로 잡는가
+  boundary-mutation:
+    name: boundary mutation (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm install
+      - name: Normal green → mutated red → restored green
+        run: node scripts/mutation-boundary.mjs
+
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}

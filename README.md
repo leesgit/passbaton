@@ -141,8 +141,10 @@ Declare which **commands** select which project in the root `.claude/passbaton.c
 
 - Only a registered command at the **very start** of what you type selects a project (`/ashfall …`). The same text
   inside a sentence, a quote, code, a path mention or a harness notification does not. (Claude Code passes the typed
-  text to the hook as-is — checked with a no-output probe hook, `tests/fixtures/hook-input-claude-code-2026-10-23.json` —
-  so the expanded `<command-name>` form seen in transcripts is not accepted)
+  text to the hook as-is — observed with a no-output probe hook under `claude -p`,
+  `tests/fixtures/hook-input-claude-code-2026-10-23.json` — so the expanded `<command-name>` form seen in transcripts is
+  not accepted.) **Define every routing and release command as a real command** (`.claude/commands/<name>.md`):
+  whether an undefined `/name` reaches the hook in the interactive UI was not observed
 - Routing runs only when the hook's `cwd` **is** the workspace root (same real path — a sub-app with the root's name
   does not count; no `cwd` in the input means no routing)
 - A **release command** (mapped to `"."`) is required. Without one, routing is off as a whole
