@@ -13,6 +13,8 @@ import { migrateSchema } from '../db/migrate.js';
 import { findWorktreeRoot, readHead, MAX_ROOTS } from '../utils/worktree.js';
 import { readWorkspaceDeclaration } from '../utils/workspace-config.js';
 import { extractDirectivesDetailed } from '../utils/directive.js';
+import { readRoutingDeclaration, leadingCommand, releaseCommand, routedBlock } from '../utils/routing.js';
+import { clampCardChars } from '../utils/resume-card.js';
 
 interface PromptInput {
   prompt?: string;
@@ -465,6 +467,63 @@ function extractAndSaveDirectives(dbPath: string, project: string, prompt: strin
   return notice;
 }
 
+const ROUTE_CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
+
+/**
+ * 루트 세션에서만 돈다(cwd 가 하위 프로젝트면 그 프로젝트의 SessionStart 카드가 이미 있다).
+ * - 맨 앞 등록 명령 → 선택(전환) 저장 · 카드 냄 / 값 "." → 해제 · 한 줄 알림
+ * - 명령 없음 + 선택 있음 → 카드 내용이 바뀌었을 때만 다시 냄
+ * 실패는 조용히 무시한다 — 라우팅이 안 돼도 훅이 세션을 깨지 않는다.
+ */
+function routeTurn(dbPath: string, project: string, workspaceRoot: string, input: PromptInput): string | null {
+  const sessionId = input.session_id;
+  if (!sessionId || !fs.existsSync(dbPath)) return null;
+  if (project !== path.basename(workspaceRoot)) return null;
+  const decl = readRoutingDeclaration(workspaceRoot);
+  if (decl.commands.size === 0) return null;
+  try {
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    migrateSchema(db);
+    try {
+      const cmd = leadingCommand(input.prompt);
+      const target = cmd ? decl.commands.get(cmd) : undefined;
+      const release = releaseCommand(decl);
+      if (cmd && target && target.dir === null) {
+        const had = db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project).changes > 0;
+        return had ? `\n<routed-context project="${project}" via="${cmd}">\nRoute released — back to ${project} (no routed project in this session)\n</routed-context>\n` : null;
+      }
+      const row = db.prepare('SELECT command, target_rel, target_name, card_hash FROM session_route WHERE session_id = ? AND project = ?')
+        .get(sessionId, project) as { command: string; target_rel: string; target_name: string; card_hash: string | null } | undefined;
+      if (cmd && target) {
+        const block = routedBlock(cmd, target, project, release, ROUTE_CARD_CHARS);
+        const same = row && row.target_rel === target.rel && row.card_hash === block.hash;
+        db.prepare(`
+          INSERT INTO session_route (session_id, project, command, target_rel, target_name, card_hash, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+          ON CONFLICT(session_id, project) DO UPDATE SET command = excluded.command, target_rel = excluded.target_rel,
+            target_name = excluded.target_name, card_hash = excluded.card_hash, updated_at = excluded.updated_at
+        `).run(sessionId, project, cmd, target.rel, target.name, block.hash);
+        return same ? null : block.text;
+      }
+      if (row) {
+        // 명령 없는 턴: 선택은 유지 · 카드 내용이 바뀐 때만 다시
+        const t = [...decl.commands.entries()].find(([c, v]) => c === row.command && v.rel === row.target_rel)?.[1];
+        if (!t) return null;   // 설정에서 사라진 선택은 지어내지 않는다
+        const block = routedBlock(row.command, t, project, release, ROUTE_CARD_CHARS);
+        if (block.hash === row.card_hash) return null;
+        db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
+        return block.text;
+      }
+      return null;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   // 환경 변수로 비활성화 가능
   if (process.env.MCP_HOOKS_DISABLED === 'true') {
@@ -537,6 +596,10 @@ async function main() {
         } catch { /* ignore */ }
       }
     }
+
+    // 2.7 (PB139-12): 루트 세션의 명시적 프로젝트 선택 → 그 프로젝트의 재개 카드(같은 단일 출력에 싣는다)
+    const routed = routeTurn(dbPath, project, workspaceRoot, input);
+    if (routed) parts.push(routed);
 
     if (parts.length > 0) emitContext(parts.join(''), 'UserPromptSubmit', input.transcript_path);
 

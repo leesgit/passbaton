@@ -130,6 +130,25 @@ excerpts of them first**, each with its line range and a content hash:
   (so `docs/credentials-guide.md` is refused; `docs/secret-sauce.md` is not — rename rather than weaken the rule)
 - `PASSBATON_CARD_CHARS` (default 3200, 400–20000) caps the **whole** card, headings included
 
+### Routing from a workspace root (v2.7.0+)
+
+Project detection follows the `cwd`, so a conversation opened at a monorepo root never got a sub-project's card.
+Declare which **commands** select which project in the root `.claude/passbaton.config.json`:
+
+```json
+{ "routing": { "commands": { "/ashfall": "apps/kenshi-fantasy", "/astra": "apps/kenshi-fantasy", "/home": "." } } }
+```
+
+- Only a registered command at the **very start** of what you type selects a project (`/ashfall …`). The same text
+  inside a sentence, a quote, code, a path mention or a harness notification does not
+- The choice is **per session** and survives compaction/resume of that session; a new session starts unrouted.
+  Another routed command switches; a command mapped to `"."` releases
+- The card is sent when the choice changes, when the card's content changes, and after compaction — not every turn
+- The card says what selected it and that the conversation is **still recorded under the root project** —
+  passbaton does not re-file root sessions under the sub-project
+- Paths must be real directories inside the workspace; invalid entries are ignored
+- All of this goes out in the hook's single output (Codex/Gemini receive one JSON object)
+
 ## Read-only MCP mode (v2.6.0+)
 
 `PASSBATON_READONLY=1` exposes only tools that do not change state (`resume_card`, `session_history`,

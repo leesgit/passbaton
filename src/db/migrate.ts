@@ -135,6 +135,19 @@ const TABLES: string[] = [
      pre_uuid TEXT,
      PRIMARY KEY (session_id, project)
    )`,
+
+  // 2.7 (PB139-12): 루트 세션이 명시적으로 고른 하위 프로젝트. **세션별**이다 — 다른 창·세션에 새지 않는다.
+  //   card_hash 는 마지막으로 낸 카드 — 같은 내용을 매 턴 반복하지 않으려고.
+  `CREATE TABLE IF NOT EXISTS session_route (
+     session_id TEXT NOT NULL,
+     project TEXT NOT NULL,
+     command TEXT NOT NULL,
+     target_rel TEXT NOT NULL,
+     target_name TEXT NOT NULL,
+     card_hash TEXT,
+     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (session_id, project)
+   )`,
 ];
 
 const INDEXES = [

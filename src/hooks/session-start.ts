@@ -14,6 +14,7 @@ import { ensureSessionsDb } from '../db/bootstrap.js';
 import { revalidateDirective } from '../utils/directive.js';
 import { buildResumeCard, clampCardChars } from '../utils/resume-card.js';
 import { readTailLines, matchCompaction } from '../utils/compact-id.js';
+import { readRoutingDeclaration, releaseCommand, routedBlock } from '../utils/routing.js';
 
 interface SessionInput {
   cwd?: string;
@@ -133,6 +134,28 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
     if (card) {
       lines.push(card.text, '');
       tokenBudget -= estimateTokens(card.text);
+    }
+
+    // [Priority 0b] 2.7 (PB139-12): 이 세션이 루트에서 고른 하위 프로젝트 — 컴팩션·재개 뒤에도 선택을 잇는다.
+    //   새 세션(startup)은 선택이 없다(세션별). 설정에서 사라진 선택은 내지 않는다.
+    if (sessionId && (source === 'compact' || source === 'resume') && projectPath && path.resolve(projectPath) === path.resolve(workspaceRoot)) {
+      try {
+        const row = db.prepare('SELECT command, target_rel, target_name FROM session_route WHERE session_id = ? AND project = ?')
+          .get(sessionId, project) as { command: string; target_rel: string; target_name: string } | undefined;
+        if (row) {
+          const decl = readRoutingDeclaration(workspaceRoot);
+          const t = decl.commands.get(row.command);
+          if (t && t.rel === row.target_rel) {
+            const block = routedBlock(row.command, t, project, releaseCommand(decl), CARD_CHARS);
+            const cost = estimateTokens(block.text);
+            if (tokenBudget > cost) {
+              lines.push(block.text);
+              tokenBudget -= cost;
+              db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
+            }
+          }
+        }
+      } catch { /* 표가 아직 없는 DB */ }
     }
 
     // [Priority 1a] 컴팩션 직후 — 같은 세션의 PreCompact 가 남긴 「마지막 사람 요청」.
