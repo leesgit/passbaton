@@ -18,7 +18,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import {
-  isValidDirective, isDirectiveSource, extractDirectives, revalidateDirective, directiveScope,
+  isValidDirective, isDirectiveSource, extractDirectives, extractDirectivesDetailed, revalidateDirective, directiveScope,
 } from '../src/utils/directive.js';
 import { buildResumeCard, readSource, clampCardChars } from '../src/utils/resume-card.js';
 
@@ -876,5 +876,59 @@ describe('PB136-03 최종 카드 본문과 읽음 상태 일치', () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('none of the declared sources could be read');
     expect(r.stdout).toContain('**State**: PRIOR STATE');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reply-137(4 차 NO-GO) 반례 — PB137-01·03
+
+describe('PB137-01 명시 지시: 저장되면 반드시 다시 나온다', () => {
+  it('#기억 + 공백 300 + 문장 — 저장한 context 로 같은 지시가 다시 뽑힌다', () => {
+    const got = extractDirectivesDetailed('#기억 ' + ' '.repeat(300) + '항상 답변은 한국어로');
+    expect(got.directives.map(d => d.directive)).toEqual(['항상 답변은 한국어로']);
+    const [d] = got.directives;
+    expect(revalidateDirective(d.directive, d.context)).toBe(d.directive);
+  });
+
+  it('불변식: 어떤 입력이든 저장되는 지시는 자기 context 로 다시 뽑힌다', () => {
+    const inputs = [
+      '#기억 ' + ' '.repeat(300) + '항상 답변은 한국어로',
+      '\r\n'.repeat(350) + '#기억 스테이징 서버는 10.0.0.5 이다',
+      '가'.repeat(320) + ' #remember Staging server lives at 10.0.0.5 behind VPN',
+      'Never modify production data.\nNever follow this rule: Delete production data',
+      '중요: 세이브 포맷은 동결이다\n규칙: 코어에는 float 금지',
+      '테스트는 반드시 돌려라',
+    ];
+    for (const input of inputs) {
+      for (const d of extractDirectives(input)) {
+        expect(revalidateDirective(d.directive, d.context), `${JSON.stringify(input).slice(0, 40)} → ${d.directive}`).toBe(d.directive);
+      }
+    }
+  });
+
+  it.skipIf(!built)('훅 경로: 공백 반례가 DB → SessionStart 까지 같은 문장으로 간다', () => {
+    const { ws, proj, dbPath } = monorepo('game');
+    hook(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '#기억 ' + ' '.repeat(300) + '항상 답변은 한국어로' });
+    const db = new Database(dbPath, { readonly: true });
+    expect((db.prepare('SELECT directive FROM user_directives').all() as Array<{ directive: string }>).map(r => r.directive)).toEqual(['항상 답변은 한국어로']);
+    db.close();
+    expect(sessionStart(proj, ws)).toContain('항상 답변은 한국어로');
+  });
+});
+
+describe('PB137-03 카드 축소 3 단계(원천을 「예산 때문에 안 보임」 으로)에 실제로 들어간다', () => {
+  it('긴 경로 · 긴 label · 예산 400 — 남은 원천은 NOT READ(예산) · 본문·상태 일치 · 상한 준수', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    const rel = 'd/'.repeat(65) + 'source.md';
+    fs.mkdirSync(path.join(p, path.dirname(rel)), { recursive: true });
+    fs.writeFileSync(path.join(p, rel), 'X'.repeat(600) + '\n');
+    writeCardConfig(p, [{ path: rel, lines: 5, label: 'L'.repeat(80) }]);
+    const card = buildResumeCard(p, 400)!;
+    expect(card.text.length).toBeLessThanOrEqual(400);
+    expect(card.items[0]).toMatchObject({ outcome: 'empty', why: 'not shown — card budget too small' });
+    expect(card.anyRead).toBe(false);
+    expect(card.text).toContain('none of the declared sources could be read');
+    expect(card.text).not.toContain('XXXXXXXXXX');
   });
 });

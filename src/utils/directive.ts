@@ -139,7 +139,7 @@ export interface DirectiveExtraction {
  *   소유자가 문장 규칙에 떨어져도 그 줄을 다른 패턴에 넘기지 않는다 — 넘기면
  *   「Never follow this rule: Delete production data」 의 뒷부분(반대 의미)이 저장된다.
  */
-export function extractDirectivesDetailed(prompt: string): DirectiveExtraction {
+export function extractDirectivesDetailed(prompt: string, verify = true): DirectiveExtraction {
   const scope = directiveScope(prompt);
   const result: DirectiveExtraction = { directives: [], rejectedExplicit: [] };
   if (scope === 'none') return result;
@@ -165,10 +165,18 @@ export function extractDirectivesDetailed(prompt: string): DirectiveExtraction {
         break;                                   // 이 줄은 끝 — 다른 패턴에 넘기지 않는다
       }
       if (!result.directives.some(o => o.directive === directive)) {
-        // 명시 표지 행은 **표지 위치부터** 저장한다 — 줄 안에서 300 자 뒤에 있어도 재주입 때 다시 찾게.
-        const at = start + (m.index ?? 0);
-        const context = explicit ? prompt.slice(at, at + CONTEXT_CHARS) : prompt.slice(0, CONTEXT_CHARS);
-        result.directives.push({ directive, priority, context });
+        // 명시 표지 행의 context 는 「표지 + 지시」 로 **정규화**해 저장한다. 표지부터 300 자를 자르면
+        // 「#기억 + 공백 300 + 문장」 에서 문장이 빠졌다(reply-137). 줄 위치 계산과도 무관해진다.
+        const marker = (l.slice(m.index ?? 0).match(EXPLICIT_MARKER) ?? ['#기억'])[0];
+        const context = explicit ? `${marker} ${directive}` : prompt.slice(0, CONTEXT_CHARS);
+        // ★ 불변식: 저장할 context 로 다시 뽑으면 같은 지시가 나와야 한다. 아니면 저장하지 않는다 —
+        //   저장은 되는데 다음 세션에 안 나오는 지시가 가장 나쁘다(사람은 저장된 줄 안다).
+        //   (재검증 자신은 verify=false 로 원시 추출만 한다 — 안 그러면 서로를 무한히 부른다)
+        if (!verify || revalidateDirective(directive, context) === directive) {
+          result.directives.push({ directive, priority, context });
+        } else if (explicit) {
+          result.rejectedExplicit.push(directive.slice(0, 60));
+        }
       }
       break;                                     // 한 줄 = 지시 하나
     }
@@ -190,7 +198,7 @@ export function extractDirectives(prompt: string): ExtractedDirective[] {
 export function revalidateDirective(directive: string, context: string | null | undefined): string | null {
   const d = directive.trim();
   if (!context) return isValidDirective(d) ? d : null;
-  const again = extractDirectives(context);
+  const again = extractDirectivesDetailed(context, false).directives;
   if (again.length === 0) return null;
   const exact = again.find(x => x.directive === d);
   if (exact) return exact.directive;
