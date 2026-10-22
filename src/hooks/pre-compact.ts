@@ -360,8 +360,10 @@ async function main() {
     // ★ 행은 **이번 컴팩션의 것만** 남는다. 이번 창에 사람 요청·파일이 없거나(요약·알림뿐)
     //   transcript 를 못 읽었으면 지난 컴팩션의 행을 지운다 — 안 그러면 같은 세션의 두 번째
     //   컴팩션 뒤에 첫 번째의 요청·pending 이 최신처럼 다시 나온다(Astra reply-140 PB140-02).
-    //   보관 정책: 컴팩션 전용 임시 행. 다음 컴팩션이 덮거나 지우고, 14 일 지난 행은 저장할 때 정리한다.
-    //   (일반 resume 의 복구 경로가 아니다 — 읽는 쪽은 source=compact 뿐이다)
+    //   보관 정책: 컴팩션 전용 **한 번 쓰는** 행. SessionStart(compact) 가 읽으면서 지우고, 쓴 지
+    //   COMPACT_HANDOVER_TTL_MS 가 지난 행은 읽지 않는다 — 여기서 쓰기·지우기가 둘 다 실패해도(잠금)
+    //   지난 컴팩션의 행이 이번 복구로 나오지 않게 하는 것은 **읽는 쪽 계약**이다(reply-141 PB141-02).
+    //   14 일 지난 행은 저장할 때 정리한다. (일반 resume 의 복구 경로가 아니다)
     if (input.session_id) {
       const forget = () => db.prepare('DELETE FROM compact_handover WHERE session_id = ? AND project = ?')
         .run(input.session_id, project);
@@ -369,12 +371,13 @@ async function main() {
         migrateSchema(db);
         if (handover && (handover.request || handover.activeFile)) {
           db.prepare(`
-            INSERT INTO compact_handover (session_id, project, request, pending, active_file, created_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            INSERT INTO compact_handover (session_id, project, request, pending, active_file, created_at, written_ms)
+            VALUES (?, ?, ?, ?, ?, datetime('now'), ?)
             ON CONFLICT(session_id, project) DO UPDATE SET
               request = excluded.request, pending = excluded.pending,
-              active_file = excluded.active_file, created_at = excluded.created_at
-          `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile);
+              active_file = excluded.active_file, created_at = excluded.created_at,
+              written_ms = excluded.written_ms
+          `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile, Date.now());
         } else {
           forget();
         }

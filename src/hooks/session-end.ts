@@ -21,7 +21,7 @@ import { detectWorkspaceRoot, isEphemeralRoot, resolveWorkspaceRoot } from '../u
 import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
-import { humanText } from '../utils/human-turn.js';
+import { humanTurn } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
 import { readWorkspaceDeclaration, scanArtifacts } from '../utils/workspace-config.js';
 
@@ -245,11 +245,12 @@ function extractNextTasks(content: string): string[] {
 }
 
 // 사람 요청 판별은 ../utils/human-turn.ts — PreCompact 와 같은 규칙을 쓴다(2.6.1).
-// 최소 길이 5 는 **요약 품질** 규칙이라 여기(Stop)에만 건다 — 사람 여부 판정이 아니다.
+// 최소 길이는 **요약 품질** 규칙이라 여기(Stop)에만 건다 — 사람 여부 판정이 아니다.
 //   PreCompact 는 「중단해」 같은 짧은 요청도 마지막 요청으로 봐야 한다(Astra reply-140 PB140-01).
-function parseUserText(entry: Parameters<typeof humanText>[0]): string {
-  const text = humanText(entry);
-  return text.length < 5 ? '' : text;
+//   옛 Stop 그대로: 명령 인자는 3 자 이상이면 받고, 일반 글은 5 자 미만을 버린다(reply-141 PB141-01).
+function parseUserText(entry: Parameters<typeof humanTurn>[0]): string {
+  const { text, viaCommand } = humanTurn(entry);
+  return text.length < (viaCommand ? 3 : 5) ? '' : text;
 }
 
 /**

@@ -45,12 +45,39 @@ const MACHINE_ENVELOPE = /^<(?:task-notification|bash-input|bash-stdout|bash-std
 /** 명령 봉투 — 맨 앞일 때만 진짜 명령이다. */
 const COMMAND_ENVELOPE = /^<(?:command-message|command-name)>/;
 
+/**
+ * 사람 글 **뒤나 사이에** 붙는 하네스 출력 블록. 봉투가 맨 앞이 아니어도 블록째 걷어 낸다
+ * (옛 Stop 이 하던 일 — Astra reply-141 PB141-03). 태그 **이름만** 인용한 사람 글(`<task-id> 가 뭐야`)은
+ * 닫는 태그가 없으므로 남는다.
+ */
+const HARNESS_BLOCKS = [
+  /<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g,
+  /<local-command-stderr>[\s\S]*?<\/local-command-stderr>/g,
+  /<bash-input>[\s\S]*?<\/bash-input>/g,
+  /<bash-stdout>[\s\S]*?<\/bash-stdout>/g,
+  /<bash-stderr>[\s\S]*?<\/bash-stderr>/g,
+  /<command-name>[\s\S]*?<\/command-name>/g,
+  /<command-message>[\s\S]*?<\/command-message>/g,
+  /<command-args>[\s\S]*?<\/command-args>/g,
+];
+
+export interface HumanTurn {
+  text: string;
+  /** 진짜 명령 봉투의 <command-args> 에서 꺼낸 글이다 */
+  viaCommand: boolean;
+}
+
 export function humanText(entry: TranscriptEntry): string {
+  return humanTurn(entry).text;
+}
+
+export function humanTurn(entry: TranscriptEntry): HumanTurn {
+  const none: HumanTurn = { text: '', viaCommand: false };
   // 슬래시 커맨드 확장으로 주입된 메타 턴은 사용자 요청이 아님
   // (예: "# /work - 프로젝트 작업 메인 명령어 (v2)…" 커맨드 본문 전체가 여기 들어옴)
-  if (entry.isMeta === true) return '';
+  if (entry.isMeta === true) return none;
   // 컴팩션 요약은 user 줄로 기록되지만 사람이 쓴 것이 아니다.
-  if (entry.isCompactSummary === true || entry.isVisibleInTranscriptOnly === true) return '';
+  if (entry.isCompactSummary === true || entry.isVisibleInTranscriptOnly === true) return none;
 
   const content = entry.message?.content ?? entry.content;
   let text = '';
@@ -66,19 +93,22 @@ export function humanText(entry: TranscriptEntry): string {
   for (const re of CONTEXT_WRAPPERS) text = text.replace(re, '');
   text = text.trim();
 
-  if (MACHINE_ENVELOPE.test(text)) return '';
+  if (MACHINE_ENVELOPE.test(text)) return none;
 
   if (COMMAND_ENVELOPE.test(text)) {
     // 슬래시 커맨드 실행 시 실제 사용자 요청은 <command-args> 안에 있음 → 삭제 말고 추출
     const args = text.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1]?.trim() ?? '';
     // 인자 없는 명령(`/ashfall` 만)은 요청 글이 없다 — 명령 이름 보존은 2.7 라우팅(PB139-12)에서
-    return args;
+    return { text: args, viaCommand: args.length > 0 };
   }
 
-  // 시스템/메타 메시지 스킵
-  if (text.startsWith('[Request interrupted')) return '';
-  if (text.startsWith('This session is being continued')) return '';
-  if (text.startsWith('No response requested')) return '';
+  for (const re of HARNESS_BLOCKS) text = text.replace(re, '');
+  text = text.trim();
 
-  return text;
+  // 시스템/메타 메시지 스킵
+  if (text.startsWith('[Request interrupted')) return none;
+  if (text.startsWith('This session is being continued')) return none;
+  if (text.startsWith('No response requested')) return none;
+
+  return { text, viaCommand: false };
 }
