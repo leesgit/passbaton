@@ -70,6 +70,10 @@ export interface CardItem {
   sha?: string;
   excerpt?: string;
   truncated?: boolean;
+  /** 마지막 줄을 **프로그램이** 잘라 「…」 를 붙였다 — 원문의 「…」 와 구별한다(2.7.2 재분배의 원문 보존 비교) */
+  sliced?: boolean;
+  /** 이 원천의 본문 몫이 바닥나 더 보여 줄 수 있는데 멈췄다(블록 상한·읽기 상한 때문이 아니다) */
+  budgetLimited?: boolean;
   /** block 일치 개수(2 이상이면 모호함) */
   matches?: number;
   why?: string;
@@ -302,6 +306,8 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
   let used = 0;
   let shownTo = from - 1;
   let truncated = hitCap;
+  let sliced = false;
+  let budgetLimited = false;
   for (const l of selected) {
     const need = l.length + (kept.length ? 1 : 0);
     if (used + need <= maxChars) {
@@ -311,8 +317,9 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
     const room = maxChars - used - (kept.length ? 1 : 0);
     // ⛔ 표 행(`|` 로 시작)은 자르지 않는다(2.7 · reply-147 PB139-13). 결정 색인의 한 행이 「재개 조건」 칸 앞에서
     //    잘리면 반쪽 처분이 온전한 결정처럼 읽힌다. 통째로 빼고 「truncated」 로만 알린다.
-    if (room > 20 && !/^\s*\|/.test(l)) { kept.push(l.slice(0, room) + '…'); shownTo++; }
+    if (room > 20 && !/^\s*\|/.test(l)) { kept.push(l.slice(0, room) + '…'); shownTo++; sliced = true; }
     truncated = true;
+    budgetLimited = true;
     break;
   }
 
@@ -325,6 +332,7 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
   return {
     ...base, outcome: 'ok', from, to, shownTo, totalLines: lines.length, partialFile: partial,
     sha, excerpt, truncated, matches,
+    ...(sliced ? { sliced } : {}), ...(budgetLimited ? { budgetLimited } : {}),
   };
 }
 
@@ -340,6 +348,8 @@ export interface ResumeCard {
   invalid: string[];
   /** 하나라도 실제 발췌가 있는가 — 없으면 「정본이 우선」 이라고 말하면 안 된다 */
   anyRead: boolean;
+  /** 남는 예산 재분배 기록(2.7.2) — 측정·시험용. applied=false 면 카드는 C0 그대로다 */
+  redistribution?: { spare: number; targets: number; extraReads: number; applied: boolean; why?: string };
 }
 
 function renderItem(it: CardItem): string[] {
@@ -370,7 +380,14 @@ function renderCard(items: CardItem[], invalid: string[], maxInvalid: number): {
   return { text: out.join('\n'), anyRead };
 }
 
-export function buildResumeCard(projectPath: string, maxChars: number): ResumeCard | null {
+export interface BuildCardOptions {
+  /** false = 재분배 없이 C0 만(비교·측정용) */
+  redistribute?: boolean;
+  /** 재분배의 추가 읽기 — 시험이 두 읽기 사이 파일 변경을 넣을 때만 바꾼다 */
+  readExtra?: typeof readSource;
+}
+
+export function buildResumeCard(projectPath: string, maxChars: number, opts: BuildCardOptions = {}): ResumeCard | null {
   const decl = readContinuityDeclaration(projectPath);
   if (decl.sources.length === 0 && decl.invalid.length === 0) return null;
 
@@ -403,9 +420,38 @@ export function buildResumeCard(projectPath: string, maxChars: number): ResumeCa
     card = renderCard(items, invalid, maxInvalid);
   }
   // 4) 그래도 넘치면(머리글만으로 넘침) 원천 줄을 뒤에서부터 뺀다
+  let shownInvalid = invalid;
   while (card.text.length > budget && items.length > 0) {
     items = items.slice(0, -1);
-    card = renderCard(items, [...invalid, 'some sources omitted — card budget too small'], 0);
+    shownInvalid = [...invalid, 'some sources omitted — card budget too small'];
+    maxInvalid = 0;
+    card = renderCard(items, shownInvalid, maxInvalid);
   }
-  return { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead };
+  const c0: ResumeCard = { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead };
+
+  // 5) 남는 예산을 **한 번** 잘린 원천에 똑같이 나눈다 (2.7.2 · Astra reply-150 PB150-01 계약 1~6)
+  //   ★ 균등 몫은 없는 원천(NOT READ 한 줄)·짧은 원천의 몫을 그냥 버렸다 — Ashfall 실측 3200 중 2390 만 썼다.
+  //   기준 = 위 1~4 를 끝낸 C0. 남는 몫 R = budget − C0 길이(머리 예약 잉여를 따로 더하면 이중 계산).
+  //   대상 = 본문 몫 때문에 멈춘 원천만(블록 상한·생략된 원천·못 읽은 원천은 되살리지 않는다).
+  //   새 발췌는 C0 발췌를 그대로 앞에 두어야 하고(프로그램이 붙인 「…」 만 빼고 비교), 선택 범위·해시가 같아야 한다.
+  //   실제로 렌더해 상한을 넘거나 어느 조건이든 깨지면 **C0 전체로** 돌아간다 — 다른 원천을 줄여 맞추지 않는다.
+  const spare = budget - c0.text.length;
+  const targets = items.map((it, i) => ({ it, i })).filter(({ it }) => it.outcome === 'ok' && it.budgetLimited);
+  if (opts.redistribute === false || spare <= 0 || targets.length === 0) return { ...c0, redistribution: { spare: Math.max(0, spare), targets: 0, extraReads: 0, applied: false } };
+  const share = Math.floor(spare / targets.length);
+  let extraReads = 0;
+  const grown = [...items];
+  for (const { it, i } of targets) {
+    const shownBody = (it.excerpt ?? '').length - (it.sliced ? 1 : 0);
+    const next = (opts.readExtra ?? readSource)(projectPath, sources[i], shownBody + share);
+    extraReads++;
+    const kept = it.sliced ? (it.excerpt ?? '').slice(0, -1) : (it.excerpt ?? '');
+    const same = next.outcome === 'ok' && next.sha === it.sha && next.from === it.from && next.to === it.to
+      && (next.excerpt ?? '').startsWith(kept);
+    if (!same) return { ...c0, redistribution: { spare, targets: targets.length, extraReads, applied: false, why: `${it.path} changed or shrank between reads` } };
+    grown[i] = next;
+  }
+  const out = renderCard(grown, shownInvalid, maxInvalid);
+  if (out.text.length > budget) return { ...c0, redistribution: { spare, targets: targets.length, extraReads, applied: false, why: 'rendered card would exceed the budget' } };
+  return { text: out.text, items: grown, invalid, anyRead: out.anyRead, redistribution: { spare, targets: targets.length, extraReads, applied: true } };
 }
