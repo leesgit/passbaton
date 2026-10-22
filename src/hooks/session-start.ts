@@ -239,7 +239,7 @@ function renderFileEvidence(row: {
 
   const edited = parse<string[]>(row.modified_files, []);
   const groups = parse<Array<{ root: string; written: string[]; committed?: string[] }>>(row.workspace_writes, []);
-  const coverage = parse<{ workspace?: { boundary?: string; scope?: string; roots?: number; checked?: number; uncovered?: string[]; declared?: number } } | null>(row.file_coverage, null);
+  const coverage = parse<{ workspace?: { boundary?: string; scope?: string; roots?: number; checked?: number; uncovered?: string[]; declared?: number; valid?: number; declStatus?: string } } | null>(row.file_coverage, null);
 
   const key = (p: string) => p.split(String.fromCharCode(92)).join('/').toLowerCase();
   const sampled = new Set<string>();
@@ -273,8 +273,13 @@ function renderFileEvidence(row: {
 
   // 2.7 (PB139-11): 확인 범위 뒤에 **선언 수와 못 본 이유**를 붙인다 — 「0/0 roots」 만으로는
   //   「볼 곳이 없었다」 인지 「기준선이 없어 못 봤다」 인지 모른다.
+  //   reply-147: 선언(declared)·유효(valid)·관측(checked/roots)을 가른다. 못 읽은 선언은 숫자 대신 상태로.
+  const declText = (w: NonNullable<typeof ws>) =>
+    w.declStatus ? `root declaration ${w.declStatus}`
+      : w.declared === undefined ? ''
+      : w.valid !== undefined ? `declared ${w.declared} (valid ${w.valid})` : `declared ${w.declared}`;
   const why = (w: NonNullable<typeof ws>) => [
-    w.declared !== undefined ? `declared ${w.declared}` : '',
+    declText(w),
     w.uncovered?.length ? `skipped: ${w.uncovered.slice(0, 2).join('; ')}` : '',
   ].filter(Boolean).join(', ');
 

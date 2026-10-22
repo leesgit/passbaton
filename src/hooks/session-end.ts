@@ -23,7 +23,7 @@ import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils
 import { migrateSchema } from '../db/migrate.js';
 import { humanTurn, requestLine } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
-import { readWorkspaceDeclaration, scanArtifacts } from '../utils/workspace-config.js';
+import { readWorkspaceDeclaration, scanArtifacts, countDeclaredRoots } from '../utils/workspace-config.js';
 
 /**
  * 결과를 뽑지 못했을 때 last_work 에 적는 값.
@@ -905,6 +905,10 @@ async function main() {
         uncovered: string[];
         /** 설정(`workspace.roots`)이 선언한 루트 수 — 등록·관측과 따로 센다(2.7 PB139-11) */
         declared?: number;
+        /** 선언 중 워킹트리로 풀린 수(reply-147) */
+        valid?: number;
+        /** 선언을 못 읽었거나 모양이 틀림 — 이때 declared 0 은 「선언 없음」 이 아니다 */
+        declStatus?: 'unreadable' | 'malformed';
         artifacts?: { patterns: number; matched: number; problems: string[] };
       };
     } = {
@@ -1021,6 +1025,14 @@ async function main() {
         }
       }
 
+      // ★ 2.7 (reply-147 PB139-11): 선언 수·유효 수를 모든 분기에 같이 적는다 — 등록(roots)·관측(checked)과 다른 축이다.
+      //   못 읽은 선언은 「선언 0」 이 아니라 declStatus 로 남긴다.
+      const dc = countDeclaredRoots(wsRoot, findWorktreeRoot);
+      const declFields = {
+        declared: dc.declared, valid: dc.valid,
+        ...(dc.status === 'unreadable' || dc.status === 'malformed' ? { declStatus: dc.status } : {}),
+      };
+
       if (!turn) {
         // ★ 기준선이 없으면 델타를 **만들어내지 않는다.** 「검사 안 함」이지
         //   「변경 없음」이 아니다. UserPromptSubmit 이 안 돌았거나 이 세션의
@@ -1028,13 +1040,11 @@ async function main() {
         // ★ 2.7 (PB139-11): 이유를 **항상** 적는다. 전에는 루트가 0 이면 이유를 비워
         //   「0/0 roots」 만 남았다 — 「볼 곳이 없었다」 와 「기준선이 없어 못 봤다」 가 같은 줄이 됐다
         //   (10-22: 재설치로 passbaton 이 잠깐 없던 사이 UserPromptSubmit 이 안 돌았던 턴).
-        let declaredRoots: number | undefined;
-        try { declaredRoots = readWorkspaceDeclaration(wsRoot).roots.length; } catch { declaredRoots = undefined; }
         coverage.workspace = {
           boundary: 'none', scope: 'registered roots only',
           roots: roots.length, checked: 0, elapsedMs: 0,
           uncovered: ['no turn-start baseline (UserPromptSubmit did not record this turn)'],
-          declared: declaredRoots,
+          ...declFields,
         };
       } else if (roots.length > 0) {
         const started = Date.now();
@@ -1114,6 +1124,7 @@ async function main() {
           elapsedMs: Date.now() - started,
           uncovered,
           artifacts: artifactCoverage,
+          ...declFields,
         };
       } else {
         // 경계는 있는데 볼 워킹트리가 없다. 「변경 없음」이 아니라 「볼 곳이 없음」이다.
@@ -1121,6 +1132,7 @@ async function main() {
           boundary: 'turn_start', scope: 'registered roots only',
           roots: 0, checked: 0, elapsedMs: 0,
           uncovered: ['no registered worktree (not a git repository?)'],
+          ...declFields,
         };
       }
     } catch (e) {

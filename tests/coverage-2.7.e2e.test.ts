@@ -105,4 +105,71 @@ describe('PB139-11 coverage 표시', () => {
     expect(line).toContain('no turn-start baseline');
     expect(line).not.toContain('declared');
   });
+  // reply-147 PB139-11 보완: 선언·유효·관측을 가른다 · 못 읽은 선언을 「선언 0」 으로 위장하지 않는다
+  const lastCov = (dbPath: string) => {
+    const db = new Database(dbPath, { readonly: true });
+    const c = JSON.parse((db.prepare('SELECT file_coverage FROM sessions ORDER BY id DESC').get() as { file_coverage: string }).file_coverage);
+    db.close();
+    return c.workspace;
+  };
+  const setConfig = (ws: string, text: string) => fs.writeFileSync(path.join(ws, '.claude', 'passbaton.config.json'), text);
+
+  it.skipIf(!built)('유효 + 없는 경로 + 워크스페이스 밖이 섞인 선언: declared 3 · valid 1 · 정상 턴은 관측 1 — 두 표시 분기 모두', () => {
+    const { ws, proj, dbPath } = workspace();
+    setConfig(ws, JSON.stringify({ workspace: { roots: ['apps/game', 'apps/missing', '../outside'] } }));
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(USER_PROMPT, ws, { cwd: proj, session_id: 's1', prompt: '지도 화면 버그 고쳐줘' });
+    hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws) });
+    const w = lastCov(dbPath);
+    expect([w.declared, w.valid, w.boundary]).toEqual([3, 1, 'turn_start']);
+    expect(w.checked).toBeGreaterThanOrEqual(1);
+    // 기준선 없는 턴(파일 없음 분기) — Stop 은 10 초 안의 같은 project+요약을 중복으로 건너뛴다(session-end 1332) — 새 워크스페이스
+    {
+      const b = workspace();
+      setConfig(b.ws, JSON.stringify({ workspace: { roots: ['apps/game', 'apps/missing', '../outside'] } }));
+      hook(SESSION_START, b.ws, { cwd: b.proj, session_id: 'nobase' });
+      hook(SESSION_END, b.ws, { cwd: b.proj, session_id: 'nobase', transcript_path: transcript(b.ws) });
+      const nb = lastCov(b.dbPath);
+      expect([nb.declared, nb.valid, nb.boundary]).toEqual([3, 1, 'none']);
+      const db = new Database(b.dbPath);
+      db.prepare("UPDATE sessions SET last_work = '지도 화면 깜빡임을 고치고 회귀 시험을 붙였다'").run();
+      db.close();
+      expect(coverageLine(hook(SESSION_START, b.ws, { cwd: b.proj, session_id: 's2' }))).toContain('declared 3 (valid 1)');
+    }
+    // 파일 [E] 있는 분기
+    const db2 = new Database(dbPath);
+    db2.prepare("INSERT INTO sessions (project, last_work, modified_files, file_coverage, timestamp) VALUES ('game', '파일을 고친 판이 남긴 기록 한 줄입니다', ?, ?, datetime('now', '+1 minute'))")
+      .run(JSON.stringify([path.join(proj, 'memo.md')]), JSON.stringify({ source: 'turn_scoped', workspace: { ...w, boundary: 'none', checked: 0, uncovered: ['no turn-start baseline'] } }));
+    db2.close();
+    const line = coverageLine(hook(SESSION_START, ws, { cwd: proj, session_id: 's3' }));
+    expect(line).toContain('coverage:');
+    expect(line).toContain('declared 3 (valid 1)');
+  });
+
+  it.skipIf(!built)('못 읽는 설정(JSON 아님) · 모양 틀린 roots → 「선언 0」 이 아니라 상태로 남고 보인다', () => {
+    for (const [text, status] of [['{ "workspace": ', 'unreadable'], [JSON.stringify({ workspace: { roots: 'apps/game' } }), 'malformed']] as const) {
+      const { ws, proj, dbPath } = workspace();
+      setConfig(ws, text);
+      hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+      hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws) });
+      const w = lastCov(dbPath);
+      expect(w.declStatus, status).toBe(status);
+      const db = new Database(dbPath);
+      db.prepare("UPDATE sessions SET last_work = '지도 화면 깜빡임을 고치고 회귀 시험을 붙였다'").run();
+      db.close();
+      const line = coverageLine(hook(SESSION_START, ws, { cwd: proj, session_id: 's2' }));
+      expect(line, status).toContain(`root declaration ${status}`);
+      expect(line, status).not.toContain('declared 0');
+    }
+  });
+
+  it.skipIf(!built)('설정 파일 자체가 없으면 declared 0 (상태 없음 — 못 읽은 것과 다르다)', () => {
+    const { ws, proj, dbPath } = workspace();
+    fs.rmSync(path.join(ws, '.claude', 'passbaton.config.json'));
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws) });
+    const w = lastCov(dbPath);
+    expect([w.declared, w.valid, w.declStatus]).toEqual([0, 0, undefined]);
+  });
 });
+

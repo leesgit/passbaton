@@ -91,6 +91,37 @@ export function readWorkspaceDeclaration(workspaceRoot: string): WorkspaceDeclar
   return out;
 }
 
+/**
+ * coverage 표시용 루트 선언 집계 (2.7 · reply-147 PB139-11) — 「선언」·「유효」·「관측」 을 가른다.
+ * readWorkspaceDeclaration 은 못 읽어도 빈 선언을 돌려준다. 그 값을 그대로 세면 **읽기 실패가 「선언 0」 으로
+ * 위장된다** — 그래서 상태를 따로 둔다.
+ */
+export interface RootDeclarationCount {
+  /** none = 설정 파일 없음 · unreadable = 있는데 못 읽음/JSON 아님 · malformed = workspace.roots 가 배열이 아님 */
+  status: 'none' | 'ok' | 'unreadable' | 'malformed';
+  /** workspace.roots 에 적힌 항목 수 — 모양·경계·존재 검사 전 */
+  declared: number;
+  /** 워크스페이스 안이고 실제 워킹트리로 풀린 수 */
+  valid: number;
+}
+
+export function countDeclaredRoots(workspaceRoot: string, resolveRoot: (abs: string) => string | null): RootDeclarationCount {
+  const file = path.join(workspaceRoot, '.claude', 'passbaton.config.json');
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch (e) {
+    return { status: (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'none' : 'unreadable', declared: 0, valid: 0 };
+  }
+  const roots = (raw as { workspace?: { roots?: unknown } })?.workspace?.roots;
+  if (roots === undefined) return { status: 'ok', declared: 0, valid: 0 };
+  if (!Array.isArray(roots)) return { status: 'malformed', declared: 0, valid: 0 };
+  const valid = new Set(readWorkspaceDeclaration(workspaceRoot).roots
+    .map(rel => resolveRoot(path.resolve(workspaceRoot, rel)))
+    .filter((r): r is string => r !== null));
+  return { status: 'ok', declared: roots.length, valid: valid.size };
+}
+
 export interface ArtifactScan {
   /** 창 안에 쓰인 산출물(절대). */
   written: string[];
