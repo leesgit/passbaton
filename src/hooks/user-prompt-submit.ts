@@ -402,10 +402,12 @@ const MAX_DIRECTIVES = 20;
 
 // directive 품질 게이트는 ../utils/directive.ts — 주입 쪽(SessionStart·PreCompact)과 공유한다.
 
-function extractAndSaveDirectives(dbPath: string, project: string, prompt: string, transcriptPath?: string): void {
+/** 저장하고, 사람에게 보일 알림(있으면)을 돌려준다 — 출력은 main 이 한 번에 낸다(2.7 PB139-10). */
+function extractAndSaveDirectives(dbPath: string, project: string, prompt: string, transcriptPath?: string): string | null {
   // DB 는 SessionStart 가 만든다(ensureSessionsDb). 여기서 `new Database` 로 열면 만들면 안 되는
   // 루트에도 빈 파일이 생긴다.
-  if (!fs.existsSync(dbPath)) return;
+  if (!fs.existsSync(dbPath)) return null;
+  let notice: string | null = null;
   try {
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
@@ -430,7 +432,7 @@ function extractAndSaveDirectives(dbPath: string, project: string, prompt: strin
     // 명시 표지(#기억)인데 저장하지 못한 것은 알린다 — 사람은 저장된 줄 안다.
     // Codex·Gemini 는 stdout 에 JSON 하나를 기대하므로 Claude 에게만 낸다.
     if (extraction.rejectedExplicit.length > 0 && !isCodexHost(transcriptPath) && !isGeminiHost(transcriptPath)) {
-      console.log(`\n<passbaton-notice>#기억 not saved (must be one complete sentence, 200 chars max): ${extraction.rejectedExplicit.map(r => `「${r}」`).join(' ')}</passbaton-notice>\n`);
+      notice = `\n<passbaton-notice>#기억 not saved (must be one complete sentence, 200 chars max): ${extraction.rejectedExplicit.map(r => `「${r}」`).join(' ')}</passbaton-notice>\n`;
     }
 
     // P1-1 (2026-08-10): 90일 지난 지시문 정리.
@@ -460,6 +462,7 @@ function extractAndSaveDirectives(dbPath: string, project: string, prompt: strin
   } catch {
     // 테이블 미존재 등 무시
   }
+  return notice;
 }
 
 async function main() {
@@ -488,9 +491,15 @@ async function main() {
 
     markTurnStart(dbPath, project, input, cwd, workspaceRoot);
 
-    // 사용자 프롬프트에서 지시사항 추출 (DB 저장, 출력 0 토큰)
+    // ★ 2.7 (Astra reply-139 PB139-10): 이 훅의 출력은 **끝에서 한 번만** 낸다. Codex·Gemini 는 stdout 에
+    //   JSON 객체 하나만 받는다 — 조각마다 emitContext 를 부르면 객체가 둘 이상 붙어 전부 버려진다.
+    //   조각은 순서대로 모으고(알림 → 과거 문맥 → 트리거 문맥) 하나로 합친다.
+    const parts: string[] = [];
+
+    // 사용자 프롬프트에서 지시사항 추출 (DB 저장 · 거부된 #기억 알림만 출력 후보)
     if (input.prompt) {
-      extractAndSaveDirectives(dbPath, project, input.prompt, input.transcript_path);
+      const notice = extractAndSaveDirectives(dbPath, project, input.prompt, input.transcript_path);
+      if (notice) parts.push(notice);
     }
 
     // 1. 명시적 과거 참조 ("저번에", "예전에" 등) — 기존 동작 유지
@@ -503,7 +512,7 @@ async function main() {
           const pastSection = formatPastWork(pastWork);
           db.close();
           if (pastSection) {
-            emitContext(`\n<past-context project="${project}">\n${pastSection}\n</past-context>\n`, 'UserPromptSubmit', input.transcript_path);
+            parts.push(`\n<past-context project="${project}">\n${pastSection}\n</past-context>\n`);
           }
         } catch { /* ignore */ }
       } else {
@@ -522,12 +531,14 @@ async function main() {
                 const content = m.content.length > 120 ? m.content.slice(0, 120) + '...' : m.content;
                 lines.push(`- [${m.memory_type}] ${content}`);
               }
-              emitContext(`\n<triggered-context project="${project ?? 'global'}" keywords="${triggerKws.join(',')}">\n${lines.join('\n')}\n</triggered-context>\n`, 'UserPromptSubmit', input.transcript_path);
+              parts.push(`\n<triggered-context project="${project ?? 'global'}" keywords="${triggerKws.join(',')}">\n${lines.join('\n')}\n</triggered-context>\n`);
             }
           }
         } catch { /* ignore */ }
       }
     }
+
+    if (parts.length > 0) emitContext(parts.join(''), 'UserPromptSubmit', input.transcript_path);
 
     process.exit(0);
   } catch (e) {
