@@ -129,6 +129,10 @@ excerpts of them first**, each with its line range and a content hash:
   `.env*`, `.git`, `.ssh`, `.aws`, `.gnupg`, `.npmrc`, `.netrc`, `id_*`, `credentials*`, `secret(s)*`, `*.pem`, `*.key`, `*.pfx` …
   (so `docs/credentials-guide.md` is refused; `docs/secret-sauce.md` is not — rename rather than weaken the rule)
 - `PASSBATON_CARD_CHARS` (default 3200, 400–20000) caps the **whole** card, headings included
+- (v2.7.2+) Space a missing or short source leaves unused is handed **once**, evenly, to the sources that were cut by their share
+  (never to a source that hit its own `lines`/block cap, never reviving an omitted one). What was already shown stays as the
+  start of each excerpt; if the files change between reads or the rendered card would exceed the cap, the card stays as it was.
+  Ashfall: 2,390 → 3,064 of 3,200 chars, +3 ms
 
 ### Routing from a workspace root (v2.7.0+)
 
