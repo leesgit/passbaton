@@ -645,7 +645,9 @@ describe('PB143 — 판독 공백 · 같은 스냅샷 · 맨 앞 인용 · 이�
   it.skipIf(!built)('PB143-02 실제 훅: 맨 앞 인용으로 시작한 사람 요청이 복구·Stop 에 남는다', () => {
     const q = '<bash-stdout>오류 내용</bash-stdout>\n이 오류를 설명해줘';
     const { out, handover } = compactCycle([human(q)]);
-    expect(handover?.request).toBe('<bash-stdout>오류 내용</bash-stdout>');   // 첫 의미 줄(요청 표시 규칙)
+    // 요청 요약은 맨 앞 인용을 건너뛴 사람 글 — 질문 자체가 나와야 한다(reply-144 PB144-02)
+    expect(handover?.request).toBe('이 오류를 설명해줘');
+    expect(out).toContain('no reply yet): 이 오류를 설명해줘');
     expect(out).toContain('no reply yet');
     const { ws, proj, dbPath } = workspace();
     hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
@@ -653,8 +655,8 @@ describe('PB143 — 판독 공백 · 같은 스냅샷 · 맨 앞 인용 · 이�
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare("SELECT last_work, user_intent FROM sessions WHERE project = 'game' ORDER BY id DESC").get() as { last_work: string; user_intent: string | null };
     db.close();
-    // Stop 은 요청을 첫 줄로 줄여 적는다(기존 요약 규칙) — 요점은 기계 줄로 버려지지 않았다는 것
-    expect(`${row.last_work} ${row.user_intent ?? ''}`).toContain('오류 내용');
+    // Stop 의 요약 줄도 질문 자체(인용은 원문에 남고 요약은 질문)
+    expect(`${row.last_work} ${row.user_intent ?? ''}`).toContain('이 오류를 설명해줘');
   });
 
   it.skipIf(!built)('PB143-03 이어 쓴 트랜스크립트: 경계·요약 뒤 새 창에 요청이 없으면 지난 창의 A 를 다시 고르지 않는다 · C 는 정상', () => {
@@ -689,4 +691,68 @@ describe('PB143 — 판독 공백 · 같은 스냅샷 · 맨 앞 인용 · 이�
     expect(fs.statSync(TP(ws)).size).toBeGreaterThan(8 * 1024 * 1024);
     expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).not.toContain('경계 시험 요청');
   }, 60000);
+});
+
+describe('PB144 — 창 안 판독 공백 · 인용 뒤 질문 · 불확실한 최신 줄 · 답 없는 새 창', () => {
+  function append(ws: string, lines: Line[]): void {
+    const p = TP(ws);
+    const n = fs.readFileSync(p, 'utf-8').split('\n').filter(Boolean).length;
+    fs.appendFileSync(p, lines.map((l, i) => JSON.stringify({ uuid: `u${n + i}`, ...l })).join('\n') + '\n');
+  }
+  const boundary: Line = { type: 'system', subtype: 'compact_boundary' };
+  const summary: Line = { type: 'user', isCompactSummary: true, isVisibleInTranscriptOnly: true, message: { role: 'user', content: 'This session is being continued …' } };
+  const rowOf = (dbPath: string) => {
+    const db = new Database(dbPath, { readonly: true });
+    const r = db.prepare("SELECT request, pending FROM compact_handover WHERE session_id = 's1'").get() as { request: string; pending: number } | undefined;
+    db.close();
+    return r;
+  };
+
+  it.skipIf(!built)('PB144-01 A → 깨진 줄 → 정상 assistant(U) 이면 A 를 이번 요청으로 내지 않는다 · 깨진 줄이 없으면 낸다', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    transcript(ws, [human('요청 A')]);
+    fs.appendFileSync(TP(ws), '{"type":"user","message":{"role":"user","content":"요청 B 일 수도\n');
+    append(ws, [reply('네')]);
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: TP(ws) });
+    expect(rowOf(dbPath)).toBeUndefined();
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).not.toContain('요청 A');
+    // 양의 대조: 같은 모양에서 깨진 줄만 없으면 복구된다
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('요청 A'), reply('네')]) });
+    expect(rowOf(dbPath)?.request).toBe('요청 A');
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('요청 A');
+  });
+
+  it('PB144-02 요약 줄: 맨 앞 인용은 건너뛰고, 글 중간의 인용은 요청 문장의 일부로 둔다', () => {
+    const lead = '<bash-stdout>오류 내용</bash-stdout>\n이 오류를 설명해줘';
+    const inline = '이 태그를 설명해줘: <bash-stdout>오류 내용</bash-stdout>';
+    const s1 = snapshotHandover([{ uuid: 'u0', ...human(lead) }], [process.cwd()]);
+    const s2 = snapshotHandover([{ uuid: 'u0', ...human(inline) }], [process.cwd()]);
+    expect(s1.handover?.request).toBe('이 오류를 설명해줘');
+    expect(s2.handover?.request).toBe('이 태그를 설명해줘: <bash-stdout>오류 내용</bash-stdout>');
+  });
+
+  it('PB144-03 마지막 요청 뒤의 닫히지 않은 봉투는 옛 A 를 「마지막 요청」 으로 올리지 않는다 · 코드 펜스 인용은 사람 글', () => {
+    const open = '<task-notification>\n<task-id>x</task-id>\n잘린 채 끝남';
+    const a = snapshotHandover([human('요청 A'), reply('네'), human(open)].map((l, i) => ({ uuid: `u${i}`, ...l })), [process.cwd()]);
+    expect(a.handover).toBeNull();
+    // 열린 봉투가 사람 요청보다 **앞**이면 그 뒤의 요청은 정상
+    const b = snapshotHandover([human(open), human('요청 C')].map((l, i) => ({ uuid: `u${i}`, ...l })), [process.cwd()]);
+    expect(b.handover?.request).toBe('요청 C');
+    const fenced = '```\n<task-notification>\n잘린 인용\n```\n이거 뭐야';
+    const c = snapshotHandover([human('요청 A'), reply('네'), human(fenced)].map((l, i) => ({ uuid: `u${i}`, ...l })), [process.cwd()]);
+    expect(c.handover?.request).toBe('이거 뭐야');   // 코드 펜스로 시작 → 사람 글 · 요약은 펜스 블록을 건너뛴다(기존 규칙)
+  });
+
+  it.skipIf(!built)('PB144-03 경계·요약 뒤 사람 C 만 있고 답이 없으면 → C + no reply yet', () => {
+    const { ws, proj } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    transcript(ws, [human('지난 창 A'), reply('네')]);
+    append(ws, [boundary, summary, human('새 창 C')]);
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: TP(ws) });
+    append(ws, [boundary, summary]);
+    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
+    expect(out).toContain('(a request, not a result · no reply yet): 새 창 C');
+    expect(out).not.toContain('지난 창 A');
+  });
 });

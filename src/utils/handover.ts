@@ -4,7 +4,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { humanText } from './human-turn.js';
+import { humanTurn, requestLine } from './human-turn.js';
 import { lastUuid, type TranscriptLine } from './compact-id.js';
 
 export interface HandoverContext {
@@ -36,6 +36,8 @@ function stripMarkdown(text: string): string {
 export interface TurnMessage {
   role: 'user' | 'assistant';
   content: string;
+  /** 사람 요청인지 기계 줄인지 가를 수 없는 user 줄(닫히지 않은 봉투) */
+  uncertain?: boolean;
   /** assistant 의 tool_use 가 다룬 파일 — 쓰기 도구가 앞, 읽기가 뒤 */
   toolPaths: { path: string; write: boolean }[];
 }
@@ -50,8 +52,9 @@ export function entriesToMessages(entries: TranscriptLine[]): TurnMessage[] {
     // Claude Code JSONL은 역할을 최상위 `type`으로 싣고, `message.role`은 없을 수 있다.
     const role = entry.message?.role || entry.role || entry.type;
     if (role === 'user') {
-      const text = humanText(entry);
-      if (text.trim()) out.push({ role, content: text, toolPaths: [] });
+      const turn = humanTurn(entry);
+      if (turn.uncertain) out.push({ role, content: '', toolPaths: [], uncertain: true });
+      else if (turn.text.trim()) out.push({ role, content: turn.text, toolPaths: [] });
       continue;
     }
     if (role !== 'assistant') continue;
@@ -114,7 +117,7 @@ export function buildHandoverContext(
     if (transcript[i].role === 'user') { lastHuman = i; break; }
   }
   if (lastHuman >= 0) {
-    const cleaned = transcript[lastHuman].content
+    const cleaned = requestLine(transcript[lastHuman].content)
       .replace(/```[\s\S]*?```/g, '')
       .split('\n')
       .map(l => l.trim())
@@ -215,10 +218,18 @@ export function snapshotHandover(entries: TranscriptLine[], bases: string[]): Ha
     const e = entries[i];
     if (e.subtype === 'compact_boundary' || e.isCompactSummary) { start = i + 1; break; }
   }
-  const messages = entriesToMessages(entries.slice(start).slice(-MAX_WINDOW));
+  const window = entries.slice(start).slice(-MAX_WINDOW);
+  const all = entriesToMessages(window);
+  const messages = all.filter(m => !m.uncertain);
+  // ★ 창 안에 읽지 못한 줄이 있으면 핸드오버를 만들지 않는다 — 버린 줄이 더 최근 요청일 수 있다.
+  //   U 뒤만 보면 「A → 깨진 줄(B?) → U」 에서 A 가 이번 요청이 된다(Astra reply-144 PB144-01).
+  // ★ 마지막 사람 요청 **뒤에** 가를 수 없는 user 줄이 있으면 그 앞의 요청을 「마지막」 으로 올리지 않는다(PB144-03).
+  const lastHuman = all.map(m => m.role === 'user' && !m.uncertain).lastIndexOf(true);
+  const lastUncertain = all.map(m => !!m.uncertain).lastIndexOf(true);
+  const unreadable = window.some(e => e.__broken) || lastUncertain > lastHuman;
   return {
     messages,
-    handover: messages.length > 0 ? buildHandoverContext(messages, bases) : null,
+    handover: !unreadable && messages.length > 0 ? buildHandoverContext(messages, bases) : null,
     preUuid: lastUuid(entries),
   };
 }

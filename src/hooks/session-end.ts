@@ -21,7 +21,7 @@ import { detectWorkspaceRoot, isEphemeralRoot, resolveWorkspaceRoot } from '../u
 import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
-import { humanTurn } from '../utils/human-turn.js';
+import { humanTurn, requestLine } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
 import { readWorkspaceDeclaration, scanArtifacts } from '../utils/workspace-config.js';
 
@@ -477,7 +477,8 @@ async function parseTranscriptSinglePass(transcriptPath: string): Promise<Transc
             const planMatch = text.match(/^Implement the following plan:\s*\n+#\s*(.+)/);
             const cleaned = planMatch
               ? planMatch[1].trim().slice(0, 100)
-              : stripMarkdown(text.split('\n')[0].trim()).slice(0, 100);
+              // 요약 줄은 봉투 블록 밖의 사람 글을 우선한다(인용 + 질문이면 질문) — reply-144 PB144-02
+              : stripMarkdown(requestLine(text).split('\n')[0].trim()).slice(0, 100);
 
             if (cleaned && cleaned.length >= 3) {
               if (!result.userRequests.firstRequest) result.userRequests.firstRequest = cleaned;

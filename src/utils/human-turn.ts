@@ -47,7 +47,7 @@ const CONTEXT_WRAPPERS = [
 const MACHINE_ENVELOPE = /^<(?:task-notification|bash-input|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|user-prompt-submit-hook)\b/i;
 
 /** 맨 앞 봉투의 완전한 블록들. 걷어 내고 남는 글이 있으면 사람이 붙여 넣은 인용 + 요청이다. */
-const ENVELOPE_BLOCKS = /<(task-notification|bash-input|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|user-prompt-submit-hook)\b[^>]*>[\s\S]*?<\/\1>/gi;
+export const ENVELOPE_BLOCKS = /<(task-notification|bash-input|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|user-prompt-submit-hook)\b[^>]*>[\s\S]*?<\/\1>/gi;
 
 /** 명령 봉투 — 맨 앞일 때만 진짜 명령이다. */
 const COMMAND_ENVELOPE = /^<(?:command-message|command-name)>/;
@@ -56,6 +56,23 @@ export interface HumanTurn {
   text: string;
   /** 진짜 명령 봉투의 <command-args> 에서 꺼낸 글이다 */
   viaCommand: boolean;
+  /** 닫히지 않은 맨 앞 봉투 — 잘린 기계 알림인지 사람의 불완전 인용인지 글만으로 가를 수 없다 */
+  uncertain?: boolean;
+}
+
+/** 맨 앞에 붙은 봉투 블록 하나(뒤 공백 포함). */
+const LEADING_BLOCK = /^<(task-notification|bash-input|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|user-prompt-submit-hook)\b[^>]*>[\s\S]*?<\/\1>\s*/i;
+
+/**
+ * 요청을 **한 줄로 요약할 때** 쓸 글. 원문(인용 포함)은 그대로 두고, 요약은 **맨 앞에 붙여 넣은** 인용
+ * 블록을 건너뛴 사람 글부터 본다 — `<bash-stdout>오류</bash-stdout>\n이 오류를 설명해줘` 의 요청은
+ * 「이 오류를 설명해줘」 다(Astra reply-144 PB144-02). 글 중간·뒤의 인용(`이 태그를 설명해줘: <bash-stdout>…`)은
+ * 요청 문장의 일부라 건드리지 않는다. 건너뛰고 남는 글이 없으면 원문.
+ */
+export function requestLine(text: string): string {
+  let rest = text.trim();
+  while (LEADING_BLOCK.test(rest)) rest = rest.replace(LEADING_BLOCK, '');
+  return rest.trim() || text;
 }
 
 export function humanText(entry: TranscriptEntry): string {
@@ -89,7 +106,10 @@ export function humanTurn(entry: TranscriptEntry): HumanTurn {
   //   닫히지 않은 봉투(잘린 알림)는 걷어 낼 수 없으므로 기계 줄로 본다(Astra reply-143 PB143-02).
   if (MACHINE_ENVELOPE.test(text)) {
     const rest = text.replace(ENVELOPE_BLOCKS, '').trim();
-    if (!rest || MACHINE_ENVELOPE.test(rest)) return none;
+    if (!rest) return none;
+    // 닫히지 않은 봉투: 사람 요청으로 쓰지 않지만 「없었던 줄」 로도 치지 않는다 — 그 앞의 옛 요청이
+    //   「마지막 요청」 으로 올라오지 않게 호출부가 표지를 본다(PB144-03)
+    if (MACHINE_ENVELOPE.test(rest)) return { ...none, uncertain: true };
     return { text, viaCommand: false };
   }
 
