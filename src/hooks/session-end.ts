@@ -1423,14 +1423,27 @@ async function main() {
     }
 
     // 활성 컨텍스트 업데이트
-    db.prepare(`
-      INSERT OR REPLACE INTO active_context (project, current_state, recent_files, updated_at)
-      VALUES (?, ?, ?, datetime('now'))
-    `).run(
-      project,
-      lastWork,
-      JSON.stringify(modifiedFiles.slice(0, 15))
-    );
+    // ⛔ 2.6.0: 일한 증거(커밋·파일)가 없는 턴은 State 를 **덮지 않는다.** 경로 한 줄 묻고
+    //    끝난 세션이 앞선 긴 작업 세션의 State 를 「(결과 요약 없음)」이나 그 한 줄 답으로
+    //    바꿔 놓았다(Ashfall 2026-10-22 실측). 증거가 없으면 recent_files 만 갱신한다.
+    const workedThisTurn = commitMessages.length > 0 || modifiedFiles.length > 0;
+    const hadState = db.prepare(
+      "SELECT 1 FROM active_context WHERE project = ? AND current_state IS NOT NULL AND current_state != ''"
+    ).get(project);
+    if (workedThisTurn || !hadState) {
+      db.prepare(`
+        INSERT OR REPLACE INTO active_context (project, current_state, recent_files, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+      `).run(
+        project,
+        lastWork,
+        JSON.stringify(modifiedFiles.slice(0, 15))
+      );
+    } else {
+      db.prepare(`
+        UPDATE active_context SET recent_files = ?, updated_at = datetime('now') WHERE project = ?
+      `).run(JSON.stringify(modifiedFiles.slice(0, 15)), project);
+    }
 
     // 에러→솔루션 자동 기록 (solutions 테이블)
     // P1-4 (2026-05-22): 품질 필터 + 동일 solution 텍스트 dedup 추가
@@ -1555,10 +1568,15 @@ async function main() {
         VALUES (?, ?, ?, ?, ?)
       `);
 
+      // ⛔ 2.6.0: 정규식이 잡은 문장은 **결정이 아니라 후보**다. `instead of …` 뒤 60 자를
+      //    잘라 온 것이라 주체·근거·대체 관계가 없다 — Ashfall 실측 146 개 전부 이런 조각이었고
+      //    한 번도 조회되지 않았다(access_count 0). 그래서 decision/7 이 아니라
+      //    observation/2 + `unverified` 로 남기고, SessionStart 는 unverified 를 주입하지 않는다.
+      //    지우지 않는 이유: 사람이 memory_search 로 보고 승격할 수 있게.
       for (const decision of decisions) {
         if (decision.length < 15) continue;
         if (!memoryDupCheck.get(project, decision)) {
-          memoryInsert.run(decision, 'decision', JSON.stringify(['auto-extracted']), project, 7);
+          memoryInsert.run(decision, 'observation', JSON.stringify(['auto-extracted', 'unverified']), project, 2);
         }
       }
 

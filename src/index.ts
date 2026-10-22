@@ -32,6 +32,7 @@ import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { tokenizeQuery, buildFtsQuery } from './utils/tokenize.js';
 import { migrateSchema } from './db/migrate.js';
+import { buildResumeCard } from './utils/resume-card.js';
 
 // @xenova/transformers - 동적 import (sharp 의존성 문제 방지)
 let transformersModule: { pipeline: unknown; env: Record<string, unknown> } | null = null;
@@ -97,11 +98,22 @@ if (!existsSync(CLAUDE_DIR)) {
   mkdirSync(CLAUDE_DIR, { recursive: true });
 }
 
+// ===== 읽기 전용 모드 (2.6.0) =====
+// `PASSBATON_READONLY=1` 이면 상태를 바꾸지 않는 도구만 내놓는다. 다른 에이전트(예: Codex 의
+// Astra)에게 같은 기억·세션 원장을 **보여 주되 고치게 하지는 않을** 때 쓴다.
+// ★ 「읽기」 도구도 조회수(access_count)·임베딩 캐시를 쓴다 — 이 모드에서는 건너뛴다.
+// ★ DB 가 이미 있으면 SQLite 를 readonly 로 연다. 그러면 빠뜨린 쓰기 경로가 있어도
+//   조용히 쓰지 않고 오류로 드러난다(약속이 아니라 강제).
+const READONLY = /^(1|true|yes)$/i.test(process.env.PASSBATON_READONLY || '');
+const READONLY_DB = READONLY && existsSync(DB_PATH);
+
 // ===== SQLite 데이터베이스 초기화 =====
-const db = new Database(DB_PATH);
+const db = READONLY_DB
+  ? new Database(DB_PATH, { readonly: true, fileMustExist: true })
+  : new Database(DB_PATH);
 
 // v5 스키마 - 세션 + 메모리 분류 체계 + 지식 그래프
-db.exec(`
+if (!READONLY_DB) db.exec(`
   -- 세션 테이블 (핵심)
   CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,7 +274,7 @@ db.exec(`
 
 // 스키마 보강 — CREATE TABLE IF NOT EXISTS 는 기존 DB 의 컬럼을 늘리지 못한다.
 // 정본은 db/migrate.ts 하나다 (이 레포에는 sessions 를 만드는 코드가 네 군데 있다).
-migrateSchema(db);
+if (!READONLY_DB) migrateSchema(db);
 
 // ===== 임베딩 엔진 =====
 let embeddingPipeline: unknown = null;
@@ -455,7 +467,25 @@ interface Tool {
   };
 }
 
+const READONLY_TOOLS = new Set([
+  'resume_card', 'session_history', 'search_sessions', 'project_status', 'list_projects',
+  'task_list', 'solution_find', 'memory_search', 'memory_get', 'memory_related',
+  'memory_stats', 'graph_explore',
+]);
+
 const tools: Tool[] = [
+  {
+    name: 'resume_card',
+    description: "Return the project's resume card: verbatim excerpts of the repo files the project declares as its source of truth (continuity.sources in <project>/.claude/passbaton.config.json), each with path:from-to and a sha1 of the excerpt. Read this before trusting DB summaries. Read-only; re-reads the files on every call. Returns a notice when the project declares no sources.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: 'Project name (must match a directory under apps/)' },
+        maxChars: { type: 'number', description: 'Character budget for all excerpts (default: 6000)' }
+      },
+      required: ['project']
+    }
+  },
   // ===== 1. 세션/컨텍스트 (4개) =====
   {
     name: 'session_start',
@@ -1009,6 +1039,20 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         return { content: [{ type: 'text', text: `✅ Session saved for ${project}\nSummary: ${summary}\nWork: ${workDone || summary}\nFiles: ${modifiedFiles?.length || 0}\nBlockers: ${blockers || 'none'}${techStack ? '\nTech stack updated' : ''}` }] };
       }
 
+      case 'resume_card': {
+        const project = args.project as string;
+        const maxChars = (args.maxChars as number) || 6000;
+        const card = buildResumeCard(getProjectPath(project), maxChars);
+        return {
+          content: [{
+            type: 'text',
+            text: card
+              ? card.text
+              : `No resume card: ${project} declares no continuity.sources in .claude/passbaton.config.json.`
+          }]
+        };
+      }
+
       case 'session_history': {
         const project = args.project as string;
         const limit = (args.limit as number) || 5;
@@ -1026,6 +1070,7 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
             text: JSON.stringify(sessions.map(s => ({
               id: s.id,
               summary: s.last_work,
+              intent: s.user_intent ?? null,
               workDone: s.current_status,
               nextSteps: s.next_tasks ? JSON.parse(s.next_tasks as string) : [],
               timestamp: s.timestamp
@@ -1077,8 +1122,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
           } else {
             const text = `${s.last_work} ${s.current_status || ''}`;
             emb = await generateEmbedding(text, 'passage');
-            // 생성 성공 시 캐시 저장
-            if (emb) {
+            // 생성 성공 시 캐시 저장 (읽기 전용 모드에서는 쓰지 않는다)
+            if (emb && !READONLY) {
               const buffer = Buffer.from(new Float32Array(emb).buffer);
               db.prepare('INSERT OR REPLACE INTO embeddings_v4 (entity_type, entity_id, embedding) VALUES (?, ?, ?)')
                 .run('session', sessionId, buffer);
@@ -1804,9 +1849,9 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
           }
         }
 
-        // 접근 기록 업데이트
+        // 접근 기록 업데이트 (읽기 전용 모드에서는 쓰지 않는다)
         const ids = results.map(r => r.id);
-        if (ids.length > 0) {
+        if (ids.length > 0 && !READONLY) {
           db.prepare(`
             UPDATE memories SET accessed_at = datetime('now'), access_count = access_count + 1
             WHERE id IN (${ids.join(',')})
@@ -1848,8 +1893,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
           FROM memories WHERE id IN (${placeholders})
         `).all(...ids) as Array<Record<string, unknown>>;
 
-        // access_count 업데이트
-        if (memRows.length > 0) {
+        // access_count 업데이트 (읽기 전용 모드에서는 쓰지 않는다)
+        if (memRows.length > 0 && !READONLY) {
           db.prepare(`
             UPDATE memories SET accessed_at = datetime('now'), access_count = access_count + 1
             WHERE id IN (${memRows.map(r => r.id).join(',')})
@@ -2416,9 +2461,22 @@ async function generateWorkContext(project: string): Promise<string> {
 
 // ===== MCP 요청 핸들러 =====
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+// 읽기 전용 모드에서는 MCP 표준 주석 readOnlyHint 를 단다 — 클라이언트(예: Codex)가 이것을 보고
+// 승인 없이 부를 수 있다. 쓰기 모드에서는 달지 않는다: memory_search 등도 조회수를 쓰기 때문이다.
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: READONLY
+    ? tools.filter(t => READONLY_TOOLS.has(t.name))
+        .map(t => ({ ...t, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } }))
+    : tools
+}));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (READONLY && !READONLY_TOOLS.has(request.params.name)) {
+    return {
+      content: [{ type: 'text', text: `Tool "${request.params.name}" is disabled: this server runs with PASSBATON_READONLY=1 (read-only tools only).` }],
+      isError: true
+    };
+  }
   return handleTool(request.params.name, request.params.arguments || {});
 });
 

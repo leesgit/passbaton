@@ -11,6 +11,8 @@ import { isEnabled } from '../utils/config.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
 import { resolveWorkspaceRoot } from '../utils/workspace.js';
 import { ensureSessionsDb } from '../db/bootstrap.js';
+import { isStillDirective } from '../utils/directive.js';
+import { buildResumeCard } from '../utils/resume-card.js';
 
 interface SessionInput {
   cwd?: string;
@@ -54,6 +56,13 @@ function getProject(cwd: string, workspaceRoot: string): string | null {
   return path.basename(workspaceRoot);
 }
 
+/** 재개 카드 선언을 찾을 프로젝트 폴더. apps/<name> 아래면 그 폴더, 아니면 워크스페이스 루트. */
+function projectPathOf(cwd: string, workspaceRoot: string, project: string): string {
+  const appsDir = path.join(workspaceRoot, 'apps');
+  if (cwd.startsWith(appsDir + path.sep)) return path.join(appsDir, project);
+  return workspaceRoot;
+}
+
 function cleanupNoiseMemories(db: InstanceType<typeof Database>): void {
   try {
     // 3일+ auto-tracked 관찰 메모리 삭제
@@ -62,6 +71,18 @@ function cleanupNoiseMemories(db: InstanceType<typeof Database>): void {
       WHERE memory_type = 'observation'
         AND tags LIKE '%auto-tracked%'
         AND created_at < datetime('now', '-3 days')
+    `).run();
+
+    // 2.6.0: 그 이전 판이 decision/7 로 넣은 정규식 조각을 격리한다(지우지 않는다).
+    //   memory_search 로는 계속 보이고, 태그로 이유를 남긴다. 한 번 바뀌면 다시 안 걸린다.
+    db.prepare(`
+      UPDATE memories
+      SET memory_type = 'observation',
+          importance = MIN(importance, 2),
+          tags = '["auto-extracted","unverified","quarantined-2.6"]'
+      WHERE memory_type = 'decision'
+        AND tags LIKE '%auto-extracted%'
+        AND tags NOT LIKE '%commit%'
     `).run();
 
     // 14일+ auto-compact 패턴 메모리 삭제
@@ -79,8 +100,15 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4); // 대략적 추정 (한글은 1.5~2배)
 }
 
-function loadContext(dbPath: string, project: string, source?: string): string | null {
-  if (!fs.existsSync(dbPath)) return null;
+// 재개 카드에 쓸 최대 글자 수. 토큰 예산(2000)과 같은 예산에서 나간다.
+const CARD_CHARS = parseInt(process.env.PASSBATON_CARD_CHARS || '3200', 10);
+
+function loadContext(dbPath: string, project: string, source?: string, projectPath?: string): string | null {
+  // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
+  const card = projectPath ? buildResumeCard(projectPath, CARD_CHARS) : null;
+  if (!fs.existsSync(dbPath)) {
+    return card ? `# ${project} - Session Resumed\n\n${card.text}` : null;
+  }
 
   // dbPath is "<workspaceRoot>/.claude/sessions.db" → strip two levels for feature-flag lookups.
   const workspaceRoot = path.dirname(path.dirname(dbPath));
@@ -95,11 +123,20 @@ function loadContext(dbPath: string, project: string, source?: string): string |
     const lines: string[] = [`# ${project} - Session Resumed\n`];
     let tokenBudget = MAX_CONTEXT_TOKENS;
 
+    // [Priority 0] 재개 카드 — 레포 정본 발췌. 있으면 아래 DB 요약은 보조다.
+    if (card) {
+      lines.push(card.text, '');
+      tokenBudget -= estimateTokens(card.text);
+    }
+
     // [Priority 1] 현재 상태
     const active = db.prepare('SELECT current_state, blockers FROM active_context WHERE project = ?').get(project) as { current_state: string; blockers: string } | undefined;
     if (active?.current_state) {
       // P0-1: 컴팩션 직후 재시작이면 PreCompact가 저장한 복구 상태임을 밝힌다.
-      const stateLabel = source === 'compact' ? '♻️ **Recovered after compaction**' : '📍 **State**';
+      // 카드가 있으면 State 는 「마지막으로 기록된 것」일 뿐이다 — 정본은 카드 쪽이다.
+      const stateLabel = source === 'compact' ? '♻️ **Recovered after compaction**'
+        : card ? '📍 **Last recorded state** (DB · may be stale — the resume card above wins)'
+        : '📍 **State**';
       const stateBlock = `${stateLabel}: ${active.current_state}` + (active.blockers ? `\n🚧 **Blocker**: ${active.blockers}` : '');
       const cost = estimateTokens(stateBlock);
       if (tokenBudget > cost) {
@@ -274,13 +311,15 @@ function renderFileEvidence(row: {
 
     // [Priority 3] 사용자 지시사항 (가장 중요 - 예산 부족해도 high priority는 포함)
     try {
-      const directives = db.prepare(`
-        SELECT directive, priority FROM user_directives
+      const directives = (db.prepare(`
+        SELECT directive, priority, context FROM user_directives
         WHERE project = ?
         ORDER BY CASE priority WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
                  created_at DESC
-        LIMIT 5
-      `).all(project) as Array<{ directive: string; priority: string }>;
+        LIMIT 40
+      `).all(project) as Array<{ directive: string; priority: string; context: string | null }>)
+        // 저장 뒤에 규칙이 강화됐을 수 있다 — 이미 DB 에 있는 오추출도 여기서 거른다(문장 + 출처).
+        .filter(d => isStillDirective(d.directive, d.context)).slice(0, 5);
 
       if (directives.length > 0) {
         const directiveLines = ['## Directives'];
@@ -334,11 +373,17 @@ function renderFileEvidence(row: {
     if (tokenBudget > 80) try {
       const memories = db.prepare(`
         SELECT content, memory_type, importance, created_at, access_count FROM memories
-        WHERE (project = ? OR project IS NULL)
+        -- 2.6.0: 전역(project NULL) 기억은 reference·preference 만. 실 DB 의 전역 10 개는
+        --   「TypeScript 는 …」 「Redis 는 …」 같은 일반 상식(시험 시드)이었고 모든 프로젝트의
+        --   Key Memories 5 칸을 다 차지했다. 서버 주소 같은 인프라 정보(reference)는 그대로 온다.
+        WHERE (project = ? OR (project IS NULL AND memory_type IN ('reference', 'preference')))
           AND memory_type IN ('decision', 'learning', 'error', 'preference', 'reference', 'observation')
           AND importance >= 3
           AND (tags NOT LIKE '%auto-tracked%' OR tags IS NULL)
           AND (tags NOT LIKE '%auto-compact%' OR tags IS NULL)
+          -- 2.6.0: 정규식 후보(unverified)와 그 이전 판의 자동 추출 「결정」 은 주입하지 않는다
+          AND (tags NOT LIKE '%unverified%' OR tags IS NULL)
+          AND NOT (memory_type = 'decision' AND tags LIKE '%auto-extracted%')
         ORDER BY importance DESC, accessed_at DESC LIMIT 30
       `).all(project) as Array<{ content: string; memory_type: string; importance: number; created_at: string; access_count: number }>;
 
@@ -408,7 +453,8 @@ function renderFileEvidence(row: {
            WHERE project = ? ORDER BY access_count DESC LIMIT 5`
         ).all(project) as Array<{ file_path: string; access_count: number }>;
         if (hot.length > 0) {
-          const files = hot.map(h => `${h.file_path.split('/').pop()} (${h.access_count}×)`).join(', ');
+          // Windows 경로(역슬래시)도 파일명만 — 전에는 전체 절대 경로가 그대로 나갔다.
+        const files = hot.map(h => `${h.file_path.split(/[\\/]/).pop()} (${h.access_count}×)`).join(', ');
           const hotLine = `\n**Hot files** (you edit these most here): ${files}`;
           lines.push(hotLine);
           tokenBudget -= estimateTokens(hotLine);
@@ -474,7 +520,7 @@ async function main() {
     ensureSessionsDb(resolvedRoot);
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
-    const context = loadContext(dbPath, project, input.source);
+    const context = loadContext(dbPath, project, input.source, projectPathOf(cwd, workspaceRoot, project));
 
     // 주입 결과는 별도 줄. injected 는 **문자 수**다 (토큰 아님 — 예산은 2000 토큰이고
     // 한글은 문자당 토큰이 더 든다. 대략 len/4 보다 나쁘다).

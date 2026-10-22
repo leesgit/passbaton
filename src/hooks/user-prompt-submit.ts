@@ -12,6 +12,7 @@ import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { migrateSchema } from '../db/migrate.js';
 import { findWorktreeRoot, readHead, MAX_ROOTS } from '../utils/worktree.js';
 import { readWorkspaceDeclaration } from '../utils/workspace-config.js';
+import { extractDirectives } from '../utils/directive.js';
 
 interface PromptInput {
   prompt?: string;
@@ -395,61 +396,27 @@ function formatPastWork(pastWork: PastWorkResult): string | null {
 
 // ===== 사용자 지시사항 자동 추출 =====
 
-const DIRECTIVE_PATTERNS: Array<{ pattern: RegExp; priority: 'high' | 'normal' }> = [
-  { pattern: /(?:절대|never)\s+(.+)/i, priority: 'high' },
-  { pattern: /(?:항상|always)\s+(.+)/i, priority: 'high' },
-  { pattern: /(?:반드시|must)\s+(.+)/i, priority: 'high' },
-  { pattern: /never\s+(?:use|modify|touch)\s+(.+)/i, priority: 'high' },
-  { pattern: /always\s+(?:use|check|include)\s+(.+)/i, priority: 'high' },
-  { pattern: /#(?:기억|remember)\s+(.+)/i, priority: 'normal' },
-  { pattern: /(?:important|중요)[:\s]+(.+)/i, priority: 'normal' },
-  { pattern: /(?:rule|규칙)[:\s]+(.+)/i, priority: 'normal' },
-];
+// 패턴·출처 규칙은 ../utils/directive.ts (주입 쪽이 같은 규칙으로 옛 행을 다시 검사한다)
 
 const MAX_DIRECTIVES = 20;
 
-/**
- * directive 품질 게이트 (P4, 2026-07-08).
- * DIRECTIVE_PATTERNS의 `.+` 탐욕 캡처가, 사용자가 붙여넣은 어시스턴트 산출물
- * (JSON 평가지/스토리보드/코드)에서 '절대/반드시/must' 부분문자열 뒤를 통째로
- * 잡아 지시문으로 오추출했음(실측 45건 중 42건 오염, 30건이 200자 cap run-on).
- * 진짜 지시문은 짧고 자족적 — 데이터/코드 구문 냄새가 나면 거부.
- * 다국어(영어+한국어) 모두 커버.
- */
-function isValidDirective(d: string): boolean {
-  if (d.length > 120) return false;                                   // run-on 캡처
-  if (/"\s*:\s*|"\s*\}|\{\s*"|"\},\{"|\}\]|\}\}/.test(d)) return false; // JSON 구조 구문
-  if (/"(?:whatWorks|itemCode|weight|factor|impact|verdict|correction|role|path|purpose|problem|action|files)"/.test(d)) return false; // 평가지/JSON 키
-  if (d.includes('`') || d.includes('**') || /\|.*\|.*\|/.test(d)) return false; // 코드/마크다운 표
-  if ((d.match(/"/g) || []).length >= 4) return false;                // 따옴표 과다=구조화 데이터
-  // 어시스턴트 산문 중간이 잘린 파편은 소문자 라틴 문자로 시작함
-  // (진짜 영어 지시문은 대문자 명령형: "Never …", "Always …", "Do NOT …").
-  // 한국어 지시문은 이 검사에 안 걸림(라틴 소문자로 시작 안 함).
-  if (/^[a-z]/.test(d)) return false;
-  return true;
-}
+// directive 품질 게이트는 ../utils/directive.ts — 주입 쪽(SessionStart·PreCompact)과 공유한다.
 
 function extractAndSaveDirectives(dbPath: string, project: string, prompt: string): void {
   try {
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
 
-    for (const { pattern, priority } of DIRECTIVE_PATTERNS) {
-      const match = prompt.match(pattern);
-      if (match && match[1]) {
-        const directive = match[1].trim().slice(0, 200);
-        if (directive.length < 5) continue;
-        if (!isValidDirective(directive)) continue;
-
-        // UPSERT directive
-        db.prepare(`
-          INSERT INTO user_directives (project, directive, context, source, priority)
-          VALUES (?, ?, ?, 'explicit', ?)
-          ON CONFLICT(project, directive) DO UPDATE SET
-            priority = ?,
-            created_at = CURRENT_TIMESTAMP
-        `).run(project, directive, prompt.slice(0, 300), priority, priority);
-      }
+    // 2.6.0: 출처 규칙 + 문장 규칙은 extractDirectives 한 곳에서.
+    for (const { directive, priority } of extractDirectives(prompt)) {
+      // UPSERT directive
+      db.prepare(`
+        INSERT INTO user_directives (project, directive, context, source, priority)
+        VALUES (?, ?, ?, 'explicit', ?)
+        ON CONFLICT(project, directive) DO UPDATE SET
+          priority = ?,
+          created_at = CURRENT_TIMESTAMP
+      `).run(project, directive, prompt.slice(0, 300), priority, priority);
     }
 
     // P1-1 (2026-08-10): 90일 지난 지시문 정리.

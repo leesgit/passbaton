@@ -97,6 +97,57 @@ Use search when you want to *look something up*. Use this when you want your con
 
 ---
 
+## Resume card — the repo is the source of truth (v2.6.0+)
+
+Long-running projects usually keep their real hand-off in the repo — a `HANDOFF.md` whose newest
+entry is on top, a plan file with a "current task" block, a stop file left by an unattended loop.
+A DB summary of the last session cannot replace those, and it goes stale the moment someone else
+edits them. Since 2.6.0 a project can declare those files, and SessionStart shows **verbatim
+excerpts of them first**, each with its line range and a content hash:
+
+```jsonc
+// <project>/.claude/passbaton.config.json
+{
+  "continuity": {
+    "sources": [
+      { "path": "docs/HANDOFF.md",    "lines": 30,           "label": "HANDOFF (newest entry)" },
+      { "path": ".ralph/fix_plan.md", "block": "지금 할 일", "label": "current task" },
+      { "path": ".ralph/DEMO_STOP",   "lines": 3,            "label": "loop stop reason" }
+    ]
+  }
+}
+```
+
+- `lines` — the first N lines (default 40, max 200)
+- `block` — the first list item or heading containing that text, up to the next item/heading of the same or higher level (max 120 lines)
+- Files are re-read on every start (never cached). A source that cannot be read is shown as **NOT READ**, never silently dropped
+- When a card is present the DB state is relabelled *Last recorded state (may be stale)*
+- The same card is available as the read-only MCP tool `resume_card`, so another agent can read it too
+
+## Read-only MCP mode (v2.6.0+)
+
+`PASSBATON_READONLY=1` exposes only tools that do not change state (`resume_card`, `session_history`,
+`search_sessions`, `memory_search`, `memory_get`, …) and opens an existing DB with SQLite's own
+read-only flag, so a missed write path fails loudly instead of writing. Access counters and the
+embedding cache are not updated in this mode. Use it to share one memory/session ledger with a second
+agent (e.g. Codex) without letting it edit:
+
+```bash
+codex mcp add passbaton-ro --env WORKSPACE_ROOT=/path/to/workspace --env PASSBATON_READONLY=1 -- npx -y passbaton
+```
+
+## What 2.6.0 stopped injecting
+
+Measured on a real 2-month workspace DB (Ashfall, 2026-10-22):
+
+| Before 2.6.0 | 2.6.0 |
+|---|---|
+| Regex-extracted "decisions" (`instead of …` + 60 chars) stored as `decision`/7 and injected — 146 of 146 were sentence fragments, none ever looked up | stored as `observation`/2 + `unverified`, not injected; old rows are quarantined (tagged, not deleted) |
+| Directives taken from any user turn — 37 of 40 came from `<task-notification>` results, loop prompts and packets sent to other agents | only from human messages under 300 chars (or anything marked `#기억`/`#remember`); old rows are re-checked against the current rules at injection time |
+| Global (`project` NULL) memories of every type in every project — general-knowledge seeds filled all 5 Key Memories slots | global memories only of type `reference`/`preference` |
+| A question-only turn overwrote the project State | State changes only when the turn has commits or file changes |
+| Hot files printed as full Windows paths | file names |
+
 ## Codex CLI support (v1.16.0+)
 
 Beyond Claude Code, this also supports **OpenAI Codex CLI**. If `~/.codex` exists,
@@ -764,6 +815,8 @@ SQLite database at `~/.claude/sessions.db`:
 | `MCP_HOOKS_DISABLED` | `false` | Disable Claude Hooks |
 | `LOG_LEVEL` | `info` | Log level (debug/info/warn/error) |
 | `LOG_FILE` | - | Optional file logging path |
+| `PASSBATON_READONLY` | `false` | Read-only MCP mode — only non-mutating tools, DB opened read-only (v2.6.0) |
+| `PASSBATON_CARD_CHARS` | `3200` | Character budget for the SessionStart resume card (v2.6.0) |
 
 ---
 

@@ -11,6 +11,7 @@ import * as path from 'path';
 import Database from 'better-sqlite3';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
+import { isStillDirective } from '../utils/directive.js';
 
 interface CompactInput {
   cwd?: string;
@@ -319,13 +320,15 @@ async function main() {
 
     // 사용자 지시사항
     try {
-      const directives = db.prepare(`
-        SELECT directive, priority FROM user_directives
+      const directives = (db.prepare(`
+        SELECT directive, priority, context FROM user_directives
         WHERE project = ?
         ORDER BY CASE priority WHEN 'high' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
                  created_at DESC
-        LIMIT 10
-      `).all(project) as Array<{ directive: string; priority: string }>;
+        LIMIT 40
+      `).all(project) as Array<{ directive: string; priority: string; context: string | null }>)
+        // 저장 뒤에 규칙이 강화됐을 수 있다 — 이미 DB 에 있는 오추출도 여기서 거른다(문장 + 출처).
+        .filter(d => isStillDirective(d.directive, d.context)).slice(0, 10);
 
       if (directives.length > 0) {
         recoveryLines.push('## DIRECTIVES (MUST FOLLOW)');
