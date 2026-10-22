@@ -12,6 +12,8 @@ import Database from 'better-sqlite3';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { revalidateDirective } from '../utils/directive.js';
+import { humanText } from '../utils/human-turn.js';
+import { migrateSchema } from '../db/migrate.js';
 
 interface CompactInput {
   cwd?: string;
@@ -25,9 +27,11 @@ interface CompactInput {
 }
 
 interface HandoverContext {
-  workSummary: string;
+  /** 마지막 사람 요청(요청이지 결과가 아니다) */
+  request: string | null;
+  /** 그 요청 뒤에 Claude 의 글이 아직 없다 */
+  pending: boolean;
   activeFile: string | null;
-  pendingAction: string | null;
   keyFacts: string[];
   recentErrors: string[];
 }
@@ -82,24 +86,44 @@ function stripMarkdown(text: string): string {
  * 대화 transcript에서 구조화된 핸드오버 컨텍스트를 빌드합니다.
  */
 /**
- * transcript_path(JSONL)를 buildHandoverContext가 받는 {role, content}[] 형태로 읽는다.
+ * transcript_path(JSONL)를 buildHandoverContext가 받는 형태로 읽는다.
  * P0-2 (2026-08-10): hook은 인라인 transcript 배열을 주지 않으므로 파일에서 직접 읽는다.
  * 컴팩션 직전에만 실행되고 뒤쪽 메시지만 필요하므로 마지막 MAX_LINES 줄만 파싱한다.
+ *
+ * 2.6.1: user 줄은 **사람 요청만** 남긴다(humanText). 하네스 알림·메타 턴·컴팩션 요약·
+ *   셸 입출력·도구 결과는 버린다 — 2026-10-22 에 `<task-notification>` 이 「하던 일」 이 됐다.
+ *   assistant 줄은 글과 함께 **도구가 실제로 건드린 경로**(tool_use input.file_path)를 싣는다.
  */
-function readTranscript(transcriptPath: string): Array<{ role: string; content: string }> {
+interface TurnMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  /** assistant 의 tool_use 가 다룬 파일 — 쓰기 도구가 앞, 읽기가 뒤 */
+  toolPaths: { path: string; write: boolean }[];
+}
+
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const READ_TOOLS = new Set(['Read']);
+
+function readTranscript(transcriptPath: string): TurnMessage[] {
   const MAX_LINES = 200;
   try {
     if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
     const lines = fs.readFileSync(transcriptPath, 'utf-8').split('\n').filter(Boolean);
-    const out: Array<{ role: string; content: string }> = [];
+    const out: TurnMessage[] = [];
     for (const line of lines.slice(-MAX_LINES)) {
       try {
         const entry = JSON.parse(line);
         // Claude Code JSONL은 역할을 최상위 `type`으로 싣고, `message.role`은 없을 수 있다.
         const role = entry?.message?.role || entry?.role || entry?.type;
-        if (role !== 'user' && role !== 'assistant') continue;
+        if (role === 'user') {
+          const text = humanText(entry);
+          if (text.trim()) out.push({ role, content: text, toolPaths: [] });
+          continue;
+        }
+        if (role !== 'assistant') continue;
         const raw = entry?.message?.content ?? entry?.content;
         let content = '';
+        const toolPaths: TurnMessage['toolPaths'] = [];
         if (typeof raw === 'string') {
           content = raw;
         } else if (Array.isArray(raw)) {
@@ -107,8 +131,15 @@ function readTranscript(transcriptPath: string): Array<{ role: string; content: 
             .filter((b: { type?: string }) => b?.type === 'text')
             .map((b: { text?: string }) => b.text || '')
             .join('\n');
+          for (const b of raw as Array<{ type?: string; name?: string; input?: { file_path?: unknown; notebook_path?: unknown } }>) {
+            if (b?.type !== 'tool_use' || !b.name) continue;
+            const p = b.input?.file_path ?? b.input?.notebook_path;
+            if (typeof p !== 'string' || !p) continue;
+            if (WRITE_TOOLS.has(b.name)) toolPaths.push({ path: p, write: true });
+            else if (READ_TOOLS.has(b.name)) toolPaths.push({ path: p, write: false });
+          }
         }
-        if (content.trim()) out.push({ role, content });
+        if (content.trim() || toolPaths.length > 0) out.push({ role, content, toolPaths });
       } catch { /* 깨진 줄은 건너뛴다 */ }
     }
     return out;
@@ -117,58 +148,72 @@ function readTranscript(transcriptPath: string): Array<{ role: string; content: 
   }
 }
 
+/**
+ * 텍스트에서 잡은 파일 후보는 **실제로 있는 파일**일 때만 쓴다.
+ * `passbaton@2.6.0` 같은 패키지 이름·URL·디렉터리가 「작업 파일」 이 됐다(2026-10-22).
+ */
+function resolveTextFile(candidate: string, bases: string[]): string | null {
+  if (!candidate || candidate.includes('://') || candidate.includes('@')) return null;
+  for (const base of bases) {
+    try {
+      const abs = path.isAbsolute(candidate) ? candidate : path.resolve(base, candidate);
+      if (fs.statSync(abs).isFile()) return candidate;
+    } catch { /* 없음 */ }
+  }
+  return null;
+}
+
 function buildHandoverContext(
-  transcript: Array<{ role: string; content: string }>
+  transcript: TurnMessage[],
+  bases: string[] = [process.cwd()],
 ): HandoverContext {
   const context: HandoverContext = {
-    workSummary: '',
+    request: null,
+    pending: false,
     activeFile: null,
-    pendingAction: null,
     keyFacts: [],
     recentErrors: []
   };
 
-  const userMessages = transcript.filter(m => m.role === 'user');
-  const assistantMessages = transcript.filter(m => m.role === 'assistant');
+  const assistantMessages = transcript.filter(m => m.role === 'assistant' && m.content.trim());
 
-  // 1. workSummary: 첫 user 메시지 = 작업 요청
-  if (userMessages.length > 0) {
-    const first = userMessages[0].content;
-    // 코드블록, 테이블 제거 후 첫 의미있는 라인
-    const cleaned = first
+  // 1. request: 마지막 **사람** 요청. ⛔ 결과가 아니다 — 저장·표시 모두 「요청」 으로만 다룬다.
+  //    (2.6.0 까지는 창 안 첫 user 줄을 workSummary 로 삼아 current_state 를 덮었다)
+  let lastHuman = -1;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    if (transcript[i].role === 'user') { lastHuman = i; break; }
+  }
+  if (lastHuman >= 0) {
+    const cleaned = transcript[lastHuman].content
       .replace(/```[\s\S]*?```/g, '')
       .split('\n')
       .map(l => l.trim())
-      .filter(l => l.length > 10 && !l.startsWith('|') && !l.startsWith('---'));
-    if (cleaned.length > 0) {
-      context.workSummary = stripMarkdown(cleaned[0]).slice(0, 200);
-    }
+      .filter(l => l.length > 0 && !l.startsWith('|') && !l.startsWith('---'));
+    if (cleaned.length > 0) context.request = stripMarkdown(cleaned[0]).slice(0, 200);
+    // pending: 그 요청 **뒤에** Claude 의 글이 하나도 없을 때만. 도구 호출만 있었다면 작업 중이다.
+    //   기계 줄은 이미 빠졌으므로 「알림이 마지막 줄」 이라는 이유로 앞선 사람 요청이 미완료가 되지 않는다.
+    context.pending = !transcript.slice(lastHuman + 1).some(m => m.role === 'assistant' && m.content.trim());
   }
 
-  // 2. activeFile: 최근 메시지에서 파일 경로 추출
-  const recentAll = transcript.slice(-10);
-  for (const msg of recentAll.reverse()) {
+  // 2. activeFile: 도구가 실제로 건드린 경로가 먼저(쓰기 > 읽기, 최근 것). 없을 때만 텍스트 후보.
+  const observed = transcript.flatMap(m => m.toolPaths);
+  const pick = [...observed].reverse().find(p => p.write) ?? [...observed].reverse()[0];
+  if (pick) {
+    const exists = (() => { try { return fs.statSync(pick.path).isFile(); } catch { return false; } })();
+    context.activeFile = exists ? pick.path : `${pick.path} (deleted)`;
+  } else {
     const filePatterns = [
       /(?:file_path|파일)[:\s]*["']?([^\s"',]+\.\w{1,6})/,
       /(?:Edit|Write|Read|수정|생성|읽기)\s+.*?(\S+\.\w{1,6})/,
       /`([^`]+\.\w{1,6})`/,
     ];
-    for (const pattern of filePatterns) {
-      const match = msg.content.match(pattern);
-      if (match?.[1] && !match[1].includes('http')) {
-        context.activeFile = match[1];
-        break;
+    for (const msg of [...transcript.slice(-10)].reverse()) {
+      for (const pattern of filePatterns) {
+        const match = msg.content.match(pattern);
+        const hit = match?.[1] ? resolveTextFile(match[1], bases) : null;
+        if (hit) { context.activeFile = hit; break; }
       }
-    }
-    if (context.activeFile) break;
-  }
-
-  // 3. pendingAction: 마지막 메시지가 user면 미완료 요청
-  if (transcript.length > 0 && transcript[transcript.length - 1].role === 'user') {
-    const lastUser = transcript[transcript.length - 1].content;
-    const cleaned = stripMarkdown(lastUser.split('\n')[0] || lastUser);
-    if (cleaned.length > 5) {
-      context.pendingAction = cleaned.slice(0, 150);
+      if (context.activeFile) break;
     }
   }
 
@@ -292,27 +337,28 @@ async function main() {
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
 
-    // 핸드오버 컨텍스트 빌드
-    const handover = transcriptMessages.length > 0 ? buildHandoverContext(transcriptMessages) : null;
+    // 핸드오버 컨텍스트 빌드 — 텍스트 파일 후보는 cwd·워크스페이스 기준으로 실제 파일만
+    const handover = transcriptMessages.length > 0
+      ? buildHandoverContext(transcriptMessages, [cwd, path.dirname(path.dirname(dbPath))])
+      : null;
 
-    // active_context 업데이트 (memories에는 저장하지 않음)
-    if (handover?.workSummary) {
-      const stateStr = [
-        handover.workSummary,
-        handover.activeFile ? `file: ${handover.activeFile}` : '',
-        handover.pendingAction ? `pending: ${handover.pendingAction.slice(0, 50)}` : ''
-      ].filter(Boolean).join(' | ');
-
-      // P0-2 (2026-08-10): INSERT OR REPLACE는 명시하지 않은 컬럼(blockers/active_tasks/
-      //   recent_files)을 NULL로 날린다. 이 write는 지금까지 handover가 항상 null이라
-      //   실행된 적이 없어 드러나지 않았으므로, 되살리면서 UPSERT로 바꾼다.
-      db.prepare(`
-        INSERT INTO active_context (project, current_state, updated_at)
-        VALUES (?, ?, datetime('now'))
-        ON CONFLICT(project) DO UPDATE SET
-          current_state = excluded.current_state,
-          updated_at = excluded.updated_at
-      `).run(project, stateStr.slice(0, 300));
+    // ⛔ 2.6.1: active_context.current_state 를 **덮지 않는다.** 여기서 가진 것은 요청뿐이고
+    //   일한 증거가 없다 — 2.6.0 의 session-end 가 「이번 턴 일한 증거」 가 있을 때만 덮도록
+    //   고친 원칙이 여기엔 없어서, 하네스 알림 한 줄이 State 가 됐다(2026-10-22).
+    //   요청은 세션별 compact_handover 에 따로 두고, 같은 세션의 SessionStart(compact) 가
+    //   「요청이지 결과가 아님」 으로 표시한다.
+    if (input.session_id && handover && (handover.request || handover.activeFile)) {
+      try {
+        migrateSchema(db);
+        db.prepare(`
+          INSERT INTO compact_handover (session_id, project, request, pending, active_file, created_at)
+          VALUES (?, ?, ?, ?, ?, datetime('now'))
+          ON CONFLICT(session_id, project) DO UPDATE SET
+            request = excluded.request, pending = excluded.pending,
+            active_file = excluded.active_file, created_at = excluded.created_at
+        `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile);
+        db.prepare("DELETE FROM compact_handover WHERE created_at < datetime('now', '-14 days')").run();
+      } catch { /* 잠금 등 — 복구 줄이 없을 뿐 컴팩션은 막지 않는다 */ }
     }
 
     // === 컨텍스트 재주입: systemMessage로 반환 ===
@@ -362,9 +408,8 @@ async function main() {
     // 핸드오버 컨텍스트
     if (handover) {
       recoveryLines.push(`\n## Handover`);
-      if (handover.workSummary) recoveryLines.push(`**Working on**: ${handover.workSummary}`);
+      if (handover.request) recoveryLines.push(`**Last human request** (a request, not a result${handover.pending ? ' · no reply yet' : ''}): ${handover.request}`);
       if (handover.activeFile) recoveryLines.push(`**Active file**: ${handover.activeFile}`);
-      if (handover.pendingAction) recoveryLines.push(`**Pending**: ${handover.pendingAction}`);
       if (handover.keyFacts.length > 0) {
         recoveryLines.push('**Key facts**:');
         handover.keyFacts.forEach(f => recoveryLines.push(`- ${f}`));
@@ -419,7 +464,7 @@ async function main() {
       const errsCount = handover?.recentErrors.length || 0;
       fs.appendFileSync(
         debugLogPath,
-        `[${new Date().toISOString()}] project=${project} sid=${sid} transcript_msgs=${transcriptLen} recovery_len=${recoveryText.length} saved=${handover?.workSummary ? 'yes' : 'no'} active_file=${handover?.activeFile || 'none'} pending=${handover?.pendingAction ? 'yes' : 'no'} facts=${factsCount} errs=${errsCount} status=ok\n`
+        `[${new Date().toISOString()}] project=${project} sid=${sid} transcript_msgs=${transcriptLen} recovery_len=${recoveryText.length} saved=${handover?.request ? 'yes' : 'no'} active_file=${handover?.activeFile || 'none'} pending=${handover?.pending ? 'yes' : 'no'} facts=${factsCount} errs=${errsCount} status=ok\n`
       );
     } catch { /* ignore */ }
 

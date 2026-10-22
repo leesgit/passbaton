@@ -403,9 +403,14 @@ const MAX_DIRECTIVES = 20;
 // directive 품질 게이트는 ../utils/directive.ts — 주입 쪽(SessionStart·PreCompact)과 공유한다.
 
 function extractAndSaveDirectives(dbPath: string, project: string, prompt: string, transcriptPath?: string): void {
+  // DB 는 SessionStart 가 만든다(ensureSessionsDb). 여기서 `new Database` 로 열면 만들면 안 되는
+  // 루트에도 빈 파일이 생긴다.
+  if (!fs.existsSync(dbPath)) return;
   try {
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
+    // 2.6.1: 훅만 쓰는 설치에서는 user_directives 가 없었다 — 저장이 아래 catch 로 조용히 사라졌다.
+    migrateSchema(db);
 
     // 2.6.0: 출처 규칙 + 문장 규칙은 extractDirectives 한 곳에서.
     const extraction = extractDirectivesDetailed(prompt);

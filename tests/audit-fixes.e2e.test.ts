@@ -220,7 +220,10 @@ describe.skipIf(!built)('audit-7 2026-08-10 regression', () => {
       return lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
     }
 
-    it('reads transcript_path and persists recovery state to active_context', () => {
+    // 2.6.1 (Astra reply-139): 복구 내용은 「요청」 이지 결과가 아니다 — active_context 가 아니라
+    //   세션별 compact_handover 에 둔다. 아래 셋은 08-10 의 의도(transcript_path 를 실제로 읽는다 ·
+    //   형제 칼럼을 날리지 않는다 · 컴팩션 직후임을 밝힌다)를 새 계약으로 지킨다.
+    it('reads transcript_path and persists the handover (not active_context)', () => {
       const { ws, dbPath } = makeWorkspace();
       const tpath = path.join(ws, 'transcript.jsonl');
       fs.writeFileSync(tpath, compactTranscript());
@@ -228,17 +231,18 @@ describe.skipIf(!built)('audit-7 2026-08-10 regression', () => {
       runHook(PRE_COMPACT, { session_id: 'p02', transcript_path: tpath, cwd: ws, hook_event_name: 'PreCompact' }, ws);
 
       const db = new Database(dbPath, { readonly: true });
-      const row = db.prepare('SELECT current_state FROM active_context').get() as
-        | { current_state: string }
+      const row = db.prepare("SELECT request FROM compact_handover WHERE session_id = 'p02'").get() as
+        | { request: string }
         | undefined;
+      const state = db.prepare('SELECT current_state FROM active_context').get();
       db.close();
 
-      // Before the fix `handover` was always null, so this row never existed.
-      expect(row).toBeDefined();
-      expect(row!.current_state.length).toBeGreaterThan(0);
+      // Before the 08-10 fix `handover` was always null, so nothing was ever written.
+      expect(row?.request).toBe('pre-compact 훅이 transcript_path를 읽도록 고쳐줘');
+      expect(state).toBeUndefined();
     });
 
-    it('does not wipe sibling columns when updating active_context', () => {
+    it('leaves active_context untouched — state and sibling columns', () => {
       const { ws, dbPath } = makeWorkspace();
       const project = path.basename(ws);
       const seed = new Database(dbPath);
@@ -255,14 +259,15 @@ describe.skipIf(!built)('audit-7 2026-08-10 regression', () => {
       const row = db.prepare('SELECT current_state, blockers FROM active_context').get() as
         | { current_state: string; blockers: string | null }
         | undefined;
+      const h = db.prepare("SELECT request FROM compact_handover WHERE session_id = 'p02b'").get();
       db.close();
 
-      expect(row!.current_state).not.toBe('old state');
-      // INSERT OR REPLACE would have nulled this out.
+      expect(h).toBeDefined();
+      expect(row!.current_state).toBe('old state');
       expect(row!.blockers).toBe('DB 마이그레이션 대기중');
     });
 
-    it('labels the injected state as recovered when source=compact', () => {
+    it('labels the recovery block when source=compact, and the DB state as last recorded', () => {
       const { ws, dbPath } = makeWorkspace();
       const project = path.basename(ws);
       const db = new Database(dbPath);
@@ -271,11 +276,15 @@ describe.skipIf(!built)('audit-7 2026-08-10 regression', () => {
         '컴팩션 직전 작업 상태 요약입니다'
       );
       db.close();
+      const tpath = path.join(ws, 'transcript.jsonl');
+      fs.writeFileSync(tpath, compactTranscript());
+      runHook(PRE_COMPACT, { session_id: 'p01', transcript_path: tpath, cwd: ws }, ws);
 
-      const compactOut = runHook(SESSION_START, { cwd: ws, source: 'compact' }, ws);
-      const normalOut = runHook(SESSION_START, { cwd: ws, source: 'startup' }, ws);
+      const compactOut = runHook(SESSION_START, { cwd: ws, session_id: 'p01', source: 'compact' }, ws);
+      const normalOut = runHook(SESSION_START, { cwd: ws, session_id: 'p01', source: 'startup' }, ws);
 
       expect(compactOut).toContain('Recovered after compaction');
+      expect(compactOut).toContain('Last recorded state');
       expect(normalOut).not.toContain('Recovered after compaction');
       expect(normalOut).toContain('State');
     });

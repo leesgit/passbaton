@@ -154,6 +154,14 @@ Measured on a real 2-month workspace DB (Ashfall, 2026-10-22):
 | A question-only turn overwrote the project State | State changes only when **this turn** wrote or committed files (shell edits included) or used Edit/Write — a research-only turn leaves State as it was |
 | Hot files printed as full Windows paths | file names |
 
+### 2.6.1 — compaction recovery and hooks-only installs
+
+| Before 2.6.1 | 2.6.1 |
+|---|---|
+| PreCompact took the **first** user line in the last 200 transcript lines as "what we were doing" and wrote it into the project State — a harness `<task-notification>` became `♻️ Recovered after compaction: <task-notification>` (Ashfall, 2026-10-22) | PreCompact never touches State. It keeps the **last human request** per session (harness notifications, meta turns, compaction summaries, shell I/O and tool results are not human requests) and SessionStart(`compact`) shows it as "a request, not a result", with "no reply yet" only when no assistant text followed it. State is labelled "Last recorded state (from the last Stop, not from this compaction)" |
+| "Active file" came from the first backticked `name.ext` in recent text — `passbaton@2.6.0` became a file | paths the Edit/Write/Read tools actually touched come first (a path that no longer exists is shown as `(deleted)`); text candidates count only if the file exists under the cwd or workspace |
+| A hooks-only install (MCP server never started) had no `user_directives` table — `#기억` was silently dropped | the hooks create it (same definition as the server); UserPromptSubmit never creates `sessions.db` itself — only SessionStart does |
+
 ## Codex CLI support (v1.16.0+)
 
 Beyond Claude Code, this also supports **OpenAI Codex CLI**. If `~/.codex` exists,

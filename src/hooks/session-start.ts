@@ -108,7 +108,7 @@ function estimateTokens(text: string): number {
 // 재개 카드에 쓸 최대 글자 수. 토큰 예산(2000)과 같은 예산에서 나간다.
 const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 
-function loadContext(dbPath: string, project: string, source?: string, projectPath?: string): string | null {
+function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string): string | null {
   // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
   const card = projectPath ? buildResumeCard(projectPath, CARD_CHARS) : null;
   if (!fs.existsSync(dbPath)) {
@@ -134,13 +134,31 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
       tokenBudget -= estimateTokens(card.text);
     }
 
+    // [Priority 1a] 컴팩션 직후 — 같은 세션의 PreCompact 가 남긴 「마지막 사람 요청」.
+    //   ⛔ 2.6.1: 요청은 결과가 아니다. 2.6.0 까지는 PreCompact 가 요청 줄로 current_state 를
+    //   덮고 여기서 「Recovered」 라고 불렀다 — 하네스 알림이 그대로 「하던 일」 이 됐다.
+    if (source === 'compact' && sessionId) {
+      try {
+        const h = db.prepare('SELECT request, pending, active_file FROM compact_handover WHERE session_id = ? AND project = ?')
+          .get(sessionId, project) as { request: string | null; pending: number; active_file: string | null } | undefined;
+        if (h && (h.request || h.active_file)) {
+          const bits = ['♻️ **Recovered after compaction**'];
+          if (h.request) bits.push(`- Last human request (a request, not a result${h.pending ? ' · no reply yet' : ''}): ${h.request}`);
+          if (h.active_file) bits.push(`- Active file: ${h.active_file}`);
+          const block = bits.join('\n');
+          lines.push(block, '');
+          tokenBudget -= estimateTokens(block);
+        }
+      } catch { /* 테이블이 아직 없는 DB */ }
+    }
+
     // [Priority 1] 현재 상태
     const active = db.prepare('SELECT current_state, blockers FROM active_context WHERE project = ?').get(project) as { current_state: string; blockers: string } | undefined;
     if (active?.current_state) {
-      // P0-1: 컴팩션 직후 재시작이면 PreCompact가 저장한 복구 상태임을 밝힌다.
       // 카드가 있으면 State 는 「마지막으로 기록된 것」일 뿐이다 — 정본은 카드 쪽이다.
-      const stateLabel = source === 'compact' ? '♻️ **Recovered after compaction**'
-        : card?.anyRead ? '📍 **Last recorded state** (DB · may be stale — the resume card above wins)'
+      // 컴팩션 직후라도 이 값은 마지막 Stop 이 적은 것이지 컴팩션이 만든 것이 아니다(2.6.1).
+      const stateLabel = card?.anyRead ? '📍 **Last recorded state** (DB · may be stale — the resume card above wins)'
+        : source === 'compact' ? '📍 **Last recorded state** (DB · from the last Stop, not from this compaction)'
         : '📍 **State**';
       const stateBlock = `${stateLabel}: ${active.current_state}` + (active.blockers ? `\n🚧 **Blocker**: ${active.blockers}` : '');
       const cost = estimateTokens(stateBlock);
@@ -532,7 +550,7 @@ async function main() {
     ensureSessionsDb(resolvedRoot);
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
-    const context = loadContext(dbPath, project, input.source, found?.dir);
+    const context = loadContext(dbPath, project, input.source, found?.dir, input.session_id);
 
     // 주입 결과는 별도 줄. injected 는 **문자 수**다 (토큰 아님 — 예산은 2000 토큰이고
     // 한글은 문자당 토큰이 더 든다. 대략 len/4 보다 나쁘다).

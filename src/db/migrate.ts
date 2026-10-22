@@ -106,11 +106,39 @@ const TABLES: string[] = [
      head_baseline TEXT,
      PRIMARY KEY (session_id, project, root)
    )`,
+
+  // ★ 2.6.1: 훅만 쓰는 설치(MCP 서버가 한 번도 안 뜬 DB)에서는 이 테이블이 없어서
+  //   UserPromptSubmit 의 지시 저장이 조용히 던지고 사라졌다(2.6.0 이전부터).
+  //   정의는 index.ts 와 같다 — 서버가 나중에 떠도 IF NOT EXISTS 라 그대로 쓴다.
+  `CREATE TABLE IF NOT EXISTS user_directives (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     project TEXT NOT NULL,
+     directive TEXT NOT NULL,
+     context TEXT,
+     source TEXT DEFAULT 'explicit',
+     priority TEXT DEFAULT 'normal',
+     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+     UNIQUE(project, directive)
+   )`,
+
+  // 2.6.1: 컴팩션 직전의 「마지막 사람 요청」. **요청이지 결과가 아니다** — 그래서
+  //   active_context.current_state 에 섞지 않는다. PreCompact 가 적고, 같은 세션의
+  //   SessionStart(source=compact) 가 읽는다.
+  `CREATE TABLE IF NOT EXISTS compact_handover (
+     session_id TEXT NOT NULL,
+     project TEXT NOT NULL,
+     request TEXT,
+     pending INTEGER NOT NULL DEFAULT 0,
+     active_file TEXT,
+     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (session_id, project)
+   )`,
 ];
 
 const INDEXES = [
   'CREATE INDEX IF NOT EXISTS idx_sessions_turn ON sessions(project, session_id, prompt_id)',
   'CREATE INDEX IF NOT EXISTS idx_session_files_lookup ON session_files(session_id, project)',
+  'CREATE INDEX IF NOT EXISTS idx_directives_project ON user_directives(project)',
 ];
 
 /**

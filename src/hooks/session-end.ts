@@ -21,6 +21,7 @@ import { detectWorkspaceRoot, isEphemeralRoot, resolveWorkspaceRoot } from '../u
 import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
+import { humanText } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
 import { readWorkspaceDeclaration, scanArtifacts } from '../utils/workspace-config.js';
 
@@ -243,51 +244,8 @@ function extractNextTasks(content: string): string[] {
   return nextTasks;
 }
 
-/**
- * 사용자 메시지를 유효한 요청인지 필터링
- */
-function parseUserText(entry: { type?: string; isMeta?: boolean; message?: { content?: unknown } }): string {
-  // 슬래시 커맨드 확장으로 주입된 메타 턴은 사용자 요청이 아님
-  // (예: "# /work - 프로젝트 작업 메인 명령어 (v2)…" 커맨드 본문 전체가 여기 들어옴)
-  if (entry.isMeta === true) return '';
-
-  const content = entry.message?.content;
-  let text = '';
-  if (typeof content === 'string') {
-    text = content;
-  } else if (Array.isArray(content)) {
-    text = (content as Array<{ type: string; text?: string }>)
-      .filter(b => b.type === 'text')
-      .map(b => b.text || '')
-      .join('\n');
-  }
-
-  // 슬래시 커맨드 실행 시 실제 사용자 요청은 <command-args> 안에 있음 → 삭제 말고 추출
-  const argsMatch = text.match(/<command-args>([\s\S]*?)<\/command-args>/);
-  if (argsMatch && argsMatch[1].trim().length >= 3) {
-    return argsMatch[1].trim();
-  }
-
-  // system-reminder, local-command 태그 제거
-  text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
-  // Codex support (2026-07-09): Codex injects <environment_context> into the first user message -> strip it
-  text = text.replace(/<environment_context>[\s\S]*?<\/environment_context>/g, '').trim();
-  // Gemini support (2026-07-10): Gemini injects <session_context> into the first user message -> strip it
-  text = text.replace(/<session_context>[\s\S]*?<\/session_context>/g, '').trim();
-  text = text.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, '').trim();
-  text = text.replace(/<command-name>[\s\S]*?<\/command-name>/g, '').trim();
-  text = text.replace(/<command-message>[\s\S]*?<\/command-message>/g, '').trim();
-  text = text.replace(/<command-args>[\s\S]*?<\/command-args>/g, '').trim();
-  text = text.replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, '').trim();
-  if (text.length < 5) return '';
-
-  // 시스템/메타 메시지 스킵
-  if (text.startsWith('[Request interrupted')) return '';
-  if (text.startsWith('This session is being continued')) return '';
-  if (text.startsWith('No response requested')) return '';
-
-  return text;
-}
+// 사람 요청 판별은 ../utils/human-turn.ts — PreCompact 와 같은 규칙을 쓴다(2.6.1).
+const parseUserText = humanText;
 
 /**
  * 메시지 content에서 텍스트 추출 (assistant/human 공통)
