@@ -161,6 +161,14 @@ describe.skipIf(!built)('PB148-20 Stop 중복 억제 = 같은 이벤트 재전�
     expect(rows(b.dbPath)).toHaveLength(1);
   });
 
+  it('호스트 턴 id 가 세션마다 다시 세는 값이어도(turn-1) 다른 세션은 둘 — 판정은 세션 안에서만', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 'A' });
+    hook(SESSION_END, ws, { cwd: proj, session_id: 'A', turn_id: 'turn-1', transcript_path: transcript(ws, 'a.jsonl', ['지도 화면 봐줘']) });
+    hook(SESSION_END, ws, { cwd: proj, session_id: 'B', turn_id: 'turn-1', transcript_path: transcript(ws, 'b.jsonl', ['상점 정렬 고쳐줘']) });
+    expect(rows(dbPath).map(x => x.session_id)).toEqual(['A', 'B']);
+  });
+
   it('호스트가 턴 식별자를 주면 그것이 정체성 — 다른 id 는 둘 · 같은 id 재전달은 하나', () => {
     const { ws, proj, dbPath } = workspace();
     hook(SESSION_START, ws, { cwd: proj, session_id: 'A' });
