@@ -730,6 +730,10 @@ describe('PB144 — 창 안 판독 공백 · 인용 뒤 질문 · 불확실한 �
     const s2 = snapshotHandover([{ uuid: 'u0', ...human(inline) }], [process.cwd()]);
     expect(s1.handover?.request).toBe('이 오류를 설명해줘');
     expect(s2.handover?.request).toBe('이 태그를 설명해줘: <bash-stdout>오류 내용</bash-stdout>');
+    // 맨 앞 블록이 여럿이어도 전부 건너뛰고 질문을 고른다(reply-145 PB145-01)
+    const multi = '<bash-input>ls</bash-input>\n<bash-stdout>a.txt</bash-stdout>\n<bash-stderr>warn</bash-stderr>\n이 파일 뭐야';
+    const s3 = snapshotHandover([{ uuid: 'u0', ...human(multi) }], [process.cwd()]);
+    expect(s3.handover?.request).toBe('이 파일 뭐야');
   });
 
   it('PB144-03 마지막 요청 뒤의 닫히지 않은 봉투는 옛 A 를 「마지막 요청」 으로 올리지 않는다 · 코드 펜스 인용은 사람 글', () => {
