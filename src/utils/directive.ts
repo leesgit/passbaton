@@ -62,11 +62,11 @@ export function isDirectiveSource(prompt: string | null | undefined): boolean {
  *   - 끝나지 않은 문장(주제·목적 조사 「은·는·을·를·및」 로 끝남) — 「로·으로·과·의」 는
  *     「한국어로」 「결과」 처럼 명사 끝과 겹쳐서 넣지 않는다
  */
-export function isValidDirective(raw: string): boolean {
+export function isValidDirective(raw: string, maxLen = 120): boolean {
   const d = raw.trim();
   const hangul = /[가-힣]/.test(d);
   if (d.length < (hangul ? 5 : 10)) return false;                     // 제목·조각
-  if (d.length > 120) return false;                                   // run-on 캡처
+  if (d.length > maxLen) return false;                                // run-on 캡처
   if (d.includes('\\n')) return false;                                // 잘린 문서 본문
   if (/[?？]\s*$/.test(d)) return false;                              // 질문
   if (/(?:는가|은가|인가|있나|없나|할까|일까|나요|까요|습니까|입니까)[.。!]?\s*$/.test(d)) return false;
@@ -92,10 +92,11 @@ export function isValidDirective(raw: string): boolean {
  * 「Never delete X」 가 「delete X」 가 되고, 「테스트는 반드시 돌려」 가 「돌려」 가 된다.
  */
 export const DIRECTIVE_PATTERNS: Array<{ pattern: RegExp; priority: 'high' | 'normal'; line?: boolean; explicit?: boolean }> = [
+  // 순서가 의미다: 명시 표지 → 금지·의무 줄 → 콜론 패턴. 한 줄은 먼저 잡은 패턴이 가진다.
+  { pattern: /#(?:기억|remember)\s+(.+)/i, priority: 'normal', explicit: true },
   { pattern: /(?:절대|never)\s+\S/i, priority: 'high', line: true },
   { pattern: /(?:항상|always)\s+\S/i, priority: 'high', line: true },
   { pattern: /(?:반드시|must)\s+\S/i, priority: 'high', line: true },
-  { pattern: /#(?:기억|remember)\s+(.+)/i, priority: 'normal', explicit: true },
   // 「중요 인물 승격 진행해줘」 → 「인물 승격 진행해줘」 같은 오탐 — 콜론이 있을 때만.
   { pattern: /(?:important|중요)\s*[:：]\s*(.+)/i, priority: 'normal' },
   { pattern: /(?:rule|규칙)\s*[:：]\s*(.+)/i, priority: 'normal' },
@@ -114,20 +115,31 @@ export function extractDirectives(prompt: string): ExtractedDirective[] {
   if (scope === 'none') return [];
   const out: ExtractedDirective[] = [];
   const lines = prompt.split(/\r?\n/);
+  // ★ 한 줄은 한 번만 쓴다. 「Never follow this rule: Delete production data」 에서 줄 전체(금지)와
+  //   rule 패턴의 뒷부분(「Delete production data」 — 반대 의미)이 둘 다 저장됐다(reply-135 B4).
+  //   줄 패턴이 배열 앞에 있으므로 금지·의무 줄이 먼저 자리를 차지한다.
+  const usedLines = new Set<number>();
+  let offset = 0;
+  const lineStart: number[] = lines.map(l => { const s = offset; offset += l.length + 1; return s; });
 
   for (const { pattern, priority, line, explicit } of DIRECTIVE_PATTERNS) {
     if (scope === 'explicit' && !explicit) continue;
-    for (const l of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      if (usedLines.has(i)) continue;
+      const l = lines[i];
       const m = l.match(pattern);
       if (!m) continue;
-      const directive = (line ? l : (m[1] ?? '')).trim().slice(0, 200);
-      if (!isValidDirective(directive)) continue;
+      // 자르지 않는다 — 잘린 메모는 틀린 메모다. 상한을 넘으면 저장하지 않는다.
+      // 명시 표지는 사람이 「이건 기억해」 라고 한 것 — 더 길게(200 자) 받는다.
+      const directive = (line ? l : (m[1] ?? '')).trim();
+      if (!isValidDirective(directive, explicit ? 200 : 120)) continue;
       if (out.some(o => o.directive === directive)) continue;
-      // 명시 표지 행은 표지부터 저장한다 — 300 자 뒤에 있어도 재주입 때 다시 찾을 수 있게.
+      // 명시 표지 행은 **표지 위치부터** 저장한다 — 줄 안에서 300 자 뒤에 있어도 재주입 때 다시 찾게.
       const ctx = explicit
-        ? prompt.slice(prompt.indexOf(l), prompt.indexOf(l) + CONTEXT_CHARS)
+        ? prompt.slice(lineStart[i] + (m.index ?? 0), lineStart[i] + (m.index ?? 0) + CONTEXT_CHARS)
         : prompt.slice(0, CONTEXT_CHARS);
       out.push({ directive, priority, context: ctx });
+      usedLines.add(i);
       break;   // 패턴마다 한 줄 — 예전 동작(첫 일치)과 같은 양
     }
   }

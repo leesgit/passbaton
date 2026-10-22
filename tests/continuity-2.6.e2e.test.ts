@@ -585,3 +585,180 @@ describe.skipIf(!built)('MCP 읽기 전용 모드 (PASSBATON_READONLY)', () => {
     expect(fs.existsSync(path.join(ws, '.claude'))).toBe(false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reply-135(재판정 NO-GO) 반례 — PB135-01~04
+
+describe('PB135-01 지시문 저장·재주입 일치', () => {
+  it('같은 줄 안에서 300 자 뒤의 #기억 — 표지부터 context 를 저장하고 다시 찾는다', () => {
+    const prompt = '가'.repeat(320) + ' #기억 항상 답변은 한국어로';
+    const got = extractDirectives(prompt);
+    expect(got.map(d => d.directive)).toEqual(['항상 답변은 한국어로']);
+    expect(got[0].context.startsWith('#기억')).toBe(true);
+    expect(revalidateDirective(got[0].directive, got[0].context)).toBe('항상 답변은 한국어로');
+  });
+
+  it('겹친 패턴이 반대 의미의 조각을 만들지 않는다 — 한 줄은 한 번만', () => {
+    const got = extractDirectives('Never follow this rule: Delete production data').map(d => d.directive);
+    expect(got).toEqual(['Never follow this rule: Delete production data']);
+    expect(got).not.toContain('Delete production data');
+  });
+
+  it('명시 표지는 200 자까지 받는다 · 그보다 길면 저장하지 않는다', () => {
+    expect(extractDirectives('#기억 ' + '서버 설정 메모 '.repeat(15)).length).toBe(1);   // ~135 자
+    expect(extractDirectives('#기억 ' + '서버 설정 메모 '.repeat(30)).length).toBe(0);   // ~270 자
+  });
+});
+
+describe('PB135-02 카드 경계 완결', () => {
+  it('예산은 카드 전체의 상한이다 — 원천 8 · 긴 label · 많은 invalid 에서도', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    const srcs: unknown[] = [];
+    for (let i = 0; i < 8; i++) {
+      fs.writeFileSync(path.join(p, `h${i}.md`), `# 절 ${i}\n` + '본문 줄\n'.repeat(50));
+      srcs.push({ path: `h${i}.md`, lines: 50, label: 'L'.repeat(80) });
+    }
+    for (let i = 0; i < 6; i++) srcs.push({ path: '' });            // invalid
+    writeCardConfig(p, srcs);
+    for (const budget of [400, 1000, 3200]) {
+      const card = buildResumeCard(p, budget)!;
+      expect(card.text.length).toBeLessThanOrEqual(budget);
+    }
+    // 상한을 지키느라 발췌를 다 버리면 안 된다 — 넉넉한 예산에서는 본문이 남는다
+    const roomy = buildResumeCard(p, 3200)!;
+    expect(roomy.anyRead).toBe(true);
+    expect(roomy.text).toContain('본문 줄');            // 출력 글에 본문이 실제로 있다
+  });
+
+  it('범위에 본문이 있어도 예산 안에 보인 것이 공백뿐이면 읽은 것이 아니다', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    fs.writeFileSync(path.join(p, 'H.md'), '\n'.repeat(300) + 'BODY');
+    writeCardConfig(p, [{ path: 'H.md', lines: 200 }]);
+    fs.writeFileSync(path.join(p, 'H.md'), ' \n'.repeat(190) + 'BODY');
+    const card = buildResumeCard(p, 400)!;
+    expect(card.anyRead).toBe(false);
+    expect(card.items[0].outcome).toBe('empty');
+    expect(card.text).toContain('NOT READ');
+  });
+
+  it('링크의 실제 대상도 텍스트여야 한다 (alias.md → data.sqlite)', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    fs.writeFileSync(path.join(p, 'data.sqlite'), 'SQLITE BYTES');
+    try {
+      fs.symlinkSync(path.join(p, 'data.sqlite'), path.join(p, 'alias.md'), 'file');
+    } catch {
+      return;   // Windows 개발자 모드 없이 파일 심볼릭 링크 불가 — 리눅스·맥 CI 가 본다
+    }
+    writeCardConfig(p, [{ path: 'alias.md', lines: 5 }]);
+    const card = buildResumeCard(p, 1000)!;
+    expect(card.items[0]).toMatchObject({ outcome: 'denied', why: 'link target is not a text source' });
+    expect(card.text).not.toContain('SQLITE BYTES');
+  });
+
+  it('설정 파일 크기 상한 · 오류문에 원문 조각이 없다', () => {
+    const p = tmp('pb-card-');
+    fs.mkdirSync(path.join(p, '.claude'));
+    fs.writeFileSync(path.join(p, '.claude', 'passbaton.config.json'), '{"continuity": SECRET_TOKEN_abc');
+    const card = buildResumeCard(p, 1000)!;
+    expect(card.invalid).toEqual(['.claude/passbaton.config.json is not valid JSON']);
+    expect(card.text).not.toContain('SECRET_TOKEN');
+    fs.writeFileSync(path.join(p, '.claude', 'passbaton.config.json'), JSON.stringify({ pad: 'x'.repeat(70 * 1024) }));
+    expect(buildResumeCard(p, 1000)!.invalid[0]).toContain('larger than');
+  });
+});
+
+describe.skipIf(!built)('PB135-03 격리 → 사람이 되살림 → 주입', () => {
+  it('unverified 를 떼고 원래 종류·중요도로 되돌리면 주입된다 · 떼지 않으면 계속 빠진다', () => {
+    const { ws, proj, dbPath } = monorepo('game');
+    const db = new Database(dbPath);
+    db.prepare('INSERT INTO memories (content, memory_type, tags, project, importance) VALUES (?, ?, ?, ?, ?)')
+      .run('청크 로더는 WAL 모드로 연다 (사람이 확인한 결정)', 'decision', '["auto-extracted","perf"]', 'game', 7);
+    db.close();
+    expect(sessionStart(proj, ws)).not.toContain('청크 로더는 WAL');          // 격리됨
+
+    const db2 = new Database(dbPath);
+    const row = db2.prepare("SELECT id, tags, metadata FROM memories WHERE content LIKE '청크 로더는 WAL%'").get() as { id: number; tags: string; metadata: string };
+    const q = JSON.parse(row.metadata).quarantine;
+    // 사람의 승격: unverified 만 떼고, metadata 의 원래 값으로 되돌린다(quarantined-2.6 은 남김)
+    const restoredTags = JSON.stringify((JSON.parse(row.tags) as string[]).filter(t => t !== 'unverified'));
+    db2.prepare('UPDATE memories SET tags = ?, memory_type = ?, importance = ? WHERE id = ?').run(restoredTags, q.from_type, q.from_importance, row.id);
+    db2.close();
+
+    const out = sessionStart(proj, ws);
+    expect(out).toContain('청크 로더는 WAL');                                  // 주입됨
+    const db3 = new Database(dbPath, { readonly: true });
+    const after = db3.prepare('SELECT memory_type, importance FROM memories WHERE id = ?').get(row.id);
+    db3.close();
+    expect(after).toEqual({ memory_type: 'decision', importance: 7 });          // 다시 격리 안 됨
+  });
+});
+
+describe.skipIf(!built || spawnSync('git', ['--version']).status !== 0)('PB135-04 State 턴 경계', () => {
+  function gitWs(): string {
+    const ws = tmp('pb-st-');
+    const git = (...a: string[]) => spawnSync('git', a, { cwd: ws, encoding: 'utf-8', windowsHide: true });
+    git('init', '-q'); git('config', 'user.email', 't@e.com'); git('config', 'user.name', 't'); git('config', 'commit.gpgsign', 'false');
+    fs.writeFileSync(path.join(ws, 'tracked.txt'), 'original\n');
+    git('add', '-A'); git('commit', '-q', '-m', 'init');
+    fs.mkdirSync(path.join(ws, '.claude'));
+    const db = new Database(path.join(ws, '.claude', 'sessions.db'));
+    db.exec(SCHEMA);
+    db.prepare('INSERT INTO active_context (project, current_state) VALUES (?, ?)').run(path.basename(ws), 'PRIOR STATE');
+    db.close();
+    return ws;
+  }
+  function turn(ws: string, sid: string, pid: string, request: string, answer: string, work?: () => void): string | undefined {
+    hook(USER_PROMPT, ws, { cwd: ws, session_id: sid, prompt_id: pid, prompt: request });
+    work?.();
+    const tdir = tmp('pb-tr-');                       // 트랜스크립트는 워크스페이스 밖
+    const tpath = path.join(tdir, 't.jsonl');
+    fs.writeFileSync(tpath, [{ type: 'user', message: { content: request } }, { type: 'assistant', message: { content: answer } }]
+      .map(l => JSON.stringify(l)).join('\n') + '\n');
+    hook(SESSION_END, ws, { cwd: ws, session_id: sid, prompt_id: pid, transcript_path: tpath, last_assistant_message: answer });
+    const db = new Database(path.join(ws, '.claude', 'sessions.db'), { readonly: true });
+    const r = db.prepare('SELECT current_state FROM active_context WHERE project = ?').get(path.basename(ws)) as { current_state: string } | undefined;
+    db.close();
+    return r?.current_state;
+  }
+
+  it('이번 턴의 셸 편집은 State 에 반영된다', () => {
+    const ws = gitWs();
+    const st = turn(ws, 's1', 'p1', '설정 파일 고쳐줘', '구현 완료 — 설정 파일의 포트를 8443 으로 바꿨습니다.',
+      () => fs.writeFileSync(path.join(ws, 'tracked.txt'), 'changed by shell\n'));
+    expect(st).not.toBe('PRIOR STATE');
+  });
+
+  it('같은 세션: 편집한 턴 뒤의 질문 턴은 State 를 바꾸지 않는다', () => {
+    const ws = gitWs();
+    const st1 = turn(ws, 's1', 'p1', '설정 파일 고쳐줘', '구현 완료 — 설정 파일의 포트를 8443 으로 바꿨습니다.',
+      () => fs.writeFileSync(path.join(ws, 'tracked.txt'), 'changed by shell\n'));
+    expect(st1).not.toBe('PRIOR STATE');
+    const st2 = turn(ws, 's1', 'p2', '지금 몇 시야?', '지금은 오후 3 시입니다. 작업은 하지 않았습니다.');
+    expect(st2).toBe(st1);
+  });
+});
+
+describe.skipIf(!built)('PB135-04 읽기 전용 · DB 가 없다는 것을 알린다', () => {
+  it('빈 메모리 DB 의 결과에는 「기록 없음」 안내가 붙는다 · 카드는 그대로 읽힌다', () => {
+    const ws = tmp('pb-ro-none-');
+    const proj = path.join(ws, 'apps', 'game');
+    fs.mkdirSync(path.join(proj, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(proj, 'docs', 'HANDOFF.md'), '# 최신\n- 다음: X\n');
+    writeCardConfig(proj, [{ path: 'docs/HANDOFF.md', lines: 5 }]);
+    const msgs = [
+      { jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } } },
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'memory_search', arguments: { query: 'x', project: 'game' } } },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'resume_card', arguments: { project: 'game' } } },
+    ];
+    const r = spawnSync('node', [SERVER], { input: msgs.map(m => JSON.stringify(m)).join('\n') + '\n', encoding: 'utf-8', env: { ...process.env, WORKSPACE_ROOT: ws, PASSBATON_READONLY: '1' }, timeout: 60000 });
+    const out = r.stdout.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+    expect(out.find(m => m.id === 1).result.content[0].text).toContain('No passbaton database');
+    const card = out.find(m => m.id === 2).result.content.map((c: { text: string }) => c.text).join('\n');
+    expect(card).toContain('다음: X');
+    expect(card).not.toContain('No passbaton database');
+    expect(fs.existsSync(path.join(ws, '.claude'))).toBe(false);
+  });
+});

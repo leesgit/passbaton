@@ -2487,7 +2487,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true
     };
   }
-  return handleTool(request.params.name, request.params.arguments || {});
+  const result = await handleTool(request.params.name, request.params.arguments || {});
+  // 읽기 전용인데 DB 파일이 없으면 빈 메모리 DB 를 본다 — 「찾은 게 없음」 과 「기록 자체가 없음」 을
+  // 구분해 알린다(reply-135). 재개 카드는 레포 파일을 읽으므로 그대로 쓸모가 있다.
+  if (READONLY && !READONLY_DB && request.params.name !== 'resume_card') {
+    result.content = [
+      { type: 'text', text: `⚠ No passbaton database at ${DB_PATH} — this read-only server is answering from an empty in-memory DB. Empty results mean "nothing recorded here", not "nothing matched".` },
+      ...(result.content ?? []),
+    ];
+  }
+  return result;
 });
 
 // ===== Prompts 핸들러 (자동 주입) =====

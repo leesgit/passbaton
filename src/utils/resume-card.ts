@@ -80,6 +80,9 @@ const MAX_LINES = 200;
 const MAX_BLOCK_LINES = 120;
 const MAX_SOURCES = 8;
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
+const MAX_CONFIG_BYTES = 64 * 1024;
+/** 원천 하나의 머리글·펜스 몫(대략). 예산을 원천 수로 나눌 때 뺀다. */
+const HEADER_RESERVE = 140;
 const MIN_CARD_CHARS = 400;
 const MAX_CARD_CHARS = 20000;
 
@@ -100,16 +103,21 @@ export function readContinuityDeclaration(projectPath: string): ContinuityDeclar
 
   let text: string;
   try {
+    if (!fs.statSync(file).isFile()) return out;
+    if (fs.statSync(file).size > MAX_CONFIG_BYTES) {
+      out.invalid.push(`.claude/passbaton.config.json is larger than ${MAX_CONFIG_BYTES >> 10} KB — ignored`);
+      return out;
+    }
     text = fs.readFileSync(file, 'utf-8');
   } catch {
     return out;                                    // 파일 없음 = 선언 없음
   }
   let raw: unknown;
   try {
-    raw = JSON.parse(text.replace(/^﻿/, ''));
-  } catch (e) {
-    // 깨진 설정을 「선언 없음」 으로 숨기지 않는다.
-    out.invalid.push(`.claude/passbaton.config.json is not valid JSON (${e instanceof Error ? e.message.slice(0, 80) : 'parse error'})`);
+    raw = JSON.parse(text.replace(/^\uFEFF/, ''));
+  } catch {
+    // 깨진 설정을 「선언 없음」 으로 숨기지 않는다. 파서 메시지는 원문 조각을 담을 수 있어 쓰지 않는다.
+    out.invalid.push('.claude/passbaton.config.json is not valid JSON');
     return out;
   }
 
@@ -168,6 +176,7 @@ function denyReason(projectPath: string, rel: string): { abs?: string; why?: str
   if (!inside(real, base)) return { why: 'link points outside the project' };
   const realSegs = path.relative(base, real).split(/[\\/]/);
   if (realSegs.some(s => DENY_SEGMENT.test(s))) return { why: 'link target looks like a secret — not read' };
+  if (!TEXT_EXT.has(path.extname(real).toLowerCase())) return { why: 'link target is not a text source' };
   try {
     if (!fs.statSync(real).isFile()) return { why: 'not a regular file' };
   } catch { return { why: 'unreadable' }; }
@@ -195,7 +204,7 @@ function readHead(abs: string, maxBytes: number): { text: string; partial: boole
 }
 
 function splitLines(text: string): string[] {
-  const lines = text.replace(/^﻿/, '').split(/\r?\n/);
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/);
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();   // 끝 개행은 줄이 아니다
   return lines;
 }
@@ -305,9 +314,14 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
     break;
   }
 
+  const excerpt = kept.join('\n');
+  if (!excerpt.trim()) {
+    // 범위에는 본문이 있는데 예산 안에 보인 것이 공백뿐 — 읽었다고 하면 안 된다.
+    return { ...base, outcome: 'empty', why: 'nothing but blank lines fits in the card budget', from, to, totalLines: lines.length, partialFile: partial, sha };
+  }
   return {
     ...base, outcome: 'ok', from, to, shownTo, totalLines: lines.length, partialFile: partial,
-    sha, excerpt: kept.join('\n'), truncated, matches,
+    sha, excerpt, truncated, matches,
   };
 }
 
@@ -330,27 +344,50 @@ export function buildResumeCard(projectPath: string, maxChars: number): ResumeCa
   if (decl.sources.length === 0 && decl.invalid.length === 0) return null;
 
   const budget = clampCardChars(maxChars, 3200);
-  // 원천마다 고르게 · 전체 예산을 넘지 않는다(머리글 몫으로 원천당 ~120 자를 뺀다)
-  const per = Math.max(120, Math.floor((budget - 120 * decl.sources.length) / Math.max(1, decl.sources.length)));
-  const items = decl.sources.map(s => readSource(projectPath, s, per));
-  const anyRead = items.some(i => i.outcome === 'ok');
+  // ★ 예산은 카드 **전체**(머리글·펜스·경고 포함)의 상한이다(reply-135 B5).
+  //   원천이 예산에 비해 많으면 뒤쪽 원천을 빼고 그렇다고 적는다 — 원천당 최소 몫을 보장하느라
+  //   상한을 넘기지 않는다.
+  const fit = Math.max(1, Math.floor(budget / (HEADER_RESERVE + 200)));
+  const sources = decl.sources.slice(0, fit);
+  const invalid = [...decl.invalid];
+  for (const s of decl.sources.slice(fit)) invalid.push(`${s.path}: dropped — card budget ${budget} fits ${fit} source(s)`);
 
-  const out: string[] = [anyRead
-    ? '## Resume card — repo source of truth (read this before the DB summary below)'
-    : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)'];
-  for (const it of items) {
-    if (it.outcome === 'ok') {
-      const total = `of ${it.totalLines}${it.partialFile ? '+' : ''}`;
-      const bits = [`sha1 ${it.sha}`];
-      if (it.truncated) bits.push(`truncated — shown to line ${it.shownTo}`);
-      if (it.matches && it.matches > 1) bits.push(`${it.matches} matches for "${(decl.sources.find(s => s.path === it.path)?.block ?? '').slice(0, 30)}" — first heading/item used`);
-      out.push(`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`);
-      const fence = fenceFor(it.excerpt ?? '');
-      out.push(fence, it.excerpt ?? '', fence);
-    } else {
-      out.push(`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`);
+  const render = (per: number) => {
+    const items = sources.map(s => readSource(projectPath, s, per));
+    const anyRead = items.some(i => i.outcome === 'ok');
+    const out: string[] = [anyRead
+      ? '## Resume card — repo source of truth (read this before the DB summary below)'
+      : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)'];
+    for (const it of items) {
+      if (it.outcome === 'ok') {
+        const total = `of ${it.totalLines}${it.partialFile ? '+' : ''}`;
+        const bits = [`sha1 ${it.sha}`];
+        if (it.truncated) bits.push(`truncated — shown to line ${it.shownTo}`);
+        if (it.matches && it.matches > 1) bits.push(`${it.matches} matches — first heading/item used`);
+        out.push(`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`);
+        const fence = fenceFor(it.excerpt ?? '');
+        out.push(fence, it.excerpt ?? '', fence);
+      } else {
+        out.push(`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`);
+      }
     }
+    if (invalid.length) {
+      const shown = invalid.slice(0, 4).map(s => s.slice(0, 100));
+      out.push(`⚠ ignored continuity entries: ${shown.join(', ')}${invalid.length > 4 ? ` … +${invalid.length - 4}` : ''}`);
+    }
+    return { text: out.join('\n'), items, anyRead };
+  };
+
+  let per = Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
+  let card = render(per);
+  for (let k = 0; k < 4 && card.text.length > budget && per > 60; k++) {
+    per = Math.max(60, Math.floor(per * budget / card.text.length) - 20);
+    card = render(per);
   }
-  if (decl.invalid.length) out.push(`⚠ ignored continuity entries: ${decl.invalid.join(', ')}`);
-  return { text: out.join('\n'), items, invalid: decl.invalid, anyRead };
+  if (card.text.length > budget) {
+    // 마지막 안전장치 — 머리글만으로도 넘치는 경우. 발췌를 버리고 머리글만 남긴다.
+    const heads = card.text.split('\n').filter(l => l.startsWith('#') || l.startsWith('⚠'));
+    card = { ...card, text: heads.join('\n').slice(0, budget) };
+  }
+  return { text: card.text, items: card.items, invalid, anyRead: card.anyRead };
 }

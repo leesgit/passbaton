@@ -123,13 +123,19 @@ excerpts of them first**, each with its line range and a content hash:
 - Files are re-read on every start (never cached). A source that cannot be read is shown as **NOT READ**, never silently dropped
 - When a card is present the DB state is relabelled *Last recorded state (may be stale)*
 - The same card is available as the read-only MCP tool `resume_card`, so another agent can read it too
+- **Boundaries** — the real path (after links/junctions) must stay inside the project; regular text files only
+  (`.md` `.markdown` `.txt` `.rst` or no extension, checked on the link target too); at most the first 2 MB is read;
+  at most 8 sources. Names that usually hold secrets are never read even if declared: any path segment matching
+  `.env*`, `.git`, `.ssh`, `.aws`, `.gnupg`, `.npmrc`, `.netrc`, `id_*`, `credentials*`, `secret(s)*`, `*.pem`, `*.key`, `*.pfx` …
+  (so `docs/credentials-guide.md` is refused; `docs/secret-sauce.md` is not — rename rather than weaken the rule)
+- `PASSBATON_CARD_CHARS` (default 3200, 400–20000) caps the **whole** card, headings included
 
 ## Read-only MCP mode (v2.6.0+)
 
 `PASSBATON_READONLY=1` exposes only tools that do not change state (`resume_card`, `session_history`,
 `search_sessions`, `memory_search`, `memory_get`, …) and opens an existing DB with SQLite's own
 read-only flag, so a missed write path fails loudly instead of writing. Access counters and the
-embedding cache are not updated in this mode. Use it to share one memory/session ledger with a second
+embedding cache are not updated, the embedding model is not loaded (keyword search only), and prompts are not listed. If the DB file does not exist the server answers from an empty in-memory DB, creates nothing on disk, and says so in every result. Use it to share one memory/session ledger with a second
 agent (e.g. Codex) without letting it edit:
 
 ```bash
@@ -142,10 +148,10 @@ Measured on a real 2-month workspace DB (Ashfall, 2026-10-22):
 
 | Before 2.6.0 | 2.6.0 |
 |---|---|
-| Regex-extracted "decisions" (`instead of …` + 60 chars) stored as `decision`/7 and injected — 146 of 146 were sentence fragments, none ever looked up | stored as `observation`/2 + `unverified`, not injected; old rows are quarantined (tagged, not deleted) |
-| Directives taken from any user turn — 37 of 40 came from `<task-notification>` results, loop prompts and packets sent to other agents | only from human messages under 300 chars (or anything marked `#기억`/`#remember`); old rows are re-checked against the current rules at injection time |
+| Regex-extracted "decisions" (`instead of …` + 60 chars) stored as `decision`/7 and injected — 146 of 146 were sentence fragments, none ever looked up | stored as `observation`/2 + `unverified`, not injected; old rows are quarantined — tags kept, `unverified`+`quarantined-2.6` appended, original type/importance saved in `metadata.quarantine`. To promote one you checked: remove `unverified`, restore type/importance from `metadata.quarantine`, keep `quarantined-2.6` |
+| Directives taken from any user turn — 37 of 40 came from `<task-notification>` results, loop prompts and packets sent to other agents; `Never delete X` was stored as `delete X` | only from human messages under 300 chars — in longer messages only the phrase after `#기억`/`#remember` (≤ 200 chars, never truncated); never/always/must keep the whole line; one line yields one directive; old rows are re-checked against the current rules at injection time |
 | Global (`project` NULL) memories of every type in every project — general-knowledge seeds filled all 5 Key Memories slots | global memories only of type `reference`/`preference` |
-| A question-only turn overwrote the project State | State changes only when the turn has commits or file changes |
+| A question-only turn overwrote the project State | State changes only when **this turn** wrote or committed files (shell edits included) or used Edit/Write — a research-only turn leaves State as it was |
 | Hot files printed as full Windows paths | file names |
 
 ## Codex CLI support (v1.16.0+)

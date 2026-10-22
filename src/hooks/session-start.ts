@@ -72,7 +72,8 @@ function cleanupNoiseMemories(db: InstanceType<typeof Database>): void {
     // 2.6.0: 그 이전 판이 decision/7 로 넣은 정규식 조각을 격리한다(지우지 않는다).
     //   memory_search 로는 계속 보이고, 태그로 이유를 남긴다. 한 번 바뀌면 다시 안 걸린다.
     //   ★ 원래 태그·종류·중요도는 지우지 않는다 — 태그는 덧붙이고, 원래 값은 metadata.quarantine 에.
-    //   사람이 승격하려면 `unverified` 태그를 떼면 된다(quarantined-2.6 이 남아 있으면 다시 안 잡는다).
+    //   사람이 승격하려면: `unverified` 태그를 떼고 metadata.quarantine 의 from_type·from_importance 로
+    //   되돌린다. quarantined-2.6 태그는 남긴다 — 그래야 다시 격리되지 않고 주입 필터를 통과한다.
     db.prepare(`
       UPDATE memories
       SET metadata = json_set(
@@ -391,7 +392,9 @@ function renderFileEvidence(row: {
           -- 2.6.0: 정규식 후보(unverified)와 그 이전 판의 자동 추출 「결정」 은 주입하지 않는다
           AND COALESCE(tags, '') NOT LIKE '%unverified%'
           -- ⚠ tags 가 NULL 이면 NOT(TRUE AND NULL) = NULL 이라 사람이 넣은 decision 이 빠졌다 — COALESCE 필수
-          AND NOT (memory_type = 'decision' AND COALESCE(tags, '') LIKE '%auto-extracted%')
+          -- 격리됐다가 사람이 되살린 것(quarantined-2.6 은 남고 unverified 는 뗀 것)은 주입한다
+          AND NOT (memory_type = 'decision' AND COALESCE(tags, '') LIKE '%auto-extracted%'
+                   AND COALESCE(tags, '') NOT LIKE '%quarantined-2.6%')
         ORDER BY importance DESC, accessed_at DESC LIMIT 30
       `).all(project) as Array<{ content: string; memory_type: string; importance: number; created_at: string; access_count: number }>;
 
