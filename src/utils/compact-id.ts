@@ -10,7 +10,7 @@
  *     - U 가 없다                         → 판정 불가 → 내지 않는다
  *     - U 뒤에 사람·assistant 메시지가 있다 → 대화가 이어진 뒤의 컴팩션이다 → A 는 지난 것 → 내지 않는다
  *     - U 뒤에는 컴팩션 산물뿐이다          → 이번 것 → 낸다
- *   실측(2026-10-22, 이 PC 트랜스크립트 500 개): 컴팩션 16 건 모두 U 뒤 · SessionStart 앞에 오는 uuid 줄은
+ *   실측(2026-10-22, 이 PC 의 메인 트랜스크립트 25 개 전부 · 서브에이전트 제외): 컴팩션 16 건 모두 U 뒤 · SessionStart 앞에 오는 uuid 줄은
  *   compact_boundary · 컴팩션 요약(isCompactSummary) · attachment 뿐이었다. compact_boundary.logicalParentUuid 는
  *   16/16 U 와 같았다. 다만 SessionStart 의 기록 시각이 경계 줄보다 앞선 세션이 있어 경계 줄 자체에는 기대지 않는다.
  *   PreCompact 는 돌았는데 컴팩션이 일어나지 않은 경우(1 건)는 U 뒤에 대화가 이어져 「지난 것」 으로 맞게 걸러진다.
