@@ -16,6 +16,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { humanText } from '../src/utils/human-turn.js';
+import { snapshotHandover } from '../src/utils/handover.js';
+import { matchCompaction } from '../src/utils/compact-id.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SESSION_START = path.resolve(here, '../dist/hooks/session-start.js');
@@ -468,7 +470,7 @@ describe('PB141·PB142 — Stop 의 명령 인자·사람 인용 · 이번 컴�
     expect(stopFor([command('중단해'), reply('중단했습니다.')])).toContain('중단해');
     // 4 자 명령 인자도 받는다
     expect(stopFor([command('취소해줘'), reply('취소했습니다.')])).toContain('취소해줘');
-    // 일반 글 4 자는 요약 품질 규칙으로 버린다(옛 Stop 그대로) — 양의 대조: 5 자는 남는다
+    // 일반 글 4 자는 요약 품질 규칙(< 5)으로 버린다(옛 Stop 그대로) — 양의 대조: 6 자는 남는다
     expect(stopFor([human('그만해요'), reply('알겠습니다 멈춥니다.')])).not.toContain('그만해요');
     expect(stopFor([human('그만해주세요'), reply('알겠습니다 멈춥니다.')])).toContain('그만해주세요');
   });
@@ -596,4 +598,95 @@ describe('PB141·PB142 — Stop 의 명령 인자·사람 인용 · 이번 컴�
     const roomy = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
     expect(roomy).toContain('예산 시험 요청');
   });
+});
+
+describe('PB143 — 판독 공백 · 같은 스냅샷 · 맨 앞 인용 · 이어 쓴 트랜스크립트 · 8 MiB 경계', () => {
+  /** 이어 쓰기: 기존 파일 끝에 줄을 붙인다(실제 호스트처럼 · 줄 번호 기반 uuid 를 이어 단다) */
+  function append(ws: string, lines: Line[]): void {
+    const p = TP(ws);
+    const n = fs.readFileSync(p, 'utf-8').split('\n').filter(Boolean).length;
+    fs.appendFileSync(p, lines.map((l, i) => JSON.stringify({ uuid: `u${n + i}`, ...l })).join('\n') + '\n');
+  }
+  const boundary: Line = { type: 'system', subtype: 'compact_boundary' };
+  const summary: Line = { type: 'user', isCompactSummary: true, isVisibleInTranscriptOnly: true, message: { role: 'user', content: 'This session is being continued …' } };
+
+  it.skipIf(!built)('PB143-01 U 뒤에 읽지 못한 줄이 있으면 내지 않는다 · 없으면 낸다', () => {
+    const { ws, proj } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('판독 시험 요청'), reply('네')]) });
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('판독 시험 요청');   // 양의 대조
+    fs.appendFileSync(TP(ws), '{"type":"assistant","message":{"role":"assistant","content":"반쯤 쓰인\n');
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).not.toContain('판독 시험 요청');
+  });
+
+  it('PB143-01 요청 내용과 pre_uuid 는 같은 스냅샷에서 나온다', () => {
+    const s1 = [human('요청 A'), reply('네 A')].map((l, i) => ({ uuid: `u${i}`, ...l }));
+    const s2 = [...s1, ...[human('요청 B'), reply('네 B')].map((l, i) => ({ uuid: `u${2 + i}`, ...l }))];
+    const a = snapshotHandover(s1, [process.cwd()]);
+    const b = snapshotHandover(s2, [process.cwd()]);
+    expect([a.handover?.request, a.preUuid]).toEqual(['요청 A', 'u1']);
+    expect([b.handover?.request, b.preUuid]).toEqual(['요청 B', 'u3']);
+    // 판정도 그 스냅샷 기준: A 의 uuid 뒤에 B 대화가 붙은 트랜스크립트에서는 A 는 지난 것
+    expect(matchCompaction(s2, a.preUuid)).toBe('stale');
+    expect(matchCompaction(s2, b.preUuid)).toBe('current');
+  });
+
+  it('PB143-02 맨 앞 인용 + 사람 요청은 사람 글이다 · 순수 봉투·닫히지 않은 봉투는 기계 줄', () => {
+    const q = '<bash-stdout>오류 내용</bash-stdout>\n이 오류를 설명해줘';
+    expect(humanText({ type: 'user', message: { content: q } })).toBe(q);
+    expect(humanText({ type: 'user', message: { content: '<bash-stdout>out</bash-stdout><bash-stderr></bash-stderr>' } })).toBe('');
+    expect(humanText({ type: 'user', message: { content: NOTIFY } })).toBe('');
+    expect(humanText({ type: 'user', message: { content: '<task-notification>\n<task-id>x</task-id>\n잘린 알림' } })).toBe('');
+    // 코드 인용으로 시작하는 사람 글
+    const code = '```\n<bash-stdout>x</bash-stdout>\n```\n이게 뭐야';
+    expect(humanText({ type: 'user', message: { content: code } })).toBe(code);
+  });
+
+  it.skipIf(!built)('PB143-02 실제 훅: 맨 앞 인용으로 시작한 사람 요청이 복구·Stop 에 남는다', () => {
+    const q = '<bash-stdout>오류 내용</bash-stdout>\n이 오류를 설명해줘';
+    const { out, handover } = compactCycle([human(q)]);
+    expect(handover?.request).toBe('<bash-stdout>오류 내용</bash-stdout>');   // 첫 의미 줄(요청 표시 규칙)
+    expect(out).toContain('no reply yet');
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(SESSION_END, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human(q), reply('설명했습니다.')]) });
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare("SELECT last_work, user_intent FROM sessions WHERE project = 'game' ORDER BY id DESC").get() as { last_work: string; user_intent: string | null };
+    db.close();
+    // Stop 은 요청을 첫 줄로 줄여 적는다(기존 요약 규칙) — 요점은 기계 줄로 버려지지 않았다는 것
+    expect(`${row.last_work} ${row.user_intent ?? ''}`).toContain('오류 내용');
+  });
+
+  it.skipIf(!built)('PB143-03 이어 쓴 트랜스크립트: 경계·요약 뒤 새 창에 요청이 없으면 지난 창의 A 를 다시 고르지 않는다 · C 는 정상', () => {
+    const { ws, proj, dbPath } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('지난 창 요청 A'), reply('네')]) });
+    append(ws, [boundary, summary]);
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('지난 창 요청 A');   // 첫 컴팩션 복구
+    append(ws, [machine(NOTIFY)]);
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: TP(ws) });
+    const db = new Database(dbPath, { readonly: true });
+    expect(db.prepare("SELECT request FROM compact_handover WHERE session_id = 's1'").get()).toBeUndefined();
+    db.close();
+    append(ws, [boundary, summary]);
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).not.toContain('지난 창 요청 A');
+    append(ws, [human('새 창 요청 C'), reply('네')]);
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: TP(ws) });
+    append(ws, [boundary, summary]);
+    const out = hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) });
+    expect(out).toContain('새 창 요청 C');
+    expect(out).not.toContain('지난 창 요청 A');
+  });
+
+  it.skipIf(!built)('PB143-01 U 가 트랜스크립트 끝 8 MiB 밖으로 밀리면 내지 않는다(복구 누락 · 오복구 아님) · 안이면 낸다', () => {
+    const { ws, proj } = workspace();
+    hook(SESSION_START, ws, { cwd: proj, session_id: 's1' });
+    hook(PRE_COMPACT, ws, { cwd: proj, session_id: 's1', transcript_path: transcript(ws, [human('경계 시험 요청'), reply('네')]) });
+    const att = (kb: number): Line => ({ type: 'attachment', attachment: { type: 'file', content: 'x'.repeat(kb * 1024) } });
+    append(ws, [boundary, summary, ...Array.from({ length: 6 }, () => att(1000))]);    // ≈ 6 MB — 안
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).toContain('경계 시험 요청');
+    append(ws, Array.from({ length: 3 }, () => att(1000)));                              // ≈ 9 MB — 밖
+    expect(fs.statSync(TP(ws)).size).toBeGreaterThan(8 * 1024 * 1024);
+    expect(hook(SESSION_START, ws, { cwd: proj, session_id: 's1', source: 'compact', transcript_path: TP(ws) })).not.toContain('경계 시험 요청');
+  }, 60000);
 });

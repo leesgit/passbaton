@@ -26,10 +26,15 @@ const TAIL_BYTES = 8 * 1024 * 1024;
 export interface TranscriptLine {
   uuid?: string;
   type?: string;
+  subtype?: string;
+  role?: string;
+  content?: unknown;
+  /** JSON 으로 읽지 못한 줄 — 「대화 없음」 의 증거가 아니다 */
+  __broken?: boolean;
   isMeta?: boolean;
   isCompactSummary?: boolean;
   isVisibleInTranscriptOnly?: boolean;
-  message?: { content?: unknown };
+  message?: { role?: string; content?: unknown };
 }
 
 export function readTailLines(transcriptPath: string | undefined, maxBytes = TAIL_BYTES): TranscriptLine[] {
@@ -46,7 +51,8 @@ export function readTailLines(transcriptPath: string | undefined, maxBytes = TAI
     const out: TranscriptLine[] = [];
     for (const l of lines) {
       if (!l.trim()) continue;
-      try { out.push(JSON.parse(l)); } catch { /* 깨진 줄 */ }
+      // 깨진 줄은 버리지 않고 표지를 남긴다 — U 뒤에 읽지 못한 구간이 있으면 판정하지 않는다(reply-143 PB143-01)
+      try { out.push(JSON.parse(l)); } catch { out.push({ __broken: true }); }
     }
     return out;
   } catch {
@@ -84,5 +90,7 @@ export function matchCompaction(lines: TranscriptLine[], preUuid: string | null 
     if (lines[i].uuid === preUuid) { at = i; break; }
   }
   if (at < 0) return 'unknown';
-  return lines.slice(at + 1).some(isConversation) ? 'stale' : 'current';
+  const after = lines.slice(at + 1);
+  if (after.some(e => e.__broken)) return 'unknown';
+  return after.some(isConversation) ? 'stale' : 'current';
 }

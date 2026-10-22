@@ -46,6 +46,9 @@ const CONTEXT_WRAPPERS = [
 /** 메시지 **전체가** 하네스 산출물인 봉투. 맨 앞에 올 때만 본다. */
 const MACHINE_ENVELOPE = /^<(?:task-notification|bash-input|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|user-prompt-submit-hook)\b/i;
 
+/** 맨 앞 봉투의 완전한 블록들. 걷어 내고 남는 글이 있으면 사람이 붙여 넣은 인용 + 요청이다. */
+const ENVELOPE_BLOCKS = /<(task-notification|bash-input|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr|user-prompt-submit-hook)\b[^>]*>[\s\S]*?<\/\1>/gi;
+
 /** 명령 봉투 — 맨 앞일 때만 진짜 명령이다. */
 const COMMAND_ENVELOPE = /^<(?:command-message|command-name)>/;
 
@@ -81,7 +84,14 @@ export function humanTurn(entry: TranscriptEntry): HumanTurn {
   for (const re of CONTEXT_WRAPPERS) text = text.replace(re, '');
   text = text.trim();
 
-  if (MACHINE_ENVELOPE.test(text)) return none;
+  // 맨 앞 봉투: 그 블록들을 걷어 내고 사람 글이 남지 않으면 기계 줄이다(실측 194/194 가 이 모양).
+  //   남으면 — `<bash-stdout>오류</bash-stdout>\n이 오류 설명해줘` — 사람이 붙여 넣은 인용 + 요청이다.
+  //   닫히지 않은 봉투(잘린 알림)는 걷어 낼 수 없으므로 기계 줄로 본다(Astra reply-143 PB143-02).
+  if (MACHINE_ENVELOPE.test(text)) {
+    const rest = text.replace(ENVELOPE_BLOCKS, '').trim();
+    if (!rest || MACHINE_ENVELOPE.test(rest)) return none;
+    return { text, viaCommand: false };
+  }
 
   if (COMMAND_ENVELOPE.test(text)) {
     // 슬래시 커맨드 실행 시 실제 사용자 요청은 <command-args> 안에 있음 → 삭제 말고 추출

@@ -12,9 +12,9 @@ import Database from 'better-sqlite3';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot } from '../utils/workspace.js';
 import { revalidateDirective } from '../utils/directive.js';
-import { humanText } from '../utils/human-turn.js';
 import { migrateSchema } from '../db/migrate.js';
-import { readTailLines, lastUuid } from '../utils/compact-id.js';
+import { readTailLines } from '../utils/compact-id.js';
+import { snapshotHandover } from '../utils/handover.js';
 
 interface CompactInput {
   cwd?: string;
@@ -27,15 +27,6 @@ interface CompactInput {
   hook_event_name?: string;
 }
 
-interface HandoverContext {
-  /** 마지막 사람 요청(요청이지 결과가 아니다) */
-  request: string | null;
-  /** 그 요청 뒤에 Claude 의 글이 아직 없다 */
-  pending: boolean;
-  activeFile: string | null;
-  keyFacts: string[];
-  recentErrors: string[];
-}
 
 function getDbPath(cwd: string): string {
   const workspaceRoot = detectWorkspaceRoot(cwd);
@@ -72,196 +63,6 @@ function detectProject(cwd: string): string {
   }
 
   return path.basename(workspaceRoot);
-}
-
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/#{1,6}\s*/g, '')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .trim();
-}
-
-/**
- * 대화 transcript에서 구조화된 핸드오버 컨텍스트를 빌드합니다.
- */
-/**
- * transcript_path(JSONL)를 buildHandoverContext가 받는 형태로 읽는다.
- * P0-2 (2026-08-10): hook은 인라인 transcript 배열을 주지 않으므로 파일에서 직접 읽는다.
- * 컴팩션 직전에만 실행되고 뒤쪽 메시지만 필요하므로 마지막 MAX_LINES 줄만 파싱한다.
- *
- * 2.6.1: user 줄은 **사람 요청만** 남긴다(humanText). 하네스 알림·메타 턴·컴팩션 요약·
- *   셸 입출력·도구 결과는 버린다 — 2026-10-22 에 `<task-notification>` 이 「하던 일」 이 됐다.
- *   assistant 줄은 글과 함께 **도구가 실제로 건드린 경로**(tool_use input.file_path)를 싣는다.
- */
-interface TurnMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  /** assistant 의 tool_use 가 다룬 파일 — 쓰기 도구가 앞, 읽기가 뒤 */
-  toolPaths: { path: string; write: boolean }[];
-}
-
-const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
-const READ_TOOLS = new Set(['Read']);
-
-function readTranscript(transcriptPath: string): TurnMessage[] {
-  const MAX_LINES = 200;
-  try {
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) return [];
-    const lines = fs.readFileSync(transcriptPath, 'utf-8').split('\n').filter(Boolean);
-    const out: TurnMessage[] = [];
-    for (const line of lines.slice(-MAX_LINES)) {
-      try {
-        const entry = JSON.parse(line);
-        // Claude Code JSONL은 역할을 최상위 `type`으로 싣고, `message.role`은 없을 수 있다.
-        const role = entry?.message?.role || entry?.role || entry?.type;
-        if (role === 'user') {
-          const text = humanText(entry);
-          if (text.trim()) out.push({ role, content: text, toolPaths: [] });
-          continue;
-        }
-        if (role !== 'assistant') continue;
-        const raw = entry?.message?.content ?? entry?.content;
-        let content = '';
-        const toolPaths: TurnMessage['toolPaths'] = [];
-        if (typeof raw === 'string') {
-          content = raw;
-        } else if (Array.isArray(raw)) {
-          content = raw
-            .filter((b: { type?: string }) => b?.type === 'text')
-            .map((b: { text?: string }) => b.text || '')
-            .join('\n');
-          for (const b of raw as Array<{ type?: string; name?: string; input?: { file_path?: unknown; notebook_path?: unknown } }>) {
-            if (b?.type !== 'tool_use' || !b.name) continue;
-            const p = b.input?.file_path ?? b.input?.notebook_path;
-            if (typeof p !== 'string' || !p) continue;
-            if (WRITE_TOOLS.has(b.name)) toolPaths.push({ path: p, write: true });
-            else if (READ_TOOLS.has(b.name)) toolPaths.push({ path: p, write: false });
-          }
-        }
-        if (content.trim() || toolPaths.length > 0) out.push({ role, content, toolPaths });
-      } catch { /* 깨진 줄은 건너뛴다 */ }
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
-
-/**
- * 텍스트에서 잡은 파일 후보는 **실제로 있는 파일**일 때만 쓴다.
- * `passbaton@2.6.0` 같은 패키지 이름·URL·디렉터리가 「작업 파일」 이 됐다(2026-10-22).
- */
-function resolveTextFile(candidate: string, bases: string[]): string | null {
-  if (!candidate || candidate.includes('://') || candidate.includes('@')) return null;
-  for (const base of bases) {
-    try {
-      const abs = path.isAbsolute(candidate) ? candidate : path.resolve(base, candidate);
-      if (fs.statSync(abs).isFile()) return candidate;
-    } catch { /* 없음 */ }
-  }
-  return null;
-}
-
-function buildHandoverContext(
-  transcript: TurnMessage[],
-  bases: string[] = [process.cwd()],
-): HandoverContext {
-  const context: HandoverContext = {
-    request: null,
-    pending: false,
-    activeFile: null,
-    keyFacts: [],
-    recentErrors: []
-  };
-
-  const assistantMessages = transcript.filter(m => m.role === 'assistant' && m.content.trim());
-
-  // 1. request: 마지막 **사람** 요청. ⛔ 결과가 아니다 — 저장·표시 모두 「요청」 으로만 다룬다.
-  //    (2.6.0 까지는 창 안 첫 user 줄을 workSummary 로 삼아 current_state 를 덮었다)
-  let lastHuman = -1;
-  for (let i = transcript.length - 1; i >= 0; i--) {
-    if (transcript[i].role === 'user') { lastHuman = i; break; }
-  }
-  if (lastHuman >= 0) {
-    const cleaned = transcript[lastHuman].content
-      .replace(/```[\s\S]*?```/g, '')
-      .split('\n')
-      .map(l => l.trim())
-      .filter(l => l.length > 0 && !l.startsWith('|') && !l.startsWith('---'));
-    if (cleaned.length > 0) context.request = stripMarkdown(cleaned[0]).slice(0, 200);
-    // pending = 그 요청 **뒤에 assistant 글이 없다.** 그 이상의 뜻은 없다 — 「곧 하겠다」 한 줄도
-    //   글이므로 pending 이 아니고, 그렇다고 작업이 끝났다는 증거도 아니다(Astra reply-140).
-    //   기계 줄은 이미 빠졌으므로 알림이 마지막 줄이어도 이 판정은 바뀌지 않는다.
-    context.pending = !transcript.slice(lastHuman + 1).some(m => m.role === 'assistant' && m.content.trim());
-  }
-
-  // 2. activeFile: 도구가 실제로 건드린 경로가 먼저(쓰기 > 읽기, 최근 것). 없을 때만 텍스트 후보.
-  //   ⛔ 「지금 없음」 은 「삭제됨」 이 아니다 — 실패한 Write·원래 없던 Read·권한 오류도 stat 이
-  //   실패한다. 삭제 증거를 보지 않으므로 삭제라고 쓰지 않는다(Astra reply-140 PB140-03).
-  //   상대 경로는 훅 프로세스 cwd 가 아니라 **입력 cwd** 기준이다.
-  const observed = transcript.flatMap(m => m.toolPaths);
-  const pick = [...observed].reverse().find(p => p.write) ?? [...observed].reverse()[0];
-  if (pick) {
-    const abs = path.isAbsolute(pick.path) ? pick.path : path.resolve(bases[0], pick.path);
-    let mark = '';
-    try {
-      if (!fs.statSync(abs).isFile()) mark = ' (not a file now)';
-    } catch (e) {
-      mark = (e as NodeJS.ErrnoException).code === 'ENOENT' ? ' (not found now)' : ' (could not check)';
-    }
-    context.activeFile = pick.path + mark;
-  } else {
-    const filePatterns = [
-      /(?:file_path|파일)[:\s]*["']?([^\s"',]+\.\w{1,6})/,
-      /(?:Edit|Write|Read|수정|생성|읽기)\s+.*?(\S+\.\w{1,6})/,
-      /`([^`]+\.\w{1,6})`/,
-    ];
-    for (const msg of [...transcript.slice(-10)].reverse()) {
-      for (const pattern of filePatterns) {
-        const match = msg.content.match(pattern);
-        const hit = match?.[1] ? resolveTextFile(match[1], bases) : null;
-        if (hit) { context.activeFile = hit; break; }
-      }
-      if (context.activeFile) break;
-    }
-  }
-
-  // 4. keyFacts: assistant 메시지에서 설정값, 포트, 버전 등 추출
-  const factPatterns = [
-    /(?:port|포트)\s*(?:is|=|:|→)\s*(\d{2,5})/gi,
-    /(?:version|버전)\s*(?:is|=|:|→)\s*([\d.]+)/gi,
-    /(?:IP|ip)\s*(?:is|=|:|→)\s*([\d.]+)/gi,
-    /(?:using|사용)\s+([\w\s.-]+?\s+v[\d.]+)/gi,
-  ];
-
-  for (const msg of assistantMessages.slice(-10)) {
-    for (const pattern of factPatterns) {
-      pattern.lastIndex = 0;
-      const match = msg.content.match(pattern);
-      if (match) {
-        context.keyFacts.push(stripMarkdown(match[0]).slice(0, 100));
-      }
-    }
-  }
-  context.keyFacts = [...new Set(context.keyFacts)].slice(0, 5);
-
-  // 5. recentErrors: 에러 패턴 추출
-  for (const msg of transcript.slice(-15)) {
-    const errorMatch = msg.content.match(
-      /(?:Error|error|ERROR|오류|실패|FAILED|Exception)[:\s](.{10,100})/
-    );
-    if (errorMatch) {
-      const err = stripMarkdown(errorMatch[0]).slice(0, 100);
-      if (!context.recentErrors.includes(err)) {
-        context.recentErrors.push(err);
-      }
-    }
-  }
-  context.recentErrors = context.recentErrors.slice(0, 3);
-
-  return context;
 }
 
 /**
@@ -333,8 +134,9 @@ async function main() {
 
     // 디버그 로그 (DB 없어도 발화 자체는 기록)
     const debugLogPath = path.join(path.dirname(dbPath), 'pre-compact-debug.log');
-    const transcriptMessages = readTranscript(input.transcript_path || '');
-    const transcriptLen = transcriptMessages.length;
+    // 트랜스크립트는 **한 번만** 읽는다 — 요청 내용과 pre_uuid 가 같은 스냅샷이어야 한다(PB143-01)
+    const snap = snapshotHandover(readTailLines(input.transcript_path), [cwd, path.dirname(path.dirname(dbPath))]);
+    const transcriptLen = snap.messages.length;
     const sid = input.session_id?.slice(0, 8) || 'none';
 
     if (!fs.existsSync(dbPath)) {
@@ -349,9 +151,7 @@ async function main() {
     db.pragma('journal_mode = WAL'); // 다중 hook 프로세스 동시성 보장
 
     // 핸드오버 컨텍스트 빌드 — 텍스트 파일 후보는 cwd·워크스페이스 기준으로 실제 파일만
-    const handover = transcriptMessages.length > 0
-      ? buildHandoverContext(transcriptMessages, [cwd, path.dirname(path.dirname(dbPath))])
-      : null;
+    const handover = snap.handover;
 
     // ⛔ 2.6.1: active_context.current_state 를 **덮지 않는다.** 여기서 가진 것은 요청뿐이고
     //   일한 증거가 없다 — 2.6.0 의 session-end 가 「이번 턴 일한 증거」 가 있을 때만 덮도록
@@ -380,7 +180,7 @@ async function main() {
               active_file = excluded.active_file, created_at = excluded.created_at,
               pre_uuid = excluded.pre_uuid
           `).run(input.session_id, project, handover.request, handover.pending ? 1 : 0, handover.activeFile,
-            lastUuid(readTailLines(input.transcript_path)));
+            snap.preUuid);
         } else {
           forget();
         }
