@@ -23,6 +23,8 @@ function run(label) {
     skipped: t.filter(a => a.status === 'pending' || a.status === 'skipped').length,
     why: t.flatMap(a => a.failureMessages ?? []).join(' ').slice(0, 300) };
   console.log(label, JSON.stringify(r));
+  // 로그를 못 읽는 쪽(비인증 API)도 결과를 보도록 주석으로도 남긴다
+  if (process.env.GITHUB_ACTIONS) console.log(`::notice title=boundary ${label}::${JSON.stringify(r).replace(/[\r\n]+/g, ' ')}`);
   return r;
 }
 
@@ -41,5 +43,7 @@ try {
 }
 const c = run('restored');
 ok &&= c.passed === 1 && c.failed === 0;
-console.log(ok ? 'BOUNDARY MUTATION: normal green → mutated red → restored green' : 'BOUNDARY MUTATION CHECK FAILED');
+const verdict = ok ? 'BOUNDARY MUTATION: normal green → mutated red → restored green' : 'BOUNDARY MUTATION CHECK FAILED';
+console.log(verdict);
+if (process.env.GITHUB_ACTIONS) console.log(`::${ok ? 'notice' : 'error'} title=boundary verdict::${verdict}`);
 process.exit(ok ? 0 : 1);

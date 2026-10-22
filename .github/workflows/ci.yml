@@ -20,6 +20,9 @@ jobs:
           node-version: 24
       - name: Install dependencies
         run: npm install
+      # 시험 파일은 CI 에서 dist/ 가 없으면 바로 던진다 — 첫 실행(c02c23c)이 그래서 빨갰다
+      - name: Build
+        run: npm run build
       - name: Normal green → mutated red → restored green
         run: node scripts/mutation-boundary.mjs
 
