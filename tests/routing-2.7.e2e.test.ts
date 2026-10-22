@@ -150,7 +150,10 @@ describe('reply-147 반례', () => {
     fs.mkdirSync(twin, { recursive: true });
     start(ws, 's1');
     expect(ask(ws, 's1', '/ashfall', twin)).not.toContain('routed-context');
-    expect(hook(USER_PROMPT, ws, { session_id: 's1', prompt: '/ashfall' })).not.toContain('routed-context');
+    // 훅 프로세스는 루트에서 떠도(process.cwd() = 루트) 입력에 cwd 가 없으면 추정하지 않는다
+    const noCwd = spawnSync('node', [USER_PROMPT], { cwd: ws, input: JSON.stringify({ session_id: 's1', prompt: '/ashfall' }), encoding: 'utf-8', env: { ...process.env, WORKSPACE_ROOT: ws } });
+    expect(noCwd.status).toBe(0);
+    expect(noCwd.stdout).not.toContain('routed-context');
     expect(ask(ws, 's1', '/ashfall')).toContain('routed-context');              // 진짜 루트에서는 된다
   });
 
