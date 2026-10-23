@@ -14,6 +14,7 @@ import { ensureSessionsDb } from '../db/bootstrap.js';
 import { revalidateDirective } from '../utils/directive.js';
 import { buildResumeCard, clampCardChars } from '../utils/resume-card.js';
 import { readTailLines, matchCompaction } from '../utils/compact-id.js';
+import { readRunOrigin } from '../utils/run-origin.js';
 import { readRoutingDeclaration, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd } from '../utils/routing.js';
 
 interface SessionInput {
@@ -335,9 +336,17 @@ function renderFileEvidence(row: {
       ? ', user_intent, modified_files, workspace_writes, file_coverage'
       : '';
 
+    // 2.7.3 (reply-154 PB154-B): 대화 카드에서는 **확인된 loop 행만** 뺀다 — 출처 필터를 먼저(WHERE) 걸고 LIMIT 3.
+    //   ⛔ 먼저 3 개를 뽑고 빼면 최신 loop 행이 슬롯을 먹어 대화 칸이 빈다. 행은 지우지 않는다(노출만 바꾼다).
+    //   현재 세션이 loop 면 기존 동작 그대로. unknown(옛 행 포함)은 남기되 표시한다 — 과거 랄프 잡음이 사라졌다고 하지 않는다.
+    const thisOrigin = readRunOrigin();
+    const hasOrigin = sessionCols.has('run_origin');
+    const hideLoop = thisOrigin !== 'loop' && hasOrigin;
+    const markUnknown = thisOrigin !== 'loop';
     const recentSessions = db.prepare(`
-      SELECT last_work, next_tasks, issues, timestamp${extraCols} FROM sessions
+      SELECT last_work, next_tasks, issues, timestamp${extraCols}${hasOrigin ? ', run_origin' : ''} FROM sessions
       WHERE project = ?
+        ${hideLoop ? "AND COALESCE(run_origin, 'unknown') != 'loop'" : ''}
         AND last_work != 'Session ended'
         AND last_work != 'Session work completed'
         AND last_work != 'Session started'
@@ -348,6 +357,7 @@ function renderFileEvidence(row: {
       last_work: string; next_tasks: string; issues: string; timestamp: string;
       user_intent?: string | null; modified_files?: string | null;
       workspace_writes?: string | null; file_coverage?: string | null;
+      run_origin?: string | null;
     }>;
 
     if (recentSessions.length > 0 && tokenBudget > 100) {
@@ -356,7 +366,8 @@ function renderFileEvidence(row: {
         // P1-3 (2026-08-10): 60자는 문장 중간을 잘라 요약이 무의미했다(실측 최근30일 326/376 절단, AVG 121.9자).
         // 140자로 확대 — 예산 초과 시 이 블록은 통째로 skip되는 구조라 오버플로 위험 없음.
         const work = session.last_work.length > 140 ? session.last_work.slice(0, 140) + '...' : session.last_work;
-        sessionLines.push(`- [${session.timestamp?.slice(0, 10) || '?'}] ${work}`);
+        const tag = markUnknown && session.run_origin !== 'loop' ? ' [origin unknown]' : '';
+        sessionLines.push(`- [${session.timestamp?.slice(0, 10) || '?'}]${tag} ${work}`);
 
         // ★ 상세(요청 → 한 일 → 커버리지 → 파일)는 **가장 최근 한 건에만** 붙인다.
         //   셋 다 붙이면 예산을 파일 목록이 다 먹고 정작 지시사항이 잘린다.
