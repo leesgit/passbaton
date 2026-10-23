@@ -34,17 +34,27 @@
  *     제목·항목 직전까지 (최대 120 줄). 제목을 목록보다 먼저 찾는다 · 코드 펜스 안과 링크 텍스트는
  *     보지 않는다 · 여러 개면 첫 것을 쓰고 개수를 적는다 · 못 찾으면 NOT READ
  *   - 경로는 프로젝트 폴더 기준
+ *   - `role` (2.7.3 · 선택): `"current-task"` = 이 원천이 「현재 작업」 이다. 첫 current-task 원천이
+ *     `no_block`·`missing`·읽기 실패·빈 범위면 카드 **첫 줄**에 경고한다(reply-153 PR-5 · reply-154 PB154-D).
+ *     명시적 「없음 — 사람 결과 대기」 블록은 읽힌 블록(ok)이라 경고가 아니다. 예산 때문에 못 보인 것은
+ *     경고(⚠)가 아니라 안내(ℹ)로 따로 적는다 — 실패·대기·예산을 같은 뜻으로 만들지 않는다.
+ *     지정이 없으면 경고도 없다(기존 동작).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 
+export type SourceRole = 'current-task';
+const ROLES: ReadonlySet<string> = new Set<SourceRole>(['current-task']);
+const isRole = (v: unknown): v is SourceRole => typeof v === 'string' && ROLES.has(v);
+
 export interface ContinuitySource {
   path: string;
   lines?: number;
   block?: string;
   label?: string;
+  role?: SourceRole;
 }
 
 export interface ContinuityDeclaration {
@@ -76,6 +86,8 @@ export interface CardItem {
   budgetLimited?: boolean;
   /** block 일치 개수(2 이상이면 모호함) */
   matches?: number;
+  /** 읽었지만 카드 예산 때문에 본문을 못 보였다(실패가 아니다 · 2.7.3 PB154-D) */
+  budgetHidden?: boolean;
   why?: string;
 }
 
@@ -150,11 +162,14 @@ export function readContinuityDeclaration(projectPath: string): ContinuityDeclar
       out.invalid.push(`${src.path}: more than ${MAX_SOURCES} sources`);
       continue;
     }
+    // 모르는 role 은 원천을 버리지 않고 role 만 버린다 — 오타 하나로 정지 사유 같은 원천이 사라지면 안 된다
+    if (src.role !== undefined && !isRole(src.role)) out.invalid.push(`${src.path}: role ${JSON.stringify(src.role).slice(0, 30)} ignored`);
     out.sources.push({
       path: src.path,
       lines: src.lines as number | undefined,
       block: src.block as string | undefined,
       label: typeof src.label === 'string' && src.label.trim() ? src.label.slice(0, 80) : src.path,
+      ...(isRole(src.role) ? { role: src.role } : {}),
     });
   }
   return out;
@@ -350,6 +365,8 @@ export interface ResumeCard {
   anyRead: boolean;
   /** 남는 예산 재분배 기록(2.7.2) — 측정·시험용. applied=false 면 카드는 C0 그대로다 */
   redistribution?: { spare: number; targets: number; extraReads: number; applied: boolean; why?: string };
+  /** 첫 「현재 작업」 원천의 상태(2.7.3 PB154-D) — role 지정이 없으면 undefined */
+  taskStatus?: TaskStatus;
 }
 
 function renderItem(it: CardItem): string[] {
@@ -364,12 +381,49 @@ function renderItem(it: CardItem): string[] {
   return [`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`];
 }
 
-function renderCard(items: CardItem[], invalid: string[], maxInvalid: number): { text: string; anyRead: boolean } {
+/** 「현재 작업」 원천의 상태(2.7.3 PB154-D). budget = 읽었거나 읽을 수 있었지만 카드 예산 때문에 못 보였다. */
+export type TaskStatus = CardOutcome | 'budget';
+
+/** 첫 current-task 원천의 선언 위치(decl.sources 안). 없으면 경고도 없다. */
+interface TaskWatch { index: number; src: ContinuitySource }
+
+function taskStatusOf(items: CardItem[], task: TaskWatch | null): TaskStatus | undefined {
+  if (!task) return undefined;
+  const it = items[task.index];
+  if (!it) return 'budget';                                   // 원천 수 상한·머리글 넘침으로 생략됨
+  if (it.outcome === 'empty' && it.budgetHidden) return 'budget';
+  // 블록 제목만 있고 본문이 비었다 — 명시적 대기 문구도 작업도 없다. 잘렸다면 본문이 있었다는 뜻이라 여기 안 온다.
+  if (it.outcome === 'ok' && task.src.block && !it.truncated && !(it.excerpt ?? '').split('\n').slice(1).some(l => l.trim())) return 'empty';
+  return it.outcome;
+}
+
+/** 카드 첫 줄. ⚠ = 추출 실패(작업을 모른다) · ℹ = 예산 때문에 안 보임(실패 아님) · ok·잘림 = 줄 없음. */
+function taskLine(status: TaskStatus | undefined, task: TaskWatch | null): string | null {
+  if (!task || status === undefined || status === 'ok') return null;
+  const p = `\`${task.src.path.slice(0, 120)}\``;
+  const what = task.src.block ? `block "${task.src.block.slice(0, 40)}"` : 'source';
+  switch (status) {
+    case 'budget':
+      return `ℹ CURRENT TASK not shown in this card (card budget — not a failure) — read ${p} directly`;
+    case 'no_block':
+      return `⚠ CURRENT TASK UNKNOWN — ${what} not found in ${p} (this is not an explicit "none — waiting"). Read the source before picking work.`;
+    case 'missing':
+      return `⚠ CURRENT TASK UNKNOWN — ${p} not found. Read/restore the source before picking work.`;
+    case 'empty':
+      return `⚠ CURRENT TASK UNKNOWN — ${what} in ${p} is empty. Read the source before picking work.`;
+    default:
+      return `⚠ CURRENT TASK UNKNOWN — ${p} could not be read (${status}). Read the source before picking work.`;
+  }
+}
+
+function renderCard(items: CardItem[], invalid: string[], maxInvalid: number, task: TaskWatch | null = null): { text: string; anyRead: boolean } {
   // ★ 읽음 상태는 **실제로 출력에 들어간 발췌**로 정한다 — 머리글을 문자열에서 추정하지 않는다.
   const anyRead = items.some(i => i.outcome === 'ok');
-  const out: string[] = [anyRead
+  const first = taskLine(taskStatusOf(items, task), task);
+  const out: string[] = first ? [first] : [];
+  out.push(anyRead
     ? '## Resume card — repo source of truth (read this before the DB summary below)'
-    : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)'];
+    : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)');
   for (const it of items) out.push(...renderItem(it));
   if (invalid.length && maxInvalid > 0) {
     const shown = invalid.slice(0, maxInvalid).map(s => s.slice(0, 100));
@@ -397,27 +451,30 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   const sources = decl.sources.slice(0, fit);
   const invalid = [...decl.invalid];
   for (const s of decl.sources.slice(fit)) invalid.push(`${s.path}: dropped — card budget ${budget} fits ${fit} source(s)`);
+  // 2.7.3 (PB154-D): 첫 「현재 작업」 원천. 지정이 없으면 null — 경고 없음(기존 동작).
+  const taskIndex = decl.sources.findIndex(s => s.role === 'current-task');
+  const task: TaskWatch | null = taskIndex >= 0 ? { index: taskIndex, src: decl.sources[taskIndex] } : null;
 
   let per = Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
   let items = sources.map(s => readSource(projectPath, s, per));
   let maxInvalid = 4;
-  let card = renderCard(items, invalid, maxInvalid);
+  let card = renderCard(items, invalid, maxInvalid, task);
 
   // 1) 발췌를 줄인다
   for (let k = 0; k < 4 && card.text.length > budget && per > 60; k++) {
     per = Math.max(60, Math.floor(per * budget / card.text.length) - 20);
     items = sources.map(s => readSource(projectPath, s, per));
-    card = renderCard(items, invalid, maxInvalid);
+    card = renderCard(items, invalid, maxInvalid, task);
   }
   // 2) 경고 목록을 개수만 남긴다
-  if (card.text.length > budget) { maxInvalid = 0; card = renderCard(items, invalid, maxInvalid); }
+  if (card.text.length > budget) { maxInvalid = 0; card = renderCard(items, invalid, maxInvalid, task); }
   // 3) 뒤쪽 원천부터 「예산 때문에 안 보임」 으로 바꾼다 — 구조로, 그리고 그 사실을 적는다
   for (let i = items.length - 1; i >= 0 && card.text.length > budget; i--) {
     if (items[i].outcome !== 'ok') continue;
     items = items.map((it, j) => j === i
-      ? { label: it.label, path: it.path, outcome: 'empty' as CardOutcome, why: 'not shown — card budget too small', from: it.from, to: it.to, totalLines: it.totalLines, sha: it.sha }
+      ? { label: it.label, path: it.path, outcome: 'empty' as CardOutcome, budgetHidden: true, why: 'not shown — card budget too small', from: it.from, to: it.to, totalLines: it.totalLines, sha: it.sha }
       : it);
-    card = renderCard(items, invalid, maxInvalid);
+    card = renderCard(items, invalid, maxInvalid, task);
   }
   // 4) 그래도 넘치면(머리글만으로 넘침) 원천 줄을 뒤에서부터 뺀다
   let shownInvalid = invalid;
@@ -425,9 +482,9 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
     items = items.slice(0, -1);
     shownInvalid = [...invalid, 'some sources omitted — card budget too small'];
     maxInvalid = 0;
-    card = renderCard(items, shownInvalid, maxInvalid);
+    card = renderCard(items, shownInvalid, maxInvalid, task);
   }
-  const c0: ResumeCard = { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead };
+  const c0: ResumeCard = { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead, taskStatus: taskStatusOf(items, task) };
 
   // 5) 남는 예산을 **한 번** 잘린 원천에 똑같이 나눈다 (2.7.2 · Astra reply-150 PB150-01 계약 1~6)
   //   ★ 균등 몫은 없는 원천(NOT READ 한 줄)·짧은 원천의 몫을 그냥 버렸다 — Ashfall 실측 3200 중 2390 만 썼다.
@@ -451,7 +508,7 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
     if (!same) return { ...c0, redistribution: { spare, targets: targets.length, extraReads, applied: false, why: `${it.path} changed or shrank between reads` } };
     grown[i] = next;
   }
-  const out = renderCard(grown, shownInvalid, maxInvalid);
+  const out = renderCard(grown, shownInvalid, maxInvalid, task);
   if (out.text.length > budget) return { ...c0, redistribution: { spare, targets: targets.length, extraReads, applied: false, why: 'rendered card would exceed the budget' } };
-  return { text: out.text, items: grown, invalid, anyRead: out.anyRead, redistribution: { spare, targets: targets.length, extraReads, applied: true } };
+  return { text: out.text, items: grown, invalid, anyRead: out.anyRead, taskStatus: taskStatusOf(grown, task), redistribution: { spare, targets: targets.length, extraReads, applied: true } };
 }
