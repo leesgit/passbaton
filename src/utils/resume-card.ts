@@ -39,14 +39,21 @@
  *     명시적 「없음 — 사람 결과 대기」 블록은 읽힌 블록(ok)이라 경고가 아니다. 예산 때문에 못 보인 것은
  *     경고(⚠)가 아니라 안내(ℹ)로 따로 적는다 — 실패·대기·예산을 같은 뜻으로 만들지 않는다.
  *     지정이 없으면 경고도 없다(기존 동작).
+ *     `"history"` = 최신 기록(HANDOFF 류) — 아래 loop 최소 카드에서 본문을 뺄 원천.
+ *   - `continuity.loopCard: "minimal"` (2.7.3 · 기본 꺼짐 · reply-154 PB154-C): 실행 출처가 **loop 이고** 이 opt-in 이
+ *     있을 때만, role 이 current-task·history 인 원천의 **본문만** 뺀다(경로·범위·해시·상태 줄은 남긴다).
+ *     role 이 없는 원천(정지 사유·처분 색인)은 그대로 싣는다 — 명시하지 않은 것은 숨기지 않는다.
+ *     원천 검사는 생략하지 않는다: 본문을 뺄 원천도 매번 읽어 상태·해시를 낸다(no_block 경고 유지).
  */
+
+import type { RunOrigin } from './run-origin.js';
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 
-export type SourceRole = 'current-task';
-const ROLES: ReadonlySet<string> = new Set<SourceRole>(['current-task']);
+export type SourceRole = 'current-task' | 'history';
+const ROLES: ReadonlySet<string> = new Set<SourceRole>(['current-task', 'history']);
 const isRole = (v: unknown): v is SourceRole => typeof v === 'string' && ROLES.has(v);
 
 export interface ContinuitySource {
@@ -59,6 +66,8 @@ export interface ContinuitySource {
 
 export interface ContinuityDeclaration {
   sources: ContinuitySource[];
+  /** loop 실행에서만 쓰는 최소 카드 opt-in(2.7.3 PB154-C). 없으면 언제나 전체 카드. */
+  loopCard?: 'minimal';
   /** 모양이 틀려 버린 항목. 조용히 무시하면 사용자는 선언이 먹은 줄 안다. */
   invalid: string[];
 }
@@ -137,7 +146,12 @@ export function readContinuityDeclaration(projectPath: string): ContinuityDeclar
     return out;
   }
 
-  const sources = (raw as { continuity?: { sources?: unknown } })?.continuity?.sources;
+  const cont = (raw as { continuity?: { sources?: unknown; loopCard?: unknown } })?.continuity;
+  const sources = cont?.sources;
+  if (cont?.loopCard !== undefined) {
+    if (cont.loopCard === 'minimal') out.loopCard = 'minimal';
+    else if (cont.loopCard !== 'full') out.invalid.push(`continuity.loopCard ${JSON.stringify(cont.loopCard).slice(0, 30)} ignored (use "minimal")`);
+  }
   if (sources === undefined) return out;
   if (!Array.isArray(sources)) {
     out.invalid.push('continuity.sources (not an array)');
@@ -367,9 +381,15 @@ export interface ResumeCard {
   redistribution?: { spare: number; targets: number; extraReads: number; applied: boolean; why?: string };
   /** 첫 「현재 작업」 원천의 상태(2.7.3 PB154-D) — role 지정이 없으면 undefined */
   taskStatus?: TaskStatus;
+  /** loop 최소 카드로 냈다(2.7.3 PB154-C) — 호출부는 Recent Sessions 도 뺀다 */
+  minimal?: boolean;
 }
 
-function renderItem(it: CardItem): string[] {
+function renderItem(it: CardItem, omitBody = false): string[] {
+  if (it.outcome === 'ok' && omitBody) {
+    // 본문만 뺀다 — 무엇을 어디서 읽어야 하는지(경로·범위·해시·상태)는 남긴다
+    return [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (of ${it.totalLines}${it.partialFile ? '+' : ''}) · sha1 ${it.sha} · ok · body omitted (loop card) — read the source directly`];
+  }
   if (it.outcome === 'ok') {
     const total = `of ${it.totalLines}${it.partialFile ? '+' : ''}`;
     const bits = [`sha1 ${it.sha}`];
@@ -416,15 +436,25 @@ function taskLine(status: TaskStatus | undefined, task: TaskWatch | null): strin
   }
 }
 
-function renderCard(items: CardItem[], invalid: string[], maxInvalid: number, task: TaskWatch | null = null): { text: string; anyRead: boolean } {
+interface RenderCtx {
+  task: TaskWatch | null;
+  /** loop 최소 카드 — strip[i] 원천은 본문을 뺀다 */
+  minimal: boolean;
+  strip: boolean[];
+}
+
+function renderCard(items: CardItem[], invalid: string[], maxInvalid: number, ctx: RenderCtx): { text: string; anyRead: boolean } {
+  const { task } = ctx;
   // ★ 읽음 상태는 **실제로 출력에 들어간 발췌**로 정한다 — 머리글을 문자열에서 추정하지 않는다.
   const anyRead = items.some(i => i.outcome === 'ok');
   const first = taskLine(taskStatusOf(items, task), task);
   const out: string[] = first ? [first] : [];
-  out.push(anyRead
+  out.push(ctx.minimal
+    ? '## Resume card — loop minimal (statuses are from a fresh check · omitted bodies: read each source directly)'
+    : anyRead
     ? '## Resume card — repo source of truth (read this before the DB summary below)'
     : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)');
-  for (const it of items) out.push(...renderItem(it));
+  items.forEach((it, i) => out.push(...renderItem(it, ctx.minimal && ctx.strip[i])));
   if (invalid.length && maxInvalid > 0) {
     const shown = invalid.slice(0, maxInvalid).map(s => s.slice(0, 100));
     out.push(`⚠ ignored continuity entries: ${shown.join(', ')}${invalid.length > maxInvalid ? ` … +${invalid.length - maxInvalid}` : ''}`);
@@ -439,6 +469,8 @@ export interface BuildCardOptions {
   redistribute?: boolean;
   /** 재분배의 추가 읽기 — 시험이 두 읽기 사이 파일 변경을 넣을 때만 바꾼다 */
   readExtra?: typeof readSource;
+  /** 이번 실행의 출처(2.7.3) — loop 이고 설정이 loopCard: "minimal" 일 때만 최소 카드. 기본 unknown = 전체 카드 */
+  origin?: RunOrigin;
 }
 
 export function buildResumeCard(projectPath: string, maxChars: number, opts: BuildCardOptions = {}): ResumeCard | null {
@@ -454,27 +486,30 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   // 2.7.3 (PB154-D): 첫 「현재 작업」 원천. 지정이 없으면 null — 경고 없음(기존 동작).
   const taskIndex = decl.sources.findIndex(s => s.role === 'current-task');
   const task: TaskWatch | null = taskIndex >= 0 ? { index: taskIndex, src: decl.sources[taskIndex] } : null;
+  // 2.7.3 (PB154-C): 출처만으로 줄이지 않는다 — loop **그리고** 명시적 opt-in 일 때만
+  const minimal = opts.origin === 'loop' && decl.loopCard === 'minimal';
+  const ctx: RenderCtx = { task, minimal, strip: decl.sources.map(s => s.role === 'current-task' || s.role === 'history') };
 
   let per = Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
   let items = sources.map(s => readSource(projectPath, s, per));
   let maxInvalid = 4;
-  let card = renderCard(items, invalid, maxInvalid, task);
+  let card = renderCard(items, invalid, maxInvalid, ctx);
 
   // 1) 발췌를 줄인다
   for (let k = 0; k < 4 && card.text.length > budget && per > 60; k++) {
     per = Math.max(60, Math.floor(per * budget / card.text.length) - 20);
     items = sources.map(s => readSource(projectPath, s, per));
-    card = renderCard(items, invalid, maxInvalid, task);
+    card = renderCard(items, invalid, maxInvalid, ctx);
   }
   // 2) 경고 목록을 개수만 남긴다
-  if (card.text.length > budget) { maxInvalid = 0; card = renderCard(items, invalid, maxInvalid, task); }
+  if (card.text.length > budget) { maxInvalid = 0; card = renderCard(items, invalid, maxInvalid, ctx); }
   // 3) 뒤쪽 원천부터 「예산 때문에 안 보임」 으로 바꾼다 — 구조로, 그리고 그 사실을 적는다
   for (let i = items.length - 1; i >= 0 && card.text.length > budget; i--) {
     if (items[i].outcome !== 'ok') continue;
     items = items.map((it, j) => j === i
       ? { label: it.label, path: it.path, outcome: 'empty' as CardOutcome, budgetHidden: true, why: 'not shown — card budget too small', from: it.from, to: it.to, totalLines: it.totalLines, sha: it.sha }
       : it);
-    card = renderCard(items, invalid, maxInvalid, task);
+    card = renderCard(items, invalid, maxInvalid, ctx);
   }
   // 4) 그래도 넘치면(머리글만으로 넘침) 원천 줄을 뒤에서부터 뺀다
   let shownInvalid = invalid;
@@ -482,9 +517,9 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
     items = items.slice(0, -1);
     shownInvalid = [...invalid, 'some sources omitted — card budget too small'];
     maxInvalid = 0;
-    card = renderCard(items, shownInvalid, maxInvalid, task);
+    card = renderCard(items, shownInvalid, maxInvalid, ctx);
   }
-  const c0: ResumeCard = { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead, taskStatus: taskStatusOf(items, task) };
+  const c0: ResumeCard = { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead, taskStatus: taskStatusOf(items, task), ...(minimal ? { minimal } : {}) };
 
   // 5) 남는 예산을 **한 번** 잘린 원천에 똑같이 나눈다 (2.7.2 · Astra reply-150 PB150-01 계약 1~6)
   //   ★ 균등 몫은 없는 원천(NOT READ 한 줄)·짧은 원천의 몫을 그냥 버렸다 — Ashfall 실측 3200 중 2390 만 썼다.
@@ -493,7 +528,8 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   //   새 발췌는 C0 발췌를 그대로 앞에 두어야 하고(프로그램이 붙인 「…」 만 빼고 비교), 선택 범위·해시가 같아야 한다.
   //   실제로 렌더해 상한을 넘거나 어느 조건이든 깨지면 **C0 전체로** 돌아간다 — 다른 원천을 줄여 맞추지 않는다.
   const spare = budget - c0.text.length;
-  const targets = items.map((it, i) => ({ it, i })).filter(({ it }) => it.outcome === 'ok' && it.budgetLimited);
+  // 최소 카드에서 본문을 뺀 원천은 재분배 대상이 아니다(보이지 않는 본문을 늘리지 않는다)
+  const targets = items.map((it, i) => ({ it, i })).filter(({ it, i }) => it.outcome === 'ok' && it.budgetLimited && !(minimal && ctx.strip[i]));
   if (opts.redistribute === false || spare <= 0 || targets.length === 0) return { ...c0, redistribution: { spare: Math.max(0, spare), targets: 0, extraReads: 0, applied: false } };
   const share = Math.floor(spare / targets.length);
   let extraReads = 0;
@@ -508,7 +544,7 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
     if (!same) return { ...c0, redistribution: { spare, targets: targets.length, extraReads, applied: false, why: `${it.path} changed or shrank between reads` } };
     grown[i] = next;
   }
-  const out = renderCard(grown, shownInvalid, maxInvalid, task);
+  const out = renderCard(grown, shownInvalid, maxInvalid, ctx);
   if (out.text.length > budget) return { ...c0, redistribution: { spare, targets: targets.length, extraReads, applied: false, why: 'rendered card would exceed the budget' } };
-  return { text: out.text, items: grown, invalid, anyRead: out.anyRead, taskStatus: taskStatusOf(grown, task), redistribution: { spare, targets: targets.length, extraReads, applied: true } };
+  return { text: out.text, items: grown, invalid, anyRead: out.anyRead, taskStatus: taskStatusOf(grown, task), ...(minimal ? { minimal } : {}), redistribution: { spare, targets: targets.length, extraReads, applied: true } };
 }

@@ -113,7 +113,8 @@ const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 
 function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string, transcriptPath?: string, hookCwd?: string): string | null {
   // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
-  const card = projectPath ? buildResumeCard(projectPath, CARD_CHARS) : null;
+  // 2.7.3 (PB154-C): 출처가 loop 이고 프로젝트 설정이 loopCard: "minimal" 일 때만 최소 카드(그 판단은 카드 쪽이 한다)
+  const card = projectPath ? buildResumeCard(projectPath, CARD_CHARS, { origin: readRunOrigin() }) : null;
   if (!fs.existsSync(dbPath)) {
     return card ? `# ${project} - Session Resumed\n\n${card.text}` : null;
   }
@@ -360,7 +361,8 @@ function renderFileEvidence(row: {
       run_origin?: string | null;
     }>;
 
-    if (recentSessions.length > 0 && tokenBudget > 100) {
+    // 2.7.3 (PB154-C): loop 최소 카드면 Recent Sessions 를 싣지 않는다(행은 그대로 · 노출만)
+    if (recentSessions.length > 0 && tokenBudget > 100 && !card?.minimal) {
       const sessionLines: string[] = ['## Recent Sessions'];
       for (const [i, session] of recentSessions.entries()) {
         // P1-3 (2026-08-10): 60자는 문장 중간을 잘라 요약이 무의미했다(실측 최근30일 326/376 절단, AVG 121.9자).
