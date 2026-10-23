@@ -133,6 +133,18 @@ excerpts of them first**, each with its line range and a content hash:
   (never to a source that hit its own `lines`/block cap, never reviving an omitted one). What was already shown stays as the
   start of each excerpt; if the files change between reads or the rendered card would exceed the cap, the card stays as it was.
   Ashfall: 2,390 → 3,064 of 3,200 chars, +3 ms
+- (v2.7.3+) **Run origin.** A loop (e.g. Ralph) exports `PASSBATON_ROLE=loop`; Stop stores it per row (`sessions.run_origin`).
+  Only the exact value `loop` counts — unset or anything else is `unknown` (never assumed to be a conversation); old rows stay
+  `unknown`. The origin is not part of duplicate suppression, so a re-delivered Stop is still one row.
+- (v2.7.3+) **Conversation cards hide confirmed loop rows** from *Recent Sessions* (filtered in SQL before `LIMIT 3`, rows are never
+  deleted); `unknown` rows stay and are tagged `[origin unknown]`. A loop session keeps the old behaviour.
+- (v2.7.3+) **Current-task warning.** Mark a source `"role": "current-task"`; if that block is missing (`no_block`), the file is
+  missing/unreadable, or the block is empty, the card's **first line** is `⚠ CURRENT TASK UNKNOWN …`. An explicit
+  "none — waiting" block is a normal read (no warning); a source hidden by the budget gets `ℹ … (card budget — not a failure)`.
+- (v2.7.3+, off by default) **Loop minimal card.** With `"continuity": { "loopCard": "minimal" }` **and** `PASSBATON_ROLE=loop`,
+  sources marked `"role": "current-task"` or `"history"` show only path · range · sha1 · status ("read the source directly");
+  unmarked sources (stop file, decision index) keep their bodies, and *Recent Sessions* is left out. Sources are still read every time.
+  Node comparison on an Ashfall copy: `docs/pb154-m1-card-compare.md`
 
 ### Routing from a workspace root (v2.7.0+)
 
