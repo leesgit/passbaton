@@ -21,6 +21,7 @@ import { detectWorkspaceRoot, isEphemeralRoot, resolveWorkspaceRoot } from '../u
 import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
+import { readRunOrigin } from '../utils/run-origin.js';
 import { humanTurn, requestLine } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
 import { readWorkspaceDeclaration, scanArtifacts, countDeclaredRoots } from '../utils/workspace-config.js';
@@ -1236,12 +1237,14 @@ async function main() {
       coverage.dedup = `unidentified Stop event (transcript ${transcript.readOutcome === 'ok' ? 'has no assistant record' : transcript.readOutcome}) — kept without duplicate suppression`;
     }
     let hasTurnColumns = false;
+    let hasOriginColumn = false;
     try {
       migrateSchema(db);
       const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
         .map(c => c.name);
       hasTurnColumns = ['session_id', 'prompt_id', 'user_intent', 'file_coverage', 'workspace_writes']
         .every(c => cols.includes(c));
+      hasOriginColumn = cols.includes('run_origin');
     } catch { /* 보강 실패 → 구스키마로 동작 */ }
 
     // ★ 턴 식별자가 있으면 그것이 정체성이다. 유사도로 추측하지 않는다.
@@ -1381,6 +1384,10 @@ async function main() {
     if (hasTurnColumns) {
       insertCols.push('session_id', 'prompt_id', 'user_intent', 'file_coverage', 'workspace_writes');
     }
+    // 2.7.3 (reply-154 PB154-A): 실행 출처. ⛔ 중복 판정(dedupWhere)에는 **넣지 않는다** —
+    //   같은 Stop 의 재전달이 다른 환경으로 오더라도 같은 이벤트다. 출처가 새 행을 만들면 실패다.
+    if (hasOriginColumn) insertCols.push('run_origin');
+    const runOrigin = readRunOrigin();
 
     const dedupWhere = turnId && hasTurnColumns
       ? 'project = ? AND session_id IS ? AND prompt_id = ?'
@@ -1423,10 +1430,13 @@ async function main() {
         coverage.attribution = 'no file edits observed in this turn';
       }
 
-      const values = hasTurnColumns
-        ? [...common, sessionId, turnId, userIntent, JSON.stringify(coverage),
-           workspaceWrites.length > 0 ? JSON.stringify(workspaceWrites) : null]
-        : common;
+      const values = [
+        ...(hasTurnColumns
+          ? [...common, sessionId, turnId, userIntent, JSON.stringify(coverage),
+             workspaceWrites.length > 0 ? JSON.stringify(workspaceWrites) : null]
+          : common),
+        ...(hasOriginColumn ? [runOrigin] : []),
+      ];
 
       const dedupArgs = turnId && hasTurnColumns
         ? [project, sessionId, turnId]

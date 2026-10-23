@@ -32,9 +32,11 @@ const COLUMNS: Record<string, Record<string, string>> = {
   // 「비어 있음」이 「안 고쳤다」인지 「안 봤다」인지 구분되지 않는다.
   // workspace_writes: 워킹트리에서 관측한 「이 턴에 쓰인 파일」. modified_files
   // (Edit/Write 로 직접 관측)와 **합치지 않는다** — 근거의 종류가 다르다.
+  // run_origin (2.7.3 · reply-154 PB154-A): 이 행을 쓴 실행의 출처 — `loop` 또는 `unknown`.
+  //   옛 행은 NULL 로 남고 읽는 쪽이 unknown 으로 본다(값을 소급해 채우지 않는다).
   sessions: {
     session_id: 'TEXT', prompt_id: 'TEXT', user_intent: 'TEXT',
-    file_coverage: 'TEXT', workspace_writes: 'TEXT',
+    file_coverage: 'TEXT', workspace_writes: 'TEXT', run_origin: 'TEXT',
   },
   session_files: { prompt_id: 'TEXT' },
   session_roots: { head_baseline: 'TEXT' },
