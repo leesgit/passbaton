@@ -138,6 +138,10 @@ excerpts of them first**, each with its line range and a content hash:
   `unknown`. The origin is not part of duplicate suppression, so a re-delivered Stop is still one row.
 - (v2.7.3+) **Conversation cards hide confirmed loop rows** from *Recent Sessions* (filtered in SQL before `LIMIT 3`, rows are never
   deleted); `unknown` rows stay and are tagged `[origin unknown]`. A loop session keeps the old behaviour.
+  The same applies to the card's **📍 State** line: if the stored state links to a confirmed loop row, the card shows the newest
+  eligible non-loop record instead (text, time and origin from that one record), or `none` — never the loop state. The line now
+  carries `recorded … · origin unknown`; a state that links to no session row is not assumed to be a conversation.
+  The verification *Heads up* is **not** filtered by origin — it is labelled a project-wide verification record.
 - (v2.7.3+) **Current-task warning.** Mark a source `"role": "current-task"`; if that block is missing (`no_block`), the file is
   missing/unreadable, or the block is empty, the card's **first line** is `⚠ CURRENT TASK UNKNOWN …`. An explicit
   "none — waiting" block is a normal read (no warning); a source hidden by the budget gets `ℹ … (card budget — not a failure)`.

@@ -111,6 +111,73 @@ function estimateTokens(text: string): number {
 // 재개 카드에 쓸 최대 글자 수. 토큰 예산(2000)과 같은 예산에서 나간다.
 const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 
+/**
+ * State 줄에 쓸 기록을 고른다 (2.7.3 · Astra reply-156 PB156-100).
+ *
+ * 저장 구조: State 의 원천은 `active_context`(프로젝트당 한 행 · **출처 칸 없음**)다. Stop 훅·MCP session_end 는
+ * 같은 요약을 `sessions.last_work` 에도 적으므로, 연결은 「같은 프로젝트·같은 글」 의 sessions 행으로만 한다.
+ *
+ * ⛔ 계약:
+ *   - 현재 출처가 loop 면 기존 동작 그대로(active_context · 표시 없음).
+ *   - 대화 카드: active_context 가 확인된 loop 행과 연결되면 쓰지 않는다. 그 대신 **loop 를 뺀 최신 적격 sessions 행
+ *     하나**에서 글·시각·출처를 모두 가져온다(행을 섞지 않는다 · 다른 행의 Blocker 도 붙이지 않는다).
+ *     적격 = Recent 와 같은 글 거름 + Stop 이 State 를 덮는 규칙(이번 턴에 일한 증거)과 같은 기준.
+ *   - 적격 기록이 없으면 「none」 — loop 상태로 대체하지 않는다.
+ *   - 연결할 수 없는 active_context(다른 도구가 적은 것·옛 DB)는 대화 출처로 추정하지 않는다 → origin unknown 으로 표시.
+ *   - unknown 도 적격이다 — 그래서 「마지막 대화 상태」 라고 부르지 않는다.
+ */
+type PickedState = { text: string; blockers: string | null; meta: string | null };
+function selectState(db: Database.Database, project: string, thisOrigin: 'loop' | 'unknown'): PickedState | null {
+  const active = db.prepare('SELECT current_state, blockers, updated_at FROM active_context WHERE project = ?').get(project) as
+    { current_state: string | null; blockers: string | null; updated_at: string | null } | undefined;
+  if (!active?.current_state) return null;
+  if (thisOrigin === 'loop') return { text: active.current_state, blockers: active.blockers, meta: null };
+
+  const cols = new Set((db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map(c => c.name));
+  const when = (t: string | null | undefined) => (t ? `recorded ${t.slice(0, 16)} (DB time)` : 'recorded ?');
+  if (!cols.has('run_origin')) {
+    // 2.7.2 까지의 DB — 출처를 확인할 수 없다(loop 로 확인된 행이 없다)
+    return { text: active.current_state, blockers: active.blockers, meta: `${when(active.updated_at)} · origin unknown` };
+  }
+  const linked = db.prepare('SELECT run_origin FROM sessions WHERE project = ? AND last_work = ?')
+    .all(project, active.current_state) as Array<{ run_origin: string | null }>;
+  if (!linked.some(r => r.run_origin === 'loop')) {
+    const how = linked.length > 0 ? 'origin unknown' : 'origin unknown · not linked to a session record';
+    return { text: active.current_state, blockers: active.blockers, meta: `${when(active.updated_at)} · ${how}` };
+  }
+
+  // 확인된 loop 기록 → 버린다. loop 를 뺀 최신 적격 행 하나.
+  const hasEvidence = ['file_coverage', 'workspace_writes', 'modified_files'].every(c => cols.has(c));
+  const rows = db.prepare(`
+    SELECT last_work, issues, timestamp${hasEvidence ? ', file_coverage, workspace_writes, modified_files' : ''} FROM sessions
+    WHERE project = ?
+      AND COALESCE(run_origin, 'unknown') != 'loop'
+      AND last_work NOT IN ('Session ended', 'Session work completed', 'Session started', '')
+      AND length(last_work) > 15
+    ORDER BY timestamp DESC, id DESC LIMIT 200
+  `).all(project) as Array<{ last_work: string; issues: string | null; timestamp: string | null;
+    file_coverage?: string | null; workspace_writes?: string | null; modified_files?: string | null }>;
+  const parse = <T>(raw: string | null | undefined, fallback: T): T => {
+    if (!raw) return fallback;
+    try { return JSON.parse(raw) as T; } catch { return fallback; }
+  };
+  // Stop 훅(session-end)의 workedThisTurn 과 같은 기준. 커버리지가 없는 행(MCP session_end·옛 훅)은 State 를 늘 덮었다.
+  const worked = (r: typeof rows[number]) => {
+    if (!r.file_coverage) return true;
+    const ws = parse<Array<{ written?: string[]; committed?: string[] }>>(r.workspace_writes, []);
+    if (ws.some(w => (w.written?.length ?? 0) > 0 || (w.committed?.length ?? 0) > 0)) return true;
+    const cov = parse<{ source?: string } | null>(r.file_coverage, null);
+    return cov?.source === 'turn_scoped' && parse<string[]>(r.modified_files, []).length > 0;
+  };
+  const row = rows.find(worked);
+  if (!row) {
+    return { text: 'none', blockers: null, meta: 'no eligible record — the last recorded state is from a loop run, and loop records are excluded from this card' };
+  }
+  // MCP session_end 는 blockers 를 issues 에 글 그대로 적는다(훅 행은 JSON 메타). 같은 행의 것만 붙인다.
+  const blockers = row.issues && row.issues.trim() !== '' && parse<unknown>(row.issues, undefined) === undefined ? row.issues : null;
+  return { text: row.last_work, blockers, meta: `${when(row.timestamp)} · origin unknown · newer loop records excluded` };
+}
+
 function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string, transcriptPath?: string, hookCwd?: string): string | null {
   // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
   // 2.7.3 (PB154-C): 출처가 loop 이고 프로젝트 설정이 loopCard: "minimal" 일 때만 최소 카드(그 판단은 카드 쪽이 한다)
@@ -197,14 +264,15 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
     }
 
     // [Priority 1] 현재 상태
-    const active = db.prepare('SELECT current_state, blockers FROM active_context WHERE project = ?').get(project) as { current_state: string; blockers: string } | undefined;
-    if (active?.current_state) {
+    // 2.7.3 (reply-156 PB156-100): 대화 카드(현재 출처 ≠ loop)는 확인된 loop 기록을 State 로 쓰지 않는다 — selectState 참고.
+    const picked = selectState(db, project, readRunOrigin());
+    if (picked) {
       // 카드가 있으면 State 는 「마지막으로 기록된 것」일 뿐이다 — 정본은 카드 쪽이다.
       // 컴팩션 직후라도 이 값은 마지막 Stop 이 적은 것이지 컴팩션이 만든 것이 아니다(2.6.1).
       const stateLabel = card?.anyRead ? '📍 **Last recorded state** (DB · may be stale — the resume card above wins)'
         : source === 'compact' ? '📍 **Last recorded state** (DB · from the last Stop, not from this compaction)'
         : '📍 **State**';
-      const stateBlock = `${stateLabel}: ${active.current_state}` + (active.blockers ? `\n🚧 **Blocker**: ${active.blockers}` : '');
+      const stateBlock = `${stateLabel}: ${picked.text}${picked.meta ? ` _(${picked.meta})_` : ''}` + (picked.blockers ? `\n🚧 **Blocker**: ${picked.blockers}` : '');
       const cost = estimateTokens(stateBlock);
       if (tokenBudget > cost) {
         lines.push(stateBlock);
@@ -532,7 +600,9 @@ function renderFileEvidence(row: {
           const why = bad.verification_result && redRe.test(bad.verification_result)
             ? 'the build was failing'
             : 'issues were left open';
-          const warn = `\n⚠️ **Heads up**: a recent session (${bad.ts}) ended with ${why}. Check before building on top.`;
+          // 2.7.3 (reply-156 PB156-100): 출처로 거르지 않는다 — 세션 출처와 검증 결과의 유효성은 별개다.
+          //   카드에 「프로젝트 공용 검증 기록」 임을 밝힌다(대상·시점·결과는 그대로).
+          const warn = `\n⚠️ **Heads up** (project-wide verification record — sessions of every origin, loop runs included): a recent session (${bad.ts}) ended with ${why}. Check before building on top.`;
           lines.push(warn);
           tokenBudget -= estimateTokens(warn);
         }
