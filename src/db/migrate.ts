@@ -36,7 +36,8 @@ const COLUMNS: Record<string, Record<string, string>> = {
   //   옛 행은 NULL 로 남고 읽는 쪽이 unknown 으로 본다(값을 소급해 채우지 않는다).
   // summary_source (2.7.3 · reply-165 PB165-200): last_work 를 만든 Stop 사다리의 분기(utils/summary-source.ts).
   //   옛 행·MCP session_end 행은 NULL = unknown(소급 안 함). active_context.state_source 는 같은 값을 State 행에 —
-  //   active_context 는 쓰는 곳이 모두 INSERT OR REPLACE 라 다른 도구가 덮으면 NULL(unknown)로 돌아간다.
+  //   2.8 (PB170-010): active_context 는 칸별 쓰기(utils/active-context.ts) — State 글을 바꾸는 쓰기만 이 칸을 다시 정하고
+  //   (출처를 모르면 NULL = unknown), recent_files·검증 기록만 바꾸는 쓰기는 건드리지 않는다.
   sessions: {
     session_id: 'TEXT', prompt_id: 'TEXT', user_intent: 'TEXT',
     file_coverage: 'TEXT', workspace_writes: 'TEXT', run_origin: 'TEXT', summary_source: 'TEXT',

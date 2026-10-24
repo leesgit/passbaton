@@ -13,6 +13,7 @@ import { detectWorkspaceRoot, isEphemeralRoot } from '../utils/workspace.js';
 import { trace, tpathOf } from '../utils/hook-trace.js';
 import { ignoredReason, UNPROVEN_RULES } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
+import { writeActiveContext } from '../utils/active-context.js';
 
 interface ToolUseInput {
   cwd?: string;
@@ -350,10 +351,8 @@ async function main() {
         recentFiles.unshift(filePath);
         recentFiles = recentFiles.slice(0, 10);
 
-        db.prepare(`
-          INSERT OR REPLACE INTO active_context (project, recent_files, updated_at)
-          VALUES (?, ?, datetime('now'))
-        `).run(project, JSON.stringify(recentFiles));
+        // 2.8 (PB170-010): recent_files 칸만 — 옛 부분 REPLACE 는 State·blockers·state_source·검증 기록을 NULL 로 지웠다
+        writeActiveContext(db, project, { recent_files: JSON.stringify(recentFiles) });
 
       } catch {
         // 오류 시 무시

@@ -33,6 +33,7 @@ import Database from 'better-sqlite3';
 import { tokenizeQuery, buildFtsQuery } from './utils/tokenize.js';
 import { migrateSchema } from './db/migrate.js';
 import { buildResumeCard } from './utils/resume-card.js';
+import { writeActiveContext } from './utils/active-context.js';
 
 // @xenova/transformers - 동적 import (sharp 의존성 문제 방지)
 let transformersModule: { pipeline: unknown; env: Record<string, unknown> } | null = null;
@@ -520,7 +521,7 @@ const tools: Tool[] = [
         workDone: { type: 'string', description: 'Description of completed work' },
         nextSteps: { type: 'array', items: { type: 'string' }, description: 'Ordered list of next tasks to pick up' },
         modifiedFiles: { type: 'array', items: { type: 'string' }, description: 'Files modified during this session' },
-        blockers: { type: 'string', description: 'Current blockers or issues (null if none)' }
+        blockers: { type: 'string', description: 'Current blockers or issues. Omit to keep the saved blockers; pass null or an empty string to clear them' }
       },
       required: ['project', 'summary']
     }
@@ -1023,15 +1024,13 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
         );
 
         // 활성 컨텍스트 업데이트
-        db.prepare(`
-          INSERT OR REPLACE INTO active_context (project, current_state, recent_files, blockers, updated_at)
-          VALUES (?, ?, ?, ?, datetime('now'))
-        `).run(
-          project,
-          summary,
-          modifiedFiles ? JSON.stringify(modifiedFiles) : null,
-          blockers || null
-        );
+        // 2.8 (PB170-010): 넘긴 인자의 칸만 — 생략한 modifiedFiles·blockers 는 보존 · 빈 문자열 blockers 는 지움(기존 계약) ·
+        //   State 출처는 이 도구가 모른다 → NULL(unknown) · last_verification 은 이 도구 칸이 아니다
+        writeActiveContext(db, project, {
+          current_state: summary,
+          ...(modifiedFiles !== undefined ? { recent_files: JSON.stringify(modifiedFiles) } : {}),
+          ...(blockers !== undefined ? { blockers: blockers || null } : {}),
+        });
 
         // techStack 저장 (있으면)
         if (techStack && Object.keys(techStack).length > 0) {
@@ -1231,10 +1230,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
           VALUES (?, ?, ?, datetime('now'))
         `).run(project, JSON.stringify(finalStack), description || null);
 
-        db.prepare(`
-          INSERT OR REPLACE INTO active_context (project, current_state, updated_at)
-          VALUES (?, 'Project initialized', datetime('now'))
-        `).run(project);
+        // 2.8 (PB170-010): State 글만 — 이미 있는 프로젝트를 다시 초기화해도 blockers·검증 기록·recent_files 는 보존
+        writeActiveContext(db, project, { current_state: 'Project initialized' });
 
         return {
           content: [{
@@ -1589,11 +1586,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
         const result = runCommand(cmd, projectPath);
 
-        // 결과 저장
-        db.prepare(`
-          INSERT OR REPLACE INTO active_context (project, last_verification, updated_at)
-          VALUES (?, ?, datetime('now'))
-        `).run(project, result.success ? 'build:passed' : 'build:failed');
+        // 결과 저장 — 2.8 (PB170-010): 검증 칸만(옛 부분 REPLACE 는 State·blockers 를 지웠다)
+        writeActiveContext(db, project, { last_verification: result.success ? 'build:passed' : 'build:failed' });
 
         return {
           content: [{
@@ -1669,11 +1663,8 @@ async function handleTool(name: string, args: Record<string, unknown>): Promise<
 
         const allPassed = results.every(r => r.success);
 
-        // 결과 저장
-        db.prepare(`
-          INSERT OR REPLACE INTO active_context (project, last_verification, updated_at)
-          VALUES (?, ?, datetime('now'))
-        `).run(project, allPassed ? 'all:passed' : 'all:failed');
+        // 결과 저장 — 2.8 (PB170-010): 검증 칸만
+        writeActiveContext(db, project, { last_verification: allPassed ? 'all:passed' : 'all:failed' });
 
         const summary = results.map(r =>
           `${r.success ? '✅' : '❌'} ${r.step}: ${r.success ? 'passed' : 'failed'}`

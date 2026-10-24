@@ -22,6 +22,7 @@ import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
 import { readRunOrigin } from '../utils/run-origin.js';
+import { writeActiveContext } from '../utils/active-context.js';
 import type { SummarySource } from '../utils/summary-source.js';
 import { humanTurn, requestLine } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
@@ -1507,15 +1508,12 @@ async function main() {
     ).get(project);
     if (workedThisTurn || !hadState) {
       // 2.7.3 (reply-165 PB165-200): State 와 **같은 행**에 그 글의 생성 출처 — 다른 행에서 가져다 붙이지 않는다
-      db.prepare(`
-        INSERT OR REPLACE INTO active_context (project, current_state, recent_files, updated_at${hasStateSourceColumn ? ', state_source' : ''})
-        VALUES (?, ?, ?, datetime('now')${hasStateSourceColumn ? ', ?' : ''})
-      `).run(
-        project,
-        lastWork,
-        JSON.stringify(modifiedFiles.slice(0, 15)),
-        ...(hasStateSourceColumn ? [lastWorkSource] : [])
-      );
+      // 2.8 (PB170-010): 이 세 칸만 — blockers·last_verification 은 Stop 이 모르는 칸이라 보존(옛 REPLACE 는 영구 삭제)
+      writeActiveContext(db, project, {
+        current_state: lastWork,
+        recent_files: JSON.stringify(modifiedFiles.slice(0, 15)),
+        ...(hasStateSourceColumn ? { state_source: lastWorkSource } : {}),
+      });
     }
     // 일한 증거가 없는 턴은 active_context 를 건드리지 않는다 — updated_at 을 올리면 오래된 State 가
     // 최신처럼 보이고, recent_files 를 덮으면 직전 작업의 파일 목록이 사라진다.
