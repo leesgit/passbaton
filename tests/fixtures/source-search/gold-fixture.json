@@ -1,0 +1,21 @@
+{
+ "name": "합성 레포 정답표 — packet-170 §2-3 형태(reply-170 §4 보정: 169 는 167 을 절 단위로 범위 제한)",
+ "queries": [
+  {
+   "query": "래칫 상향",
+   "expect": [
+    { "path": "docs/ratchet.txt" },
+    { "path": "docs/astra/2026-10-24-reply-164.md", "section": "250 래칫 계약", "supersession": "대체 관계 미확인" }
+   ]
+  },
+  {
+   "query": "동일 배우 이탈 복원",
+   "expect": [
+    { "path": "docs/astra/2026-10-24-reply-169.md", "section": "1. 결정", "supersession": "대체 관계 미확인" },
+    { "path": "docs/astra/2026-10-24-reply-167.md", "section": "2. fix_plan 표", "supersession": "범위 제한" },
+    { "path": "docs/astra/2026-10-24-reply-167.md", "section": "4. 역검증", "supersession": "대체 관계 미확인" },
+    { "path": "docs/astra/2026-10-24-reply-166.md", "section": "2. fix_plan 표", "supersession": "대체" }
+   ]
+  }
+ ]
+}

@@ -113,7 +113,7 @@ const MAX_LINES = 200;
 const MAX_BLOCK_LINES = 120;
 const MAX_SOURCES = 8;
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
-const MAX_CONFIG_BYTES = 64 * 1024;
+export const MAX_CONFIG_BYTES = 64 * 1024;
 /** 원천 하나의 머리글·펜스 몫(대략). 예산을 원천 수로 나눌 때 뺀다. */
 const HEADER_RESERVE = 140;
 const MIN_CARD_CHARS = 400;
@@ -209,7 +209,7 @@ export function readContinuityDeclaration(projectPath: string, io?: CardIo): Con
 }
 
 /** 읽어도 되는 파일인가. 이유를 돌려주면 거부. ⚠ 내용은 절대 보지 않는다. */
-function denyReason(projectPath: string, rel: string): { abs?: string; why?: string; missing?: boolean } {
+export function denyReason(projectPath: string, rel: string): { abs?: string; why?: string; missing?: boolean } {
   let base: string;
   try { base = fs.realpathSync(projectPath); } catch { return { why: 'project folder unreadable' }; }
   const lexical = path.resolve(projectPath, rel);

@@ -1,0 +1,23 @@
+{
+ "name": "Ashfall 실제 레포 — packet-170 §2-3 정답 자료(reply-170 §4 보정 · 절별 근거 없음 = 대체 관계 미확인)",
+ "queries": [
+  {
+   "query": "래칫 상향",
+   "expect": [
+    { "path": "docs/ue_adapter_ratchet.txt" },
+    { "path": "docs/astra/2026-10-24-reply-164.md", "section": "1. 결정", "supersession": "대체 관계 미확인" },
+    { "path": "docs/astra/2026-10-24-reply-164.md", "section": "250 래칫 계약", "supersession": "대체 관계 미확인" }
+   ]
+  },
+  {
+   "query": "동일 배우 이탈 복원",
+   "expect": [
+    { "path": "docs/astra/2026-10-24-reply-169.md", "section": "1. 결정", "supersession": "대체 관계 미확인" },
+    { "path": "docs/astra/2026-10-24-reply-169.md", "section": "2. fix_plan 표", "supersession": "대체 관계 미확인" },
+    { "path": "docs/astra/2026-10-24-reply-169.md", "section": "3. 끝 조건", "supersession": "대체 관계 미확인" },
+    { "path": "docs/astra/2026-10-24-reply-167.md", "section": "2. fix_plan 표", "supersession": "대체 관계 미확인" },
+    { "path": "docs/astra/2026-10-24-reply-166.md", "section": "2. fix_plan 표", "supersession": "대체 관계 미확인" }
+   ]
+  }
+ ]
+}
