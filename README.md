@@ -184,6 +184,55 @@ excerpts of them first**, each with its line range and a content hash:
   SessionStart card as `<path>@<sha1>`. A source that could not be read is written as `<path>@<outcome>` without a hash; no
   DB id is written for a row that does not exist.
 
+### Two side-effect-free CLIs for hand-offs between agents (v2.8+)
+
+Both are separate entry points that **never open the database** (the `passbaton` binary opens it on start) and never write
+hook traces or settings.
+
+**`passbaton-card`** — a snapshot of the resume card, for handing to another agent (e.g. a reviewer model) exactly as built.
+
+```
+passbaton-card --project-dir <dir> --out <card.md> [--meta <meta.json>] [--max-chars N] [--origin loop|unknown] [--no-git] [--force]
+passbaton-card --verify <meta.json> [--card <card.md>]
+```
+
+- Writes only `--out` (the card bytes) and `--meta` (or prints the meta to stdout). Refuses to overwrite without `--force` and
+  does not create directories — a snapshot is meant to be immutable.
+- Each source file is read **once**; the card text, the whole-file SHA-256, the selected range (and its SHA-256), truncation /
+  omission / budget-hidden state and `delivery: full | partial | none` all come from that same buffer. The meta also records the
+  render version, the SHA-256 of `passbaton.config.json` and of the whole card. Git blob/HEAD comparison is auxiliary only —
+  untracked and modified files are identified by their bytes.
+- The meta says `claims: card-file-created-only`. A snapshot proves which bytes were in the card **when it was made**; it is not
+  proof that anyone received or read it. `--verify` re-reads the files and reports what changed since (the card file itself, a
+  source, or the config).
+- A card can be complete while a source inside it is only partly shown (`delivery: partial`): "the card arrived whole" is not
+  "every source arrived whole".
+- Exit codes: `0` ok / match · `1` verify mismatch · `2` usage · `3` no sources declared (no card) · `4` write refused or failed.
+
+**`passbaton-search`** — direct text search over **declared** sources only. No index, no embeddings.
+
+```
+passbaton-search --project-dir <dir> [--config <file>] [--max-results N] [--no-git] [--json] <query…>
+passbaton-search --verify <report.json>
+passbaton-search --project-dir <dir> --gold <gold.json> [--config <file>] [--no-git]
+```
+
+- Searches `search.sources` in `.claude/passbaton.config.json` (`{path}` · `{glob}` · optional `block` = only under that heading);
+  without it, only the `continuity.sources` paths. `..` and absolute paths are refused; a sub-folder with its own passbaton
+  config or `.git` is treated as another project and skipped. Default 20 results (max 200).
+- Each hit: path, heading path, line range, SHA-256 of the whole file, of the range and of the excerpt (bytes actually read),
+  the excerpt, and git status (auxiliary). `--verify` re-reads a saved `--json` report and flags changed or deleted sources.
+- **Supersession is only shown from explicit evidence:** rows of a declared `search.supersession` table
+  (`| target | relation | evidence |`) that name a section (`§N`). Rows without a section are listed under `ignoredEvidence`. Without
+  evidence the label is `대체 관계 미확인` (supersession unknown) — never "still valid" and never "wholly replaced".
+  ⚠ Labels attach to a whole numbered section, while real evidence is often one clause of it; a clause-level replacement can
+  therefore look like a whole-section one. Don't wire a supersession table into real search until that is fixed.
+- **Text search only finds the words that are there.** Measured on one project's decision records (8 fixed questions): 0/8 with
+  the default sources, 2/8 with the decision replies declared — every remaining miss was a vocabulary mismatch (the answer
+  section never uses the question's words). Paraphrased questions miss.
+- Output carries `authority: none — lookup aid only …` — results are pointers to read, not permission to act, and nothing is written back.
+- Exit codes: `0` ok / match / gold passed · `1` verify mismatch / gold failed · `2` usage · `3` no sources declared.
+
 ### Routing from a workspace root (v2.7.0+)
 
 Project detection follows the `cwd`, so a conversation opened at a monorepo root never got a sub-project's card.

@@ -24,7 +24,7 @@ import {
 import type { RunOrigin } from './run-origin.js';
 
 /** 카드 렌더 규칙의 식별. resume-card.ts 의 출력 규칙을 바꾸면 올린다. */
-export const CARD_RENDER_VERSION = 'passbaton-resume-card/2.8-c1';
+export const CARD_RENDER_VERSION = 'passbaton-resume-card/2.8.0';
 export const CARD_META_SCHEMA = 'passbaton.card-meta/1';
 /** 스냅샷은 원천 전체를 읽어 전체 해시를 낸다 — 이보다 크면 읽지 않는다(NOT READ) */
 export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
