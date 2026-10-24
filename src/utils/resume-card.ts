@@ -130,7 +130,15 @@ export function clampCardChars(v: unknown, fallback: number): number {
   return Math.min(MAX_CARD_CHARS, Math.max(MIN_CARD_CHARS, Math.floor(n)));
 }
 
-export function readContinuityDeclaration(projectPath: string): ContinuityDeclaration {
+/**
+ * 2.8 (PB174-200 C1): 원천 바이트를 어디서 읽는가. 기본(없음) = 지금까지처럼 파일에서 매번 읽는다.
+ * 스냅샷 카드는 실경로마다 **한 번** 읽은 버퍼를 돌려주는 구현을 넘긴다 — 해시·범위·카드가 같은 바이트에서 나온다.
+ */
+export interface CardIo {
+  read(abs: string): Buffer;
+}
+
+export function readContinuityDeclaration(projectPath: string, io?: CardIo): ContinuityDeclaration {
   const out: ContinuityDeclaration = { sources: [], invalid: [] };
   const file = path.join(projectPath, '.claude', 'passbaton.config.json');
 
@@ -141,7 +149,7 @@ export function readContinuityDeclaration(projectPath: string): ContinuityDeclar
       out.invalid.push(`.claude/passbaton.config.json is larger than ${MAX_CONFIG_BYTES >> 10} KB — ignored`);
       return out;
     }
-    text = fs.readFileSync(file, 'utf-8');
+    text = io ? io.read(file).toString('utf-8') : fs.readFileSync(file, 'utf-8');
   } catch {
     return out;                                    // 파일 없음 = 선언 없음
   }
@@ -228,7 +236,8 @@ function denyReason(projectPath: string, rel: string): { abs?: string; why?: str
 }
 
 /** 앞에서 최대 maxBytes 만 읽는다. 잘렸으면 마지막의 덜 읽힌 줄은 버린다. */
-function readHead(abs: string, maxBytes: number): { text: string; partial: boolean } {
+function readHead(abs: string, maxBytes: number, io?: CardIo): { text: string; partial: boolean } {
+  if (io) return headOf(io.read(abs), maxBytes);
   const fd = fs.openSync(abs, 'r');
   try {
     const size = fs.fstatSync(fd).size;
@@ -245,6 +254,22 @@ function readHead(abs: string, maxBytes: number): { text: string; partial: boole
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/** readHead 와 같은 규칙으로 이미 읽은 버퍼의 앞부분을 글로(잘렸으면 덜 읽힌 마지막 줄을 버린다). */
+function headOf(buf: Buffer, maxBytes: number): { text: string; partial: boolean } {
+  let text = buf.subarray(0, Math.min(buf.length, maxBytes)).toString('utf-8');
+  const partial = buf.length > maxBytes;
+  if (partial) {
+    const nl = text.lastIndexOf('\n');
+    text = nl >= 0 ? text.slice(0, nl) : '';
+  }
+  return { text, partial };
+}
+
+/** 2.8 (C1): 카드가 고른 범위(from-to, 1-based 포함)의 글 — readSource 가 해시한 것과 같은 규칙으로 같은 버퍼에서. */
+export function selectedTextOf(buf: Buffer, from: number, to: number): string {
+  return splitLines(headOf(buf, MAX_READ_BYTES).text).slice(from - 1, to).join('\n');
 }
 
 function splitLines(text: string): string[] {
@@ -306,7 +331,7 @@ function findBlock(lines: string[], needle: string): { from: number; to: number;
   return { from: pick.i + 1, to: j, hitCap, matches: cands.length };   // 1-based, 포함
 }
 
-export function readSource(projectPath: string, src: ContinuitySource, maxChars: number): CardItem {
+export function readSource(projectPath: string, src: ContinuitySource, maxChars: number, io?: CardIo): CardItem {
   const label = src.label ?? src.path;
   const base: CardItem = { label, path: src.path, outcome: 'unreadable', ...(src.optional === true ? { optional: true } : {}) };
   const gate = denyReason(projectPath, src.path);
@@ -321,7 +346,7 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
 
   let text: string, partial: boolean;
   try {
-    ({ text, partial } = readHead(gate.abs, MAX_READ_BYTES));
+    ({ text, partial } = readHead(gate.abs, MAX_READ_BYTES, io));
   } catch {
     return { ...base, outcome: 'unreadable', why: 'unreadable' };
   }
@@ -490,10 +515,13 @@ export interface BuildCardOptions {
   readExtra?: typeof readSource;
   /** 이번 실행의 출처(2.7.3) — loop 이고 설정이 loopCard: "minimal" 일 때만 최소 카드. 기본 unknown = 전체 카드 */
   origin?: RunOrigin;
+  /** 2.8 (C1): 원천 바이트 공급 — 스냅샷 카드만 넘긴다. 없으면 기존 동작(파일에서 읽음) */
+  io?: CardIo;
 }
 
 export function buildResumeCard(projectPath: string, maxChars: number, opts: BuildCardOptions = {}): ResumeCard | null {
-  const decl = readContinuityDeclaration(projectPath);
+  const io = opts.io;
+  const decl = readContinuityDeclaration(projectPath, io);
   if (decl.sources.length === 0 && decl.invalid.length === 0) return null;
 
   const budget = clampCardChars(maxChars, 3200);
@@ -510,14 +538,14 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   const ctx: RenderCtx = { task, minimal, strip: decl.sources.map(s => s.role === 'current-task' || s.role === 'history') };
 
   let per = Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
-  let items = sources.map(s => readSource(projectPath, s, per));
+  let items = sources.map(s => readSource(projectPath, s, per, io));
   let maxInvalid = 4;
   let card = renderCard(items, invalid, maxInvalid, ctx);
 
   // 1) 발췌를 줄인다
   for (let k = 0; k < 4 && card.text.length > budget && per > 60; k++) {
     per = Math.max(60, Math.floor(per * budget / card.text.length) - 20);
-    items = sources.map(s => readSource(projectPath, s, per));
+    items = sources.map(s => readSource(projectPath, s, per, io));
     card = renderCard(items, invalid, maxInvalid, ctx);
   }
   // 2) 경고 목록을 개수만 남긴다
@@ -555,7 +583,7 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   const grown = [...items];
   for (const { it, i } of targets) {
     const shownBody = (it.excerpt ?? '').length - (it.sliced ? 1 : 0);
-    const next = (opts.readExtra ?? readSource)(projectPath, sources[i], shownBody + share);
+    const next = (opts.readExtra ?? readSource)(projectPath, sources[i], shownBody + share, io);
     extraReads++;
     const kept = it.sliced ? (it.excerpt ?? '').slice(0, -1) : (it.excerpt ?? '');
     const same = next.outcome === 'ok' && next.sha === it.sha && next.from === it.from && next.to === it.to

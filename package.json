@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "bin": {
     "passbaton": "dist/index.js",
+    "passbaton-card": "dist/cli-card.js",
     "passbaton-hooks": "dist/hooks/install.js",
     "passbaton-hook-session-start": "dist/hooks/session-start.js",
     "passbaton-hook-user-prompt": "dist/hooks/user-prompt-submit.js",
