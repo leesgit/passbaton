@@ -191,6 +191,24 @@ describe('C1 card snapshot — same bytes, full identity', () => {
   });
 });
 
+describe('C1 card snapshot — the meta refuses bytes the card was not made from', () => {
+  it('throws when the recorded buffer differs from the one the card read (positive: same buffer → no throw)', () => {
+    const w = project([{ path: 'docs/HANDOFF.md', lines: 3, label: 'HANDOFF' }]);
+    expect(() => renderCardSnapshot(w.proj, { maxChars: 3200, git: false })).not.toThrow();
+    const real = createSnapshotIo();
+    const shadow = new Map<string, Buffer>();
+    const io: SnapshotIo = {
+      buffers: shadow,
+      read(abs) {
+        const b = real.read(abs);
+        shadow.set(abs, abs.endsWith('HANDOFF.md') ? Buffer.from('# 다른 바이트\n- 섞임\n- 셋째\n') : b);
+        return b;
+      },
+    };
+    expect(() => renderCardSnapshot(w.proj, { maxChars: 3200, git: false, io })).toThrow(/not the same bytes/);
+  });
+});
+
 describe('C1 card snapshot — negative tests with positive controls', () => {
   function made() {
     const w = project();
