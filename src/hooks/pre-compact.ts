@@ -219,8 +219,15 @@ async function main() {
       }
     } catch { /* table may not exist */ }
 
-    // 기술 스택
-    const fixed = db.prepare('SELECT tech_stack FROM project_context WHERE project = ?').get(project) as { tech_stack: string } | undefined;
+    // 기술 스택 — project_context 는 MCP 서버(index.ts·db/database.ts)만 만드는 **선택 원천**이다. 훅만 쓴 DB
+    //   (migrateSchema 에 없음)에는 표가 없어서 여기서 던졌고, 인계 행은 이미 적힌 뒤 사람용 systemMessage 만
+    //   빠졌다(status=error · 2.7.3 부터 · Astra reply-174 PB174-010 (b)). 표가 **없을 때만** 건너뛴다 —
+    //   표가 있는데 조회가 실패하면(칸 없음·손상) 그대로 던져 아래 catch 의 status=error 로 드러낸다.
+    const hasProjectContext = db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_context'").get() !== undefined;
+    const fixed = hasProjectContext
+      ? db.prepare('SELECT tech_stack FROM project_context WHERE project = ?').get(project) as { tech_stack: string } | undefined
+      : undefined;
     if (fixed?.tech_stack) {
       try {
         const stack = JSON.parse(fixed.tech_stack);

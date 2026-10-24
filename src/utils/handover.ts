@@ -50,7 +50,14 @@ export function entriesToMessages(entries: TranscriptLine[]): TurnMessage[] {
   for (const entry of entries) {
     if (entry.__broken) continue;
     // Claude Code JSONL은 역할을 최상위 `type`으로 싣고, `message.role`은 없을 수 있다.
-    const role = entry.message?.role || entry.role || entry.type;
+    // ★ 2.8 (Astra reply-174 PB174-010 (d)): **사건 종류(최상위 type)가 먼저**다. 호스트는 대화 줄 말고도
+    //   `api-request-blob`(API 로 보낸 요청 사본 · message.role 'user'|'system'|'assistant')·`attachment`(알림 렌더) 같은
+    //   줄을 같은 파일에 쓴다. 옛 순서(message.role 먼저)는 요청 사본의 `<system-reminder id=…>` 를 사람 요청으로 골랐다.
+    //   type 이 대화 줄이 아니면 건너뛴다 — type 이 없거나 'message'(다른 호스트 모양)일 때만 role 을 본다.
+    const t = entry.type;
+    const role = t === 'user' || t === 'assistant' ? t
+      : t === undefined || t === 'message' ? (entry.message?.role || entry.role)
+      : undefined;
     if (role === 'user') {
       const turn = humanTurn(entry);
       if (turn.uncertain) out.push({ role, content: '', toolPaths: [], uncertain: true });

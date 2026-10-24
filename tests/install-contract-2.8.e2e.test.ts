@@ -162,8 +162,8 @@ describe.skipIf(!built)('PB170-030 N1 — 등록 정보로 전달 → 훅 도달
 
     const t = transcript(ws, '청크 경계 고쳐줘');
     deliver(reg.claude, 'PreCompact', { ...base, transcript_path: t, trigger: 'manual' }, ws);
-    // 효과 = 이 세션의 인계 행(SessionStart(compact) 가 읽는 것). ⚠ 훅만 쓰는 DB 에서는 뒤쪽 project_context 조회가
-    //   던져 사람용 systemMessage 가 빠진다(2.7.3 부터 있던 결함 · 인계 행은 그 전에 적힌다) — 이 시험의 범위 밖
+    // 효과 = 이 세션의 인계 행(SessionStart(compact) 가 읽는 것). 훅 전용 DB 의 project_context 부재로 사람용
+    //   systemMessage 가 빠지던 결함(2.7.3~)은 PB174-010 (b) 에서 고쳤다 — tests/compact-recovery-2.8.e2e.test.ts
     const rows = q<{ request: string | null }>(dbPath, 'SELECT request FROM compact_handover WHERE session_id = ?', base.session_id);
     expect(rows).toHaveLength(1);
     expect(rows[0].request).toContain('청크 경계 고쳐줘');

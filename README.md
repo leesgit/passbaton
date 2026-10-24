@@ -164,6 +164,12 @@ excerpts of them first**, each with its line range and a content hash:
 - (v2.8+) **No error-time solution injection.** The PostToolUse Bash-error → `<past-solution>` path is gone: the installer only
   ever registered that hook for `Edit`/`Write`, so no installed setup ever reached it. Recording error→fix pairs at Stop and the
   MCP tools (`solution_record`, `solution_find`, `solution_suggest`) are unchanged.
+- (v2.8+) **Compaction recovery fixes.** PreCompact no longer fails on a hooks-only database (no `project_context` table — that
+  table is created only by the MCP server): the handover row is stored *and* the "context saved" notice is shown. A table that
+  exists but cannot be read is still reported as an error. The "Last human request" line is taken only from real `user`
+  transcript lines — API request copies (`api-request-blob`) and notification renders are skipped, and notifications with
+  attributes (`<system-reminder id="…">`) are stripped. If no human request can be identified, the line says
+  `not identified` instead of showing leftover text.
 
 ### Routing from a workspace root (v2.7.0+)
 

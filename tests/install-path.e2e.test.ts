@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import Database from 'better-sqlite3';
 import { claudeHookCommand } from '../src/hooks/install.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -75,6 +76,75 @@ const commandsOf = (settings: Settings, event: string) =>
 const runExec = (h: Handler, input: string, env: NodeJS.ProcessEnv) =>
   spawnSync(h.command, h.args ?? [], { input, env, encoding: 'utf8', timeout: 60_000, shell: false });
 
+// ── PostToolUse 도달 계약 (Astra reply-174 PB174-010 (a)) ──────────────────────────────────────────────
+// 앞 판은 등록 **항목 수**(PostToolUse 항목 2 · post-tool-use.js 줄 2)를 고정했다 — Edit·Write 를 한 항목
+// `Edit|Write` 로 합친 등가 변경도 빨강이었다. 이제는 호스트처럼 matcher 를 도구 이름에 맞춰 띄울 명령을 고르고,
+// 실제로 띄워 **도달(관측 효과)·실행 횟수(hook-trace 줄)·출력**을 본다. 등록 모양은 묻지 않는다.
+const REACHED_TOOLS = ['Edit', 'Write'];
+const UNREACHED_TOOLS = ['Bash', 'Read', 'Glob', 'Grep', 'NotebookEdit', 'WebFetch'];
+type MEntry = { matcher?: string; hooks: Handler[] };
+/** Claude Code 의 matcher 규칙: 없음·빈 문자열·'*' = 전부 · 그 밖은 도구 이름 전체에 맞는 정규식(대소문자 구별) */
+const matcherHits = (matcher: string | undefined, tool: string) =>
+  matcher === undefined || matcher === '' || matcher === '*' || new RegExp(`^(?:${matcher})$`).test(tool);
+/** 이 도구의 PostToolUse 에 호스트가 띄울 명령들(등록 순서) */
+const postToolDispatch = (settings: Settings, tool: string): Handler[] =>
+  ((settings.hooks.PostToolUse ?? []) as MEntry[]).filter(e => matcherHits(e.matcher, tool)).flatMap(e => e.hooks);
+const isOurPostTool = (h: Handler) => [h.command, ...(h.args ?? [])].join(' ').includes('post-tool-use.js');
+
+/**
+ * 등록 정보만으로 Edit·Write·무관 도구를 한 번씩 전달하고 관측한다. 작업 폴더는 hookTrace 켬(실행 횟수 = trace 줄 수).
+ * `launchable` 로 띄울 명령을 고른다(사용자 줄 my-formatter 처럼 이 PC 에 없는 명령은 띄우지 않고 세기만 한다).
+ */
+function reachPostTool(settings: Settings, env: NodeJS.ProcessEnv, launchable: (h: Handler) => boolean = () => true) {
+  const ws = tmpDir('pb-reach-');
+  fs.mkdirSync(path.join(ws, '.git'));
+  fs.mkdirSync(path.join(ws, '.claude'));
+  fs.writeFileSync(path.join(ws, '.claude', 'passbaton.config.json'), JSON.stringify({ features: { hookTrace: { enabled: true } } }));
+  const sid = 'reach';
+  const start = runExec(handlersOf(settings, 'SessionStart')[0],
+    JSON.stringify({ session_id: sid, cwd: ws, hook_event_name: 'SessionStart', source: 'startup' }), env);
+  expect(start.status, start.stderr).toBe(0);
+  const per: Record<string, { dispatched: Handler[]; outs: string[]; file: string }> = {};
+  for (const tool of [...REACHED_TOOLS, ...UNREACHED_TOOLS]) {
+    const file = path.join(ws, `${tool.toLowerCase()}-target.ts`);
+    const dispatched = postToolDispatch(settings, tool);
+    const outs = dispatched.filter(launchable).map(h => {
+      const r = runExec(h, JSON.stringify({ session_id: sid, cwd: ws, hook_event_name: 'PostToolUse', tool_name: tool,
+        tool_input: { file_path: file, path: ws, old_string: 'a', new_string: 'b', content: 'x', command: 'echo hi' } }), env);
+      expect(r.status, `${tool}: ${r.stderr}`).toBe(0);
+      return r.stdout;
+    });
+    per[tool] = { dispatched, outs, file };
+  }
+  const traceLog = path.join(ws, '.claude', 'hook-trace.log');
+  const lines = fs.existsSync(traceLog)
+    ? fs.readFileSync(traceLog, 'utf8').split(/\r?\n/).filter(l => l.includes('hook=post-tool-use')) : [];
+  const runs = (tool: string) => lines.filter(l => l.split(' ').includes(`tool=${tool}`)).length;
+  const db = new Database(path.join(ws, '.claude', 'sessions.db'), { readonly: true });
+  const tracked = (db.prepare('SELECT file_path FROM session_files WHERE session_id = ?').all(sid) as Array<{ file_path: string }>)
+    .map(r => r.file_path);
+  db.close();
+  return { per, runs, tracked, traceLines: lines.length };
+}
+
+/** 도달 계약: Edit·Write 는 각각 우리 훅 정확히 한 번(실행 1 · 그 파일 추적 · 출력 없음) · 무관 도구는 우리 훅 0 · 실행 0 */
+function expectPostToolReach(r: ReturnType<typeof reachPostTool>) {
+  for (const tool of REACHED_TOOLS) {
+    const { dispatched, outs, file } = r.per[tool];
+    expect(dispatched.filter(isOurPostTool), `${tool}: our hook dispatched exactly once`).toHaveLength(1);
+    expect(r.runs(tool), `${tool}: hook ran exactly once (hook-trace)`).toBe(1);
+    expect(r.tracked, `${tool}: hook effect (session_files)`).toContain(file);
+    expect(outs.join(''), `${tool}: no stdout on a normal edit`).toBe('');
+  }
+  for (const tool of UNREACHED_TOOLS) {
+    expect(r.per[tool].dispatched.filter(isOurPostTool), `${tool}: not dispatched`).toHaveLength(0);
+    expect(r.runs(tool), `${tool}: not run`).toBe(0);
+    expect(r.tracked).not.toContain(r.per[tool].file);
+  }
+  // 양성 대조: 위의 0 이 「trace 가 안 켜졌다」 가 아님 — post-tool-use trace 줄 수 = 도달 도구 수
+  expect(r.traceLines).toBe(REACHED_TOOLS.length);
+}
+
 /** 이 PC 에서 훅을 띄울 수 있는 셸들 (Claude Code 는 Windows 에서 Git Bash 로 띄운다). */
 function shells(): Array<{ name: string; run: (cmd: string, input: string, env: NodeJS.ProcessEnv) => ReturnType<typeof spawnSync> }> {
   const out: ReturnType<typeof shells> = [];
@@ -103,7 +173,11 @@ describe.skipIf(!built)('install — Claude Code 훅은 PATH 없이 돈다', () 
       expect(hs).toHaveLength(1);
       expect(hs[0]).toEqual({ type: 'command', command: process.execPath, args: [path.join(ROOT, 'dist', 'hooks', file)] });
     }
-    expect(handlersOf(s, 'PostToolUse')).toHaveLength(2);
+    // PostToolUse 는 모양(항목 수)이 아니라 도달 계약으로 — 분리 등록이든 `Edit|Write` 한 항목이든 같은 동작이면 초록
+    for (const h of handlersOf(s, 'PostToolUse')) {
+      expect(h).toEqual({ type: 'command', command: process.execPath, args: [path.join(ROOT, 'dist', 'hooks', 'post-tool-use.js')] });
+    }
+    expectPostToolReach(reachPostTool(s, barePathEnv(home)));
     const mcp = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).mcpServers['project-manager'];
     expect(mcp).toEqual({ command: process.execPath, args: [path.join(ROOT, 'dist', 'index.js')] });
   });
@@ -192,7 +266,12 @@ describe.skipIf(!built)('install — Claude Code 훅은 PATH 없이 돈다', () 
     expect(s.model).toBe('keep-me');
     const post = commandsOf(s, 'PostToolUse');
     expect(post.filter(c => c === 'my-formatter --fix')).toHaveLength(1);
-    expect(post.filter(c => c.includes('post-tool-use.js'))).toHaveLength(2);
+    // 두 번 설치 뒤에도 Edit·Write 각각 우리 훅이 한 번만 뜬다(중복 등록 = 실행 2 → 빨강) · 사용자 줄은 원래 matcher(Edit)에서만
+    const reach = reachPostTool(s, barePathEnv(home), isOurPostTool);
+    expectPostToolReach(reach);
+    const userLine = (tool: string) => reach.per[tool].dispatched.filter(h => h.command === 'my-formatter --fix').length;
+    expect(userLine('Edit')).toBe(1);
+    expect(userLine('Write')).toBe(0);
     expect(post.some(c => c.startsWith('npm exec'))).toBe(false);
     const stop = commandsOf(s, 'Stop');
     expect(stop).toContain('my-wrapper passbaton-hook-session-end');

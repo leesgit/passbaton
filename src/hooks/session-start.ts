@@ -269,6 +269,8 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
         if (h && current && (h.request || h.active_file)) {
           const bits = ['♻️ **Recovered after compaction**'];
           if (h.request) bits.push(`- Last human request (a request, not a result${h.pending ? ' · no reply yet' : ''}): ${h.request}`);
+          // 2.8 (PB174-010 (d)): 사람 요청을 못 가렸으면 그렇다고 쓴다 — 빈자리를 남은 글(알림 등)로 채우지 않는다
+          else bits.push('- Last human request: not identified (only system/harness lines before this compaction — ask, do not guess)');
           if (h.active_file) bits.push(`- Active file: ${h.active_file}`);
           const block = bits.join('\n');
           // 카드 다음 자리다. 카드가 예산을 다 먹었으면 넣지 않는다 — 예산을 넘기지 않는 것이 먼저

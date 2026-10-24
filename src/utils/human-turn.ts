@@ -35,7 +35,10 @@ export interface TranscriptEntry {
 
 /** 사람 글을 감싸거나 앞에 붙는 문맥 — 벗기면 사람 글이 남을 수 있다. */
 const CONTEXT_WRAPPERS = [
-  /<system-reminder>[\s\S]*?<\/system-reminder>/g,
+  // 2.8 (Astra reply-174 PB174-010 (d)): 호스트는 `<system-reminder id="…">` 처럼 **속성을 단** 알림도 보낸다(다른 세션·
+  //   에이전트 메시지 · 2026-10-22~24 실측). 옛 `<system-reminder>` 정확 일치는 이것을 못 벗겨서 컴팩션 복구에
+  //   「Last human request: <system-reminder id=…>」 가 나왔다.
+  /<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/g,
   // Codex support (2026-07-09): Codex injects <environment_context> into the first user message
   /<environment_context>[\s\S]*?<\/environment_context>/g,
   // Gemini support (2026-07-10): Gemini injects <session_context> into the first user message
@@ -100,6 +103,9 @@ export function humanTurn(entry: TranscriptEntry): HumanTurn {
 
   for (const re of CONTEXT_WRAPPERS) text = text.replace(re, '');
   text = text.trim();
+  // 벗기지 못한(닫히지 않은·잘린) 알림이 맨 앞에 남았다 — 남은 글을 사람 원문이라 부르지 않는다(PB174-010 (d)).
+  //   「없었던 줄」 로도 치지 않는다: 그 앞의 옛 요청이 「마지막 요청」 으로 올라오지 않게 표지만 남긴다(PB144-03 과 같음)
+  if (/^<system-reminder\b/i.test(text)) return { ...none, uncertain: true };
 
   // 맨 앞 봉투: 그 블록들을 걷어 내고 사람 글이 남지 않으면 기계 줄이다(실측 194/194 가 이 모양).
   //   남으면 — `<bash-stdout>오류</bash-stdout>\n이 오류 설명해줘` — 사람이 붙여 넣은 인용 + 요청이다.
