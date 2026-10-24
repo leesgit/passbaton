@@ -32,7 +32,7 @@ Every new session — whether you're in Claude Code, Codex CLI, or Gemini CLI:
 ```bash
 # Session start → Auto-loads relevant context + recent session history
 # When asking → Auto-injects relevant memories/solutions
-# During conversation → Tracks active files + auto-injects error solutions
+# During conversation → Tracks active files (Edit, Write)
 # On compact → Structured handover context for continuity
 # On exit → Extracts commits, decisions, error-fix pairs from transcript
 ```
@@ -160,7 +160,10 @@ excerpts of them first**, each with its line range and a content hash:
 - (v2.7.3+) **Less noise, same meaning.** A Recent row with zero observations from a *complete* check is shortened to
   `files: 0 obs in checked scope · 1/1 roots · boundary=turn_start · declared 1 (valid 1)`; partial checks, skipped roots, no
   baseline, declaration errors and "not recorded" keep the long form. The `Solutions: N recorded` statistic is left out only when a
-  resume card with at least one read source was delivered to a non-loop session; error-time solution injection is unchanged.
+  resume card with at least one read source was delivered to a non-loop session.
+- (v2.8+) **No error-time solution injection.** The PostToolUse Bash-error → `<past-solution>` path is gone: the installer only
+  ever registered that hook for `Edit`/`Write`, so no installed setup ever reached it. Recording error→fix pairs at Stop and the
+  MCP tools (`solution_record`, `solution_find`, `solution_suggest`) are unchanged.
 
 ### Routing from a workspace root (v2.7.0+)
 
@@ -482,7 +485,7 @@ Drawback: you must install separately in every project, `npm exec` may not find 
 |------|---------|----------|
 | `SessionStart` | `passbaton-hook-session-start` | Auto-loads project context on session start |
 | `UserPromptSubmit` | `passbaton-hook-user-prompt` | Auto-injects relevant memories + past reference search |
-| `PostToolUse` | `passbaton-hook-post-tool` | Tracks active files (Edit, Write) + auto-injects error solutions (Bash) |
+| `PostToolUse` | `passbaton-hook-post-tool` | Tracks active files (Edit, Write) |
 | `PreCompact` | `passbaton-hook-pre-compact` | Structured handover context before compression |
 | `Stop` | `passbaton-hook-session-end` | Extracts commits, decisions, error-fix pairs from transcript |
 
@@ -518,7 +521,7 @@ After installation, restart Claude Code to activate the hooks.
 | 📊 **Memory Classification** | 5 types: observation, decision, learning, error, pattern |
 | ✅ **Integrated Verification** | One-click build/test/lint execution |
 | 📋 **Task Management** | Priority-based task management |
-| 🔧 **Auto Error→Solution** | **(v1.12.0)** Bash errors auto-detect → inject past solutions; session-end auto-records error-fix pairs |
+| 🔧 **Error→Solution Archive** | Session-end auto-records error-fix pairs; look them up with `solution_find` / `solution_suggest` (the v1.12.0 Bash-error auto-injection was removed in v2.8 — the installed hook never received Bash events) |
 | 💰 **Token Efficiency** | **(v1.11.0)** Removed loadContext from UserPromptSubmit (saves 24-60K tokens/session) |
 | 📑 **Progressive Disclosure** | **(v1.11.0)** memory_search returns index first, memory_get for full content |
 | ⏳ **Temporal Decay** | **(v1.11.0)** Memory scoring with type-specific half-lives for relevance |
@@ -618,7 +621,6 @@ The only genuinely user-flippable flags today are **`compactionHandover`, `hotPa
 
 **PostToolUse Hook** (`npx passbaton-hook-post-tool`):
 - Tracks hot file paths and updates `active_context.recent_files`
-- **(v1.12.0)** Auto-detects Bash errors → searches solutions DB → injects past solutions into context
 - **No longer creates observation memories** (v1.10.0 — eliminates `[File Change]` noise)
 
 **PreCompact Hook** (`npx passbaton-hook-pre-compact`):
@@ -990,7 +992,6 @@ npm run test:coverage
 - [x] Temporal decay for memory scoring with type-specific half-lives (v1.11.0)
 - [x] Progressive disclosure — memory_search returns index, memory_get for full content (v1.11.0)
 - [x] Memory consolidation via Jaccard similarity (v1.11.0)
-- [x] Auto error→solution pipeline — PostToolUse detects Bash errors, injects past solutions (v1.12.0)
 - [x] SessionEnd auto-records error-fix pairs to solutions table (v1.12.0)
 - [x] Cross-project solution search with current project prioritization (v1.12.0)
 - [ ] sqlite-vec native vector search (v2 - when data > 1000 records)

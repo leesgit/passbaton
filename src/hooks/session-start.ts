@@ -647,13 +647,14 @@ function renderFileEvidence(row: {
 
     // [Priority 6] 솔루션 통계 (1줄, 저비용)
     // 2.7.3 (reply-165 PB165-300): 재개 카드가 **실제로 전달된**(발췌가 하나라도 실린) 비-loop 출력에서는 통계 줄을 뺀다 —
-    //   일에 쓰는 정보가 아니다. 오류 때 해법 주입(post-tool-use)은 그대로다. loop·카드 없음·못 읽은 카드는 기존대로.
+    //   일에 쓰는 정보가 아니다. loop·카드 없음·못 읽은 카드는 기존대로.
+    // 2.8 (reply-170 PB170-030 · C6): 오류 때 자동 주입은 제거됐다 — 「auto-injected on error」 라고 약속하지 않는다.
     if (!(card?.anyRead && thisOrigin !== 'loop')) try {
       const solCount = (db.prepare(
         'SELECT COUNT(*) as cnt FROM solutions WHERE project = ?'
       ).get(project) as { cnt: number })?.cnt || 0;
       if (solCount > 0) {
-        const solLine = `\nSolutions: ${solCount} recorded (auto-injected on error)\n`;
+        const solLine = `\nSolutions: ${solCount} recorded (look up with solution_find)\n`;
         if (tokenBudget > 10) {
           lines.push(solLine);
           tokenBudget -= estimateTokens(solLine);

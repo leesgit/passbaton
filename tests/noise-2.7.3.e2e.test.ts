@@ -4,6 +4,7 @@
 // 미기록·부분 검사(checked < roots · 못 본 곳)·경계 없음·선언 오류·무효 선언은 지금의 긴 꼴 그대로 ·
 // `Solutions: N recorded` 통계 줄은 재개 카드가 실제로 전달된(anyRead) 비-loop 출력에서만 뺀다 · 오류 때 해법 주입은 그대로.
 // 역검증(reply-165 §1 300): 부분 검사를 정상 0 으로 보이면 빨강 · 오류 해법 주입까지 끄면 빨강.
+// ⚠ 2.8 (reply-170 PB170-030 · C6): 오류 때 해법 자동 주입은 제거됐다(실제 설치에서 도달 불가) — 마지막 시험은 뒤집힌 기대.
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'child_process';
@@ -112,7 +113,7 @@ describe.skipIf(!built)('PB165-300 files 줄 — 정상 완전 검사의 관측 
 });
 
 describe.skipIf(!built)('PB165-300 Solutions 통계 줄 — 재개 카드가 전달된 비-loop 출력에서만 생략', () => {
-  const STAT = /^Solutions: 3 recorded \(auto-injected on error\)$/m;
+  const STAT = /^Solutions: 3 recorded \(look up with solution_find\)$/m;   // 2.8: 자동 주입 약속 문구 제거
   const READABLE = [{ path: 'docs/HANDOFF.md', lines: 5, label: 'HANDOFF' }];
 
   it('카드 전달(anyRead) + 비-loop → 통계 줄 없음 · 카드는 있음', () => {
@@ -142,7 +143,9 @@ describe.skipIf(!built)('PB165-300 Solutions 통계 줄 — 재개 카드가 전
     expect(start(ws, proj, 'loop')).toMatch(STAT);
   });
 
-  it('오류 때 해법 주입은 그대로 — Bash 오류 출력 → <past-solution> (카드가 있어도)', () => {
+  // 2.8 (reply-170 PB170-030 · C6): 이 경로는 실제 설치에서 도달한 적이 없어(matcher Edit·Write) 제거했다 — 기대를 뒤집는다.
+  //   수동 해법 도구 보존·설치 경로 도달은 tests/install-contract-2.8.e2e.test.ts.
+  it('2.8: Bash 오류 출력을 직접 줘도 <past-solution> 을 내지 않는다(자동 주입 제거)', () => {
     const { ws, proj } = workspace({ workspace: NORMAL }, { solutions: 3 });
     card(proj, READABLE, { 'docs/HANDOFF.md': '# 최신 절\n' });
     const env: NodeJS.ProcessEnv = { ...process.env, WORKSPACE_ROOT: ws };
@@ -152,7 +155,7 @@ describe.skipIf(!built)('PB165-300 Solutions 통계 줄 — 재개 카드가 전
       encoding: 'utf-8', env,
     });
     expect(r.status, r.stderr?.slice(0, 300)).toBe(0);
-    expect(r.stdout).toContain('<past-solution>');
-    expect(r.stdout).toContain('셰이더 캐시 모듈 경로를 tsconfig paths 에 추가했다');
+    expect(r.stdout).not.toContain('<past-solution>');
+    expect(r.stdout).not.toContain('셰이더 캐시 모듈 경로를 tsconfig paths 에 추가했다');
   });
 });

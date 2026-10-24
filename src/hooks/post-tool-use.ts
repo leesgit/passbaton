@@ -36,70 +36,11 @@ interface ToolUseInput {
   transcript_path?: string;
 }
 
-// ===== 에러 감지 → 솔루션 자동 주입 =====
-
-const ERROR_PATTERNS = [
-  /(?:error|Error|ERROR)\s*[:\[]/,
-  /(?:FAILED|FAIL|failed)\s/,
-  /(?:Cannot find|Module not found|No such file)/,
-  /(?:Permission denied|EACCES|EPERM)/,
-  /(?:command not found|ENOENT)/,
-  /exit code [1-9]/,
-  /(?:TypeError|SyntaxError|ReferenceError|RangeError)\s*:/,
-  /(?:FATAL|panic|segfault)/i,
-];
-
-function extractErrorSignature(output: string): string | null {
-  const lines = output.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.length < 10) continue;
-    for (const pattern of ERROR_PATTERNS) {
-      if (pattern.test(trimmed)) {
-        // 에러 라인에서 시그니처 추출 (파일 경로/라인번호 제거, 핵심만)
-        return trimmed
-          .replace(/\s+at\s+.+$/, '')  // stack trace 제거
-          .replace(/\(.*?\)/g, '')      // 경로 괄호 제거
-          .slice(0, 80)
-          .trim();
-      }
-    }
-  }
-  return null;
-}
-
-function searchSolutions(db: InstanceType<typeof Database>, project: string, errorSig: string): Array<{
-  error_signature: string;
-  solution: string;
-  project: string;
-  created_at: string;
-}> {
-  try {
-    // 에러 키워드 추출 (3글자 이상 단어)
-    const keywords = errorSig.split(/\s+/).filter(w => w.length > 3).slice(0, 3);
-    if (keywords.length === 0) return [];
-
-    const likeConditions = keywords.map(() => 'error_signature LIKE ?').join(' OR ');
-    const likeParams = keywords.map(k => `%${k}%`);
-
-    return db.prepare(`
-      SELECT error_signature, solution, project, created_at
-      FROM solutions
-      WHERE (${likeConditions})
-      ORDER BY
-        CASE WHEN project = ? THEN 0 ELSE 1 END,
-        created_at DESC
-      LIMIT 2
-    `).all(...likeParams, project) as Array<{
-      error_signature: string;
-      solution: string;
-      project: string;
-      created_at: string;
-    }>;
-  } catch {
-    return [];
-  }
-}
+// ===== (제거) 에러 감지 → 솔루션 자동 주입 =====
+// 2.8 (Astra reply-170 PB170-030 · C6): Bash 오류 출력 → <past-solution> 주입 경로를 걷어냈다. 설치기는 이 훅을
+// matcher Edit·Write 로만 등록하므로(install.ts) Bash 발화는 실제 설치에서 **한 번도 이 프로세스에 오지 않았다** —
+// 훅을 직접 부른 시험만 초록이었다. 오류→해법 **기록**(session-end solutionCapture)과 수동 조회(MCP solution_find·
+// solution_record·solution_suggest)·과거 참조의 Solutions 는 그대로다. Codex·Gemini 에는 PostToolUse 등록 자체가 없다.
 
 /**
  * DB 경로. **임시 작업 디렉터리에는 아무것도 만들지 않는다.**
@@ -225,36 +166,9 @@ async function main() {
       sid: input.session_id ? 'yes' : 'no',
     });
 
-    // Bash 에러 감지 → 솔루션 자동 주입
-    if (toolName === 'Bash' && input.tool_result) {
-      const errorSig = extractErrorSignature(input.tool_result);
-      if (errorSig) {
-        const cwd = input.cwd || process.cwd();
-        const project = detectProject(cwd);
-        const dbPath = getDbPath(cwd);
-        if (!dbPath) {
-          process.exit(0);   // 임시 작업 디렉터리 — 기록할 워크스페이스가 없다
-        }
-        if (fs.existsSync(dbPath)) {
-          try {
-            const db = new Database(dbPath, { readonly: true });
-            const solutions = searchSolutions(db, project, errorSig);
-            db.close();
-            if (solutions.length > 0) {
-              const lines = ['## Past solutions for similar error\n'];
-              for (const s of solutions) {
-                const sol = s.solution.length > 100 ? s.solution.slice(0, 100) + '...' : s.solution;
-                const date = s.created_at?.slice(0, 10) || '';
-                lines.push(`- **${s.error_signature.slice(0, 60)}** → ${sol} (${s.project}, ${date})`);
-              }
-              console.log(`\n<past-solution>\n${lines.join('\n')}\n</past-solution>\n`);
-            }
-          } catch { /* ignore */ }
-        }
-      }
-      process.exit(0);
-    }
-
+    // 2.8 (PB170-030): Bash 분기(오류 → 해법 자동 주입)는 제거 — 위 파일 머리 주석 참조. Bash 가 와도 아래 필터에서 끝난다.
+    // Read·Glob·Grep 분기(hot_paths)는 남아 있지만 설치기가 그 matcher 를 등록하지 않아 실제 설치에서는 도달하지 않는다
+    // (tests/install-contract-2.8.e2e.test.ts 가 「미등록」 으로 고정).
     const TRACKED_TOOLS = ['Edit', 'Write', 'Read', 'Glob', 'Grep'];
 
     if (!TRACKED_TOOLS.includes(toolName)) {
