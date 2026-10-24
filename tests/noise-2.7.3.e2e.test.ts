@@ -88,6 +88,7 @@ describe.skipIf(!built)('PB165-300 files 줄 — 정상 완전 검사의 관측 
     ['다 셌지만 못 본 곳(잘림·HEAD 기준선 없음)', { ...NORMAL, uncovered: ['repo: truncated'] }, /\(1\/1 roots, boundary=turn_start, declared 1 \(valid 1\), skipped: repo: truncated\)$/],
     ['checked < roots 인데 이유가 비었음', { ...NORMAL, roots: 3, checked: 2 }, /\(2\/3 roots, boundary=turn_start, declared 1 \(valid 1\)\)$/],
     ['경계 없음(턴 시작 기준선 없음)', { ...NORMAL, boundary: 'none', checked: 0, uncovered: ['no turn-start baseline (UserPromptSubmit did not record this turn)'] }, /\(0\/1 roots, boundary=none, /],
+    ['경계가 기록되지 않음(boundary 칸 없음)', { roots: 1, checked: 1, uncovered: [], declared: 1, valid: 1 }, /\(1\/1 roots, boundary=\?, declared 1 \(valid 1\)\)$/],
     ['볼 곳 없음(0/0 roots)', { ...NORMAL, roots: 0, checked: 0, uncovered: ['no registered worktree (not a git repository?)'] }, /\(0\/0 roots, boundary=turn_start, /],
     ['선언 파일 오류', { ...NORMAL, declStatus: 'malformed' }, /\(1\/1 roots, boundary=turn_start, root declaration malformed\)$/],
     ['무효 선언(valid < declared)', { ...NORMAL, declared: 2, valid: 1 }, /\(1\/1 roots, boundary=turn_start, declared 2 \(valid 1\)\)$/],
