@@ -44,6 +44,10 @@
  *     있을 때만, role 이 current-task·history 인 원천의 **본문만** 뺀다(경로·범위·해시·상태 줄은 남긴다).
  *     role 이 없는 원천(정지 사유·처분 색인)은 그대로 싣는다 — 명시하지 않은 것은 숨기지 않는다.
  *     원천 검사는 생략하지 않는다: 본문을 뺄 원천도 매번 읽어 상태·해시를 낸다(no_block 경고 유지).
+ *   - `optional: true` (2.7.3 · 선택 · reply-165 PB165-100): **파일이 없을 때만** ⚠ NOT READ 대신 중립 줄
+ *     「file absent (optional source)」 로 낸다(`.ralph/DEMO_STOP`·요청 대기 파일처럼 없는 것이 정상인 원천).
+ *     ⛔ 경로 경계 거부·비밀 이름·일반 파일 아님·읽기 실패·블록 없음·빈 범위·잘림은 optional 이어도 그대로 보인다.
+ *     없는 선택 원천은 「읽음」(anyRead)으로 세지 않는다. 불리언이 아닌 값은 원천을 살리고 optional 만 버린다.
  */
 
 import type { RunOrigin } from './run-origin.js';
@@ -62,6 +66,8 @@ export interface ContinuitySource {
   block?: string;
   label?: string;
   role?: SourceRole;
+  /** 없는 것이 정상인 원천(2.7.3 PB165-100) — 명시적 true 일 때만 「파일 없음」 을 중립으로 낸다 */
+  optional?: boolean;
 }
 
 export interface ContinuityDeclaration {
@@ -97,6 +103,8 @@ export interface CardItem {
   matches?: number;
   /** 읽었지만 카드 예산 때문에 본문을 못 보였다(실패가 아니다 · 2.7.3 PB154-D) */
   budgetHidden?: boolean;
+  /** 선언에서 optional: true 였다(2.7.3 PB165-100) — outcome 이 missing 일 때만 표시가 달라진다 */
+  optional?: boolean;
   why?: string;
 }
 
@@ -178,12 +186,15 @@ export function readContinuityDeclaration(projectPath: string): ContinuityDeclar
     }
     // 모르는 role 은 원천을 버리지 않고 role 만 버린다 — 오타 하나로 정지 사유 같은 원천이 사라지면 안 된다
     if (src.role !== undefined && !isRole(src.role)) out.invalid.push(`${src.path}: role ${JSON.stringify(src.role).slice(0, 30)} ignored`);
+    // optional 도 같다 — "true" 같은 문자열은 불리언이 아니다. 버리면 기본(없음 = ⚠)으로 돌아가 부재를 숨기지 않는다
+    if (src.optional !== undefined && typeof src.optional !== 'boolean') out.invalid.push(`${src.path}: optional ${JSON.stringify(src.optional).slice(0, 30)} ignored`);
     out.sources.push({
       path: src.path,
       lines: src.lines as number | undefined,
       block: src.block as string | undefined,
       label: typeof src.label === 'string' && src.label.trim() ? src.label.slice(0, 80) : src.path,
       ...(isRole(src.role) ? { role: src.role } : {}),
+      ...(src.optional === true ? { optional: true } : {}),
     });
   }
   return out;
@@ -297,9 +308,15 @@ function findBlock(lines: string[], needle: string): { from: number; to: number;
 
 export function readSource(projectPath: string, src: ContinuitySource, maxChars: number): CardItem {
   const label = src.label ?? src.path;
-  const base: CardItem = { label, path: src.path, outcome: 'unreadable' };
+  const base: CardItem = { label, path: src.path, outcome: 'unreadable', ...(src.optional === true ? { optional: true } : {}) };
   const gate = denyReason(projectPath, src.path);
-  if (gate.missing) return { ...base, outcome: 'missing', why: 'file not found' };
+  if (gate.missing) {
+    // 끊어진 링크는 「없음」 이 아니라 가리키는 곳을 못 따라간 것이다 — optional 이어도 중립으로 내지 않는다
+    let dangling = false;
+    if (base.optional) { try { fs.lstatSync(path.resolve(projectPath, src.path)); dangling = true; } catch { /* 정말 없음 */ } }
+    if (dangling) { const { optional: _o, ...b } = base; return { ...b, outcome: 'missing', why: 'file not found (dangling link)' }; }
+    return { ...base, outcome: 'missing', why: 'file not found' };
+  }
   if (!gate.abs) return { ...base, outcome: 'denied', why: gate.why };
 
   let text: string, partial: boolean;
@@ -398,6 +415,8 @@ function renderItem(it: CardItem, omitBody = false): string[] {
     const fence = fenceFor(it.excerpt ?? '');
     return [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`, fence, it.excerpt ?? '', fence];
   }
+  // 2.7.3 (PB165-100): 선언이 optional 이고 **파일이 없을 때만** 중립 — 거부·읽기 실패·블록 없음은 아래 ⚠ 그대로
+  if (it.outcome === 'missing' && it.optional === true) return [`### ${it.label} — \`${it.path}\` · file absent (optional source — not an error)`];
   return [`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`];
 }
 

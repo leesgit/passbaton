@@ -149,6 +149,10 @@ excerpts of them first**, each with its line range and a content hash:
   sources marked `"role": "current-task"` or `"history"` show only path · range · sha1 · status ("read the source directly");
   unmarked sources (stop file, decision index) keep their bodies, and *Recent Sessions* is left out. Sources are still read every time.
   Node comparison on an Ashfall copy: `docs/pb154-m1-card-compare.md`
+- (v2.7.3+) **Optional sources.** `"optional": true` on a source turns *only* "file not found" into a neutral
+  `file absent (optional source — not an error)` line (for a stop file that normally does not exist). Boundary/secret/type
+  refusals, unreadable files, a missing block, an empty range and truncation still show as before; an absent source never
+  counts as "read". A non-boolean value is reported as ignored and the source keeps the default behaviour.
 
 ### Routing from a workspace root (v2.7.0+)
 
