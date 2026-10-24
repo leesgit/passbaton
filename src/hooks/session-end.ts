@@ -22,6 +22,7 @@ import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
 import { readRunOrigin } from '../utils/run-origin.js';
+import type { SummarySource } from '../utils/summary-source.js';
 import { humanTurn, requestLine } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
 import { readWorkspaceDeclaration, scanArtifacts, countDeclaredRoots } from '../utils/workspace-config.js';
@@ -785,6 +786,8 @@ async function main() {
 
     // === 추출 시작 ===
     let lastWork = '';
+    // 2.7.3 (reply-165 PB165-200): lastWork 를 **실제로 채운 분기**. 채운 자리에서만 정한다 — 나중에 글로 추정하지 않는다.
+    let lastWorkSource: SummarySource | null = null;
     let nextTasks: string[] = [];
     let commitMessages: string[] = [];
     let errorsSolved: string[] = [];
@@ -832,6 +835,7 @@ async function main() {
     // 2a: 커밋 메시지 — 이 턴에 실제로 일어난 일 중 가장 강한 증거
     if (commitMessages.length > 0) {
       lastWork = commitMessages.slice(0, 3).join('; ');
+      if (lastWork) lastWorkSource = 'commit';
     }
 
     // P1-2 (2026-08-10): nextTasks 추출을 `!lastWork` 폴백 밖으로 분리.
@@ -850,13 +854,14 @@ async function main() {
     // 2d: last_assistant_message에서 추출
     if (!lastWork && input.last_assistant_message) {
       lastWork = extractSummaryFromText(input.last_assistant_message);
+      if (lastWork) lastWorkSource = 'assistant-text';
     }
 
     // 2c: transcript에서 최근 assistant 메시지 스캔 (이미 파싱됨)
     if (!lastWork && transcript.recentAssistantMessages.length > 0) {
       for (let i = transcript.recentAssistantMessages.length - 1; i >= 0; i--) {
         lastWork = extractSummaryFromText(transcript.recentAssistantMessages[i]);
-        if (lastWork) break;
+        if (lastWork) { lastWorkSource = 'assistant-text'; break; }
       }
     }
 
@@ -868,7 +873,7 @@ async function main() {
         for (const line of lines) {
           if (actionVerbs.test(line) && line.length > 20) {
             const cleaned = stripMarkdown(line).trim();
-            if (cleaned.length > 15) { lastWork = cleaned.slice(0, 200); break; }
+            if (cleaned.length > 15) { lastWork = cleaned.slice(0, 200); lastWorkSource = 'fallback'; break; }
           }
         }
         if (lastWork) break;
@@ -885,7 +890,7 @@ async function main() {
       }
       for (let i = assistantMsgs.length - 1; i >= Math.max(0, assistantMsgs.length - 5); i--) {
         lastWork = extractSummaryFromText(assistantMsgs[i].content);
-        if (lastWork) break;
+        if (lastWork) { lastWorkSource = 'assistant-text'; break; }
       }
     }
 
@@ -1184,6 +1189,7 @@ async function main() {
     if (!lastWork && modifiedFiles.length > 0) {
       const fileNames = modifiedFiles.slice(0, 5).map(f => displayName(f)).join(', ');
       lastWork = `Modified files: ${fileNames}`;
+      lastWorkSource = 'fallback';
     }
 
     // Phase 5: 모든 last_work 결정 경로에 stripSlashPrefix 강제 적용
@@ -1211,6 +1217,7 @@ async function main() {
       }
 
       lastWork = NO_OUTCOME;
+      lastWorkSource = 'no-result';
     }
 
     // 스키마 확장 — 세션·턴 식별자와 요청을 컬럼으로 갖는다.
@@ -1238,6 +1245,8 @@ async function main() {
     }
     let hasTurnColumns = false;
     let hasOriginColumn = false;
+    let hasSourceColumn = false;
+    let hasStateSourceColumn = false;
     try {
       migrateSchema(db);
       const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
@@ -1245,6 +1254,9 @@ async function main() {
       hasTurnColumns = ['session_id', 'prompt_id', 'user_intent', 'file_coverage', 'workspace_writes']
         .every(c => cols.includes(c));
       hasOriginColumn = cols.includes('run_origin');
+      hasSourceColumn = cols.includes('summary_source');
+      hasStateSourceColumn = (db.prepare('PRAGMA table_info(active_context)').all() as Array<{ name: string }>)
+        .some(c => c.name === 'state_source');
     } catch { /* 보강 실패 → 구스키마로 동작 */ }
 
     // ★ 턴 식별자가 있으면 그것이 정체성이다. 유사도로 추측하지 않는다.
@@ -1387,6 +1399,8 @@ async function main() {
     // 2.7.3 (reply-154 PB154-A): 실행 출처. ⛔ 중복 판정(dedupWhere)에는 **넣지 않는다** —
     //   같은 Stop 의 재전달이 다른 환경으로 오더라도 같은 이벤트다. 출처가 새 행을 만들면 실패다.
     if (hasOriginColumn) insertCols.push('run_origin');
+    // 2.7.3 (reply-165 PB165-200): 요약의 생성 출처 — 출처와 마찬가지로 중복 판정에는 넣지 않는다
+    if (hasSourceColumn) insertCols.push('summary_source');
     const runOrigin = readRunOrigin();
 
     const dedupWhere = turnId && hasTurnColumns
@@ -1436,6 +1450,7 @@ async function main() {
              workspaceWrites.length > 0 ? JSON.stringify(workspaceWrites) : null]
           : common),
         ...(hasOriginColumn ? [runOrigin] : []),
+        ...(hasSourceColumn ? [lastWorkSource] : []),
       ];
 
       const dedupArgs = turnId && hasTurnColumns
@@ -1491,13 +1506,15 @@ async function main() {
       "SELECT 1 FROM active_context WHERE project = ? AND current_state IS NOT NULL AND current_state != ''"
     ).get(project);
     if (workedThisTurn || !hadState) {
+      // 2.7.3 (reply-165 PB165-200): State 와 **같은 행**에 그 글의 생성 출처 — 다른 행에서 가져다 붙이지 않는다
       db.prepare(`
-        INSERT OR REPLACE INTO active_context (project, current_state, recent_files, updated_at)
-        VALUES (?, ?, ?, datetime('now'))
+        INSERT OR REPLACE INTO active_context (project, current_state, recent_files, updated_at${hasStateSourceColumn ? ', state_source' : ''})
+        VALUES (?, ?, ?, datetime('now')${hasStateSourceColumn ? ', ?' : ''})
       `).run(
         project,
         lastWork,
-        JSON.stringify(modifiedFiles.slice(0, 15))
+        JSON.stringify(modifiedFiles.slice(0, 15)),
+        ...(hasStateSourceColumn ? [lastWorkSource] : [])
       );
     }
     // 일한 증거가 없는 턴은 active_context 를 건드리지 않는다 — updated_at 을 올리면 오래된 State 가

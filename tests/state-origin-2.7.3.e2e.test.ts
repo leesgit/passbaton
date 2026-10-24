@@ -87,7 +87,7 @@ describe.skipIf(!built)('PB156-100 대화 카드의 State — 확인된 loop 기
     seed(dbPath, ROWS, LOOP_ACTIVE);
     const s = stateLines(start(ws, proj));
     expect(s).toEqual([
-      '📍 **State**: 대화 상태 B — 미니맵 H 요청서와 체크리스트를 정리했다 _(recorded 2026-10-23 02:00 (DB time) · origin unknown · newer loop records excluded)_',
+      '📍 **State**: 대화 상태 B — 미니맵 H 요청서와 체크리스트를 정리했다 _(via unknown · recorded 2026-10-23 02:00 (DB time) · origin unknown · newer loop records excluded)_',
     ]);
   });
 
@@ -120,7 +120,7 @@ describe.skipIf(!built)('PB156-100 대화 카드의 State — 확인된 loop 기
     seed(dbPath, [ROWS[0], ...ROWS.slice(2)], LOOP_ACTIVE);
     const s = stateLines(start(ws, proj));
     expect(s).toEqual([
-      '📍 **State**: 대화 상태 A — 지도 렌더 조사 결과를 남겼다 _(recorded 2026-10-23 01:00 (DB time) · origin unknown · newer loop records excluded)_',
+      '📍 **State**: 대화 상태 A — 지도 렌더 조사 결과를 남겼다 _(via unknown · recorded 2026-10-23 01:00 (DB time) · origin unknown · newer loop records excluded)_',
       '🚧 **Blocker**: A 의 블로커 — 셰이더 캐시',
     ]);
   });
@@ -135,11 +135,11 @@ describe.skipIf(!built)('PB156-100 대화 카드의 State — 확인된 loop 기
     expect(s[0]).not.toContain('BLOCKED');
   });
 
-  it('현재 세션이 loop 면 기존 동작 — active_context 그대로 · 표시 없음', () => {
+  it('현재 세션이 loop 면 기존 동작 — active_context 그대로 · 출처 표시 없음(생성 출처만 — 옛 행이라 unknown)', () => {
     const { ws, proj, dbPath } = workspace();
     seed(dbPath, ROWS, LOOP_ACTIVE);
     expect(stateLines(start(ws, proj, 'loop'))).toEqual([
-      `📍 **State**: ${ROWS[4].work}`,
+      `📍 **State**: ${ROWS[4].work} _(via unknown)_`,
       '🚧 **Blocker**: loop 쪽 블로커',
     ]);
   });
@@ -154,7 +154,7 @@ describe.skipIf(!built)('PB156-100 대화 카드의 State — 확인된 loop 기
     const { ws, proj, dbPath } = workspace();
     seed(dbPath, ROWS, { state: ROWS[1].work, at: '2026-10-23 02:00:01', blockers: '대화 블로커' });
     expect(stateLines(start(ws, proj))).toEqual([
-      `📍 **State**: ${ROWS[1].work} _(recorded 2026-10-23 02:00 (DB time) · origin unknown)_`,
+      `📍 **State**: ${ROWS[1].work} _(via unknown · recorded 2026-10-23 02:00 (DB time) · origin unknown)_`,
       '🚧 **Blocker**: 대화 블로커',
     ]);
   });
@@ -163,7 +163,7 @@ describe.skipIf(!built)('PB156-100 대화 카드의 State — 확인된 loop 기
     const { ws, proj, dbPath } = workspace();
     seed(dbPath, ROWS, { state: 'update_active_context 가 적은 상태 — 어느 세션 행과도 같지 않다', at: '2026-10-23 06:00:00' });
     const s = stateLines(start(ws, proj));
-    expect(s).toEqual(['📍 **State**: update_active_context 가 적은 상태 — 어느 세션 행과도 같지 않다 _(recorded 2026-10-23 06:00 (DB time) · origin unknown · not linked to a session record)_']);
+    expect(s).toEqual(['📍 **State**: update_active_context 가 적은 상태 — 어느 세션 행과도 같지 않다 _(via unknown · recorded 2026-10-23 06:00 (DB time) · origin unknown · not linked to a session record)_']);
   });
 
   it('DB 는 바뀌지 않는다 — 행·active_context 그대로', () => {
@@ -223,7 +223,7 @@ describe.skipIf(!built)('PB156-300 옛 DB(2.7.2 · run_origin 칸 없음) — �
     const { ws, proj, dbPath } = workspace();
     oldDb(dbPath);
     const s = stateLines(start(ws, proj));
-    expect(s).toEqual(['📍 **State**: 옛 루프 기록 — 게이트 실행 기록을 정비했다 _(recorded 2026-10-22 10:00 (DB time) · origin unknown)_']);
+    expect(s).toEqual(['📍 **State**: 옛 루프 기록 — 게이트 실행 기록을 정비했다 _(via unknown · recorded 2026-10-22 10:00 (DB time) · origin unknown)_']);
     const db = new Database(dbPath, { readonly: true });
     const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map(c => c.name);
     db.close();

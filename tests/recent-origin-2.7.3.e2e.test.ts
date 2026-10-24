@@ -152,8 +152,8 @@ describe.skipIf(!built)('PB154-B 대화 카드의 Recent Sessions — 필터 먼
     const { ws, proj } = workspace(rows);
     const r = recent(start(ws, proj));
     expect(r).toEqual([
-      '- [2026-10-24] [origin unknown] 실행 래퍼(b81qgl3wk)가 10 분 시간 제한으로 정리됐습니다',
-      '- [2026-10-23] [origin unknown] 대화 A — 지도 렌더 조사 결과와 다음 단계 정리',
+      '- [2026-10-24] [origin unknown] 실행 래퍼(b81qgl3wk)가 10 분 시간 제한으로 정리됐습니다 _(via unknown)_',
+      '- [2026-10-23] [origin unknown] 대화 A — 지도 렌더 조사 결과와 다음 단계 정리 _(via unknown)_',
     ]);
   });
 });

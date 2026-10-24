@@ -153,6 +153,10 @@ excerpts of them first**, each with its line range and a content hash:
   `file absent (optional source — not an error)` line (for a stop file that normally does not exist). Boundary/secret/type
   refusals, unreadable files, a missing block, an empty range and truncation still show as before; an absent source never
   counts as "read". A non-boolean value is reported as ignored and the source keeps the default behaviour.
+- (v2.7.3+) **Summary provenance.** Stop stores which branch produced the summary (`sessions.summary_source`,
+  `active_context.state_source`): commit message · assistant text · fallback (action line or file list) · no result. The 📍 State
+  line and each *Recent Sessions* row show it from that same record (`_(via commit message · …)_`); old rows and rows written by
+  other tools show `via unknown` (never guessed from the text). A commit-message summary is still not proof that the work is done.
 
 ### Routing from a workspace root (v2.7.0+)
 
