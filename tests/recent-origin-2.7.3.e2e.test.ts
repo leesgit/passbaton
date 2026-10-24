@@ -26,7 +26,7 @@ afterEach(() => {
   }
 });
 
-type Row = { work: string; origin: 'loop' | 'unknown' | null; at: string };
+type Row = { work: string; origin: 'loop' | 'unknown' | null; at: string; intent?: string };
 
 function workspace(rows: Row[], withOriginColumn = true) {
   const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-273b-')));
@@ -39,8 +39,8 @@ function workspace(rows: Row[], withOriginColumn = true) {
   const db = new Database(dbPath);
   migrateSchema(db);
   if (withOriginColumn) {
-    const ins = db.prepare("INSERT INTO sessions (project, last_work, timestamp, run_origin) VALUES ('game', ?, ?, ?)");
-    for (const r of rows) ins.run(r.work, r.at, r.origin);
+    const ins = db.prepare("INSERT INTO sessions (project, last_work, timestamp, run_origin, user_intent) VALUES ('game', ?, ?, ?, ?)");
+    for (const r of rows) ins.run(r.work, r.at, r.origin, r.intent ?? null);
   } else {
     db.exec('ALTER TABLE sessions DROP COLUMN run_origin');      // 2.7.2 까지의 모양
     const ins = db.prepare("INSERT INTO sessions (project, last_work, timestamp) VALUES ('game', ?, ?)");
@@ -137,6 +137,24 @@ describe.skipIf(!built)('PB154-B 대화 카드의 Recent Sessions — 필터 먼
     const r = recent(start(ws, proj));
     expect(r).toHaveLength(3);
     for (const l of r) expect(l).toContain('[origin unknown]');
+  });
+
+  // reply-165 PB165-210 (O3): 2.7.2 가 쓴 랄프 행은 출처가 NULL 이다 — 요청 글(intent)·요약 문구로 loop 라고 소급하지 않는다.
+  //   그 행은 계약대로 남고(unknown 표시) · 명시적 loop 행만 빠지며 · 필터는 LIMIT 앞이다.
+  it('NULL 출처 + 랄프 같은 intent·요약 → 남는다(intent 로 출처 추정 안 함) · 명시 loop 만 빠진다', () => {
+    const rows: Row[] = [
+      { work: '대화 A — 지도 렌더 조사 결과와 다음 단계 정리', origin: 'unknown', at: '2026-10-23 01:00:00' },
+      { work: '실행 래퍼(b81qgl3wk)가 10 분 시간 제한으로 정리됐습니다', origin: null, at: '2026-10-24 02:00:00', intent: 'Ashfall — Ralph 루프 지침' },
+      { work: '루프 1 — 이번 루프에서도 아무것도 하지 않았습니다', origin: 'loop', at: '2026-10-24 03:00:00', intent: 'Ashfall — Ralph 루프 지침' },
+      { work: '루프 2 — 게이트 실행 기록을 정비했습니다', origin: 'loop', at: '2026-10-24 04:00:00', intent: 'Ashfall — Ralph 루프 지침' },
+      { work: '루프 3 — 이번 루프에서도 아무것도 하지 않았습니다', origin: 'loop', at: '2026-10-24 05:00:00', intent: 'Ashfall — Ralph 루프 지침' },
+    ];
+    const { ws, proj } = workspace(rows);
+    const r = recent(start(ws, proj));
+    expect(r).toEqual([
+      '- [2026-10-24] [origin unknown] 실행 래퍼(b81qgl3wk)가 10 분 시간 제한으로 정리됐습니다',
+      '- [2026-10-23] [origin unknown] 대화 A — 지도 렌더 조사 결과와 다음 단계 정리',
+    ]);
   });
 });
 
