@@ -158,7 +158,8 @@ describe.skipIf(!built)('SessionStart — 파일 증거 렌더링', () => {
     });
 
     const out = run(ws);
-    expect(out).toContain('no qualifying observations within checked scope');
+    // 2.7.3 (reply-165 PB165-300): 정상 완전 검사는 짧은 꼴 — 그래도 「검사 범위에서」 0 이다
+    expect(out).toContain('files: 0 obs in checked scope · 1/1 roots · boundary=turn_start');
     expect(out).not.toContain('No files changed');
   });
 

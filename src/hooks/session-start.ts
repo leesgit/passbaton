@@ -317,7 +317,7 @@ function renderFileEvidence(row: {
 
   const edited = parse<string[]>(row.modified_files, []);
   const groups = parse<Array<{ root: string; written: string[]; committed?: string[] }>>(row.workspace_writes, []);
-  const coverage = parse<{ workspace?: { boundary?: string; scope?: string; roots?: number; checked?: number; uncovered?: string[]; declared?: number; valid?: number; declStatus?: string } } | null>(row.file_coverage, null);
+  const coverage = parse<{ workspace?: { boundary?: string; scope?: string; roots?: number; checked?: number; uncovered?: string[]; declared?: number; valid?: number; declStatus?: string; artifacts?: { problems?: string[] } } } | null>(row.file_coverage, null);
 
   const key = (p: string) => p.split(String.fromCharCode(92)).join('/').toLowerCase();
   const sampled = new Set<string>();
@@ -361,10 +361,17 @@ function renderFileEvidence(row: {
     w.uncovered?.length ? `skipped: ${w.uncovered.slice(0, 2).join('; ')}` : '',
   ].filter(Boolean).join(', ');
 
+  // 2.7.3 (reply-165 PB165-300): 관측 0 인 **정상 완전 검사**만 짧게 — 범위(checked/roots)·경계·선언/유효 수는 그대로 남긴다.
+  //   정상 = 루트가 있고 전부 봤고(checked = roots) · 턴 시작 경계 · 못 본 곳 없음 · 선언 오류·무효 선언 없음 · 산출물 스캔 문제 없음.
+  //   ⛔ 부분 검사·미기록·선언 오류는 아래 긴 꼴 그대로 — 「0 obs」 가 「다 봤는데 없었다」 로만 읽히게 한다.
+  const complete = (w: NonNullable<typeof ws>) => (w.roots ?? 0) > 0 && w.checked === w.roots && w.boundary === 'turn_start'
+    && !w.uncovered?.length && !w.declStatus && (w.valid === undefined || w.valid === w.declared) && !w.artifacts?.problems?.length;
+
   if (byRoot.size === 0) {
-    out.push(ws
-      ? `  files: no qualifying observations within checked scope (${ws.checked ?? 0}/${ws.roots ?? 0} roots, boundary=${ws.boundary ?? '?'}${why(ws) ? `, ${why(ws)}` : ''})`
-      : '  files: not recorded');
+    out.push(!ws ? '  files: not recorded'
+      : complete(ws)
+      ? `  files: 0 obs in checked scope · ${ws.checked}/${ws.roots} roots · boundary=${ws.boundary}${declText(ws) ? ` · ${declText(ws)}` : ''}`
+      : `  files: no qualifying observations within checked scope (${ws.checked ?? 0}/${ws.roots ?? 0} roots, boundary=${ws.boundary ?? '?'}${why(ws) ? `, ${why(ws)}` : ''})`);
     return out;
   }
 
@@ -639,7 +646,9 @@ function renderFileEvidence(row: {
     } catch { /* hot_paths table may not exist */ }
 
     // [Priority 6] 솔루션 통계 (1줄, 저비용)
-    try {
+    // 2.7.3 (reply-165 PB165-300): 재개 카드가 **실제로 전달된**(발췌가 하나라도 실린) 비-loop 출력에서는 통계 줄을 뺀다 —
+    //   일에 쓰는 정보가 아니다. 오류 때 해법 주입(post-tool-use)은 그대로다. loop·카드 없음·못 읽은 카드는 기존대로.
+    if (!(card?.anyRead && thisOrigin !== 'loop')) try {
       const solCount = (db.prepare(
         'SELECT COUNT(*) as cnt FROM solutions WHERE project = ?'
       ).get(project) as { cnt: number })?.cnt || 0;

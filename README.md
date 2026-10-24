@@ -157,6 +157,10 @@ excerpts of them first**, each with its line range and a content hash:
   `active_context.state_source`): commit message · assistant text · fallback (action line or file list) · no result. The 📍 State
   line and each *Recent Sessions* row show it from that same record (`_(via commit message · …)_`); old rows and rows written by
   other tools show `via unknown` (never guessed from the text). A commit-message summary is still not proof that the work is done.
+- (v2.7.3+) **Less noise, same meaning.** A Recent row with zero observations from a *complete* check is shortened to
+  `files: 0 obs in checked scope · 1/1 roots · boundary=turn_start · declared 1 (valid 1)`; partial checks, skipped roots, no
+  baseline, declaration errors and "not recorded" keep the long form. The `Solutions: N recorded` statistic is left out only when a
+  resume card with at least one read source was delivered to a non-loop session; error-time solution injection is unchanged.
 
 ### Routing from a workspace root (v2.7.0+)
 
