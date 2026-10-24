@@ -81,6 +81,8 @@ function audit(body: Buffer, frags: Frag[], allowedRest: RegExp) {
   for (const f of frags) {
     expect(f.in_body, `${f.src} in body`).toBe('yes');
     expect(f.at, `${f.src} offset`).toBeGreaterThanOrEqual(0);
+    // subarray 는 끝을 넘으면 조용히 자른다 — 본문 끝을 넘는 길이 기록(잘림 전 길이 등)을 sha 대조가 놓치지 않게(PB174-020)
+    expect(f.at + f.bytes, `${f.src} recorded length stays inside the emitted body`).toBeLessThanOrEqual(body.length);
     const slice = body.subarray(f.at, f.at + f.bytes);
     expect(sha12(slice), `${f.src} bytes/sha match the emitted body`).toBe(f.sha);
     covered.fill(1, f.at, f.at + f.bytes);
@@ -215,5 +217,139 @@ describe.skipIf(!built)('PB170-100 C9 재개 사건 기록 — 자동 칸 결속
     expect(checkResumeEvent(judged(ev, { first_action_ok: 'unjudged', verdict: 'same' }), log).join()).toMatch(/verdict without judging/);
     expect(checkResumeEvent(judged(ev, { first_action_ok: 'unjudged', verdict: 'unjudged', judge: null, evidence: null }), log)).toEqual([]);
     expect(checkResumeEvent(judged(ev, { calls_before_first_action: 0, first_action_ok: 'yes', verdict: 'better' }), log)).toEqual([]);
+  });
+});
+
+// ── PB174-020 (Astra reply-174 §1 (c)) — routed-card 원천 식별 ─────────────────────────────────────────────
+// 계약: 파일 원천 = 워크스페이스 기준 경로 : 선택 범위 @ 그 범위의 sha1(앞 10 · 카드에 찍힌 값) [~보인 끝 줄(잘렸을 때)] ·
+//   읽지 못한 원천 = 경로@결과(해시 없음) · DB 원천 = 실제 session_route 행(session_id/project — 그 행에서 읽은 값) ·
+//   존재하지 않는 DB 행 id 를 만들지 않는다. 검사는 원장을 믿지 않고 디스크·DB·stdout 에서 다시 잰다.
+describe.skipIf(!built)('PB174-020 N3 — routed-card 원천 식별(파일 범위·해시 · DB 행)', () => {
+  const ROUTES = { '/ashfall': 'apps/game', '/other': 'apps/other', '/home': '.' };
+  function routedWs(handoff: string, lines = 5) {
+    const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-174r-')));
+    roots.push(ws);
+    for (const [name, body] of [['game', handoff], ['other', '# 최신\n- 다음: 다른 앱 일\n']]) {
+      const proj = path.join(ws, 'apps', name);
+      fs.mkdirSync(path.join(proj, 'docs'), { recursive: true });
+      fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
+      fs.writeFileSync(path.join(proj, 'docs', 'HANDOFF.md'), body);
+      fs.writeFileSync(path.join(proj, '.claude', 'passbaton.config.json'),
+        JSON.stringify({ continuity: { sources: [{ path: 'docs/HANDOFF.md', lines, label: 'HANDOFF' }] } }));
+    }
+    fs.mkdirSync(path.join(ws, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'package.json'), JSON.stringify({ name: 'mono', workspaces: ['apps/*'] }));
+    const trace = (enabled: boolean) => fs.writeFileSync(path.join(ws, '.claude', 'passbaton.config.json'),
+      JSON.stringify({ routing: { commands: ROUTES }, features: { hookTrace: { enabled } } }));
+    trace(false);
+    run(SESSION_START, ws, { cwd: ws, session_id: 'S0', source: 'startup' });   // DB
+    return { ws, dbPath: path.join(ws, '.claude', 'sessions.db'), trace };
+  }
+  const ask = (ws: string, sid: string, prompt: string, env: Record<string, string> = {}) =>
+    run(USER_PROMPT, ws, { cwd: ws, session_id: sid, prompt }, env);
+  const routeRows = (dbPath: string, sid: string) => {
+    const db = new Database(dbPath, { readonly: true });
+    try { return db.prepare('SELECT session_id, project FROM session_route WHERE session_id = ?').all(sid) as Array<{ session_id: string; project: string }>; }
+    finally { db.close(); }
+  };
+  /** 파일 원천 id 를 디스크에서 다시 잰다 — 범위의 줄을 다시 잘라 sha1 앞 10 */
+  function fileSource(ws: string, id: string) {
+    const m = /^(.+):(\d+)-(\d+)@([0-9a-f]{10})(?:~(\d+))?$/.exec(id);
+    expect(m, `file source id shape: ${id}`).not.toBeNull();
+    const [, rel, a, b, sha, shown] = m!;
+    const all = fs.readFileSync(path.join(ws, rel), 'utf8').split(/\r?\n/);
+    if (all.length > 1 && all[all.length - 1] === '') all.pop();
+    const from = Number(a), to = Number(b);
+    const rangeText = all.slice(from - 1, to).join('\n');
+    expect(crypto.createHash('sha1').update(rangeText).digest('hex').slice(0, 10), `${id}: range hash = bytes on disk`).toBe(sha);
+    return { rel, from, to, sha, shown: shown === undefined ? undefined : Number(shown), rangeText };
+  }
+  const fragText = (body: Buffer, f: Frag) => body.subarray(f.at, f.at + f.bytes).toString('utf8');
+
+  it('명령 턴: ids = 실제 session_route 행 + 파일 경로:범위@sha1 — 디스크·DB·본문과 결속 · trace on/off 본문 동일', () => {
+    const { ws, dbPath, trace } = routedWs('# 최신\n- 다음: N174-020 원장 결속\n- 정지: DEMO_STOP 유지\n');
+    const off = ask(ws, 'A', '/ashfall 이어서');
+    trace(true);
+    const on = ask(ws, 'B', '/ashfall 이어서');
+    expect(on).toBe(off);
+    expect(on).toContain('N174-020 원장 결속');                         // 양성: 카드가 실제로 나왔다
+    const body = Buffer.from(on.replace(/\r?\n$/, ''), 'utf8');
+    const { frags } = ledger(ws, 'user-prompt');
+    expect(frags.map(f => f.src)).toEqual(['routed-card']);
+    audit(body, frags, /^$/);
+    const ids = frags[0].ids!.split(',');
+    const rows = routeRows(dbPath, 'B');
+    expect(rows).toHaveLength(1);
+    expect(ids[0]).toBe(`session_route:${rows[0].session_id}/${rows[0].project}`);
+    expect(ids).toHaveLength(2);
+    const src = fileSource(ws, ids[1]);
+    expect(src.rel).toBe('apps/game/docs/HANDOFF.md');
+    expect(src.shown).toBeUndefined();                                 // 안 잘렸다
+    const text = fragText(body, frags[0]);
+    expect(text).toContain(`\`docs/HANDOFF.md:${src.from}-${src.to}\``);  // 범위 = 실제 낸 카드의 범위
+    expect(text).toContain(`sha1 ${src.sha}`);
+  });
+
+  it('잘린 카드: 범위·해시는 선택 범위 그대로 + 보인 끝 줄 표시 · 조각 바이트는 잘린 뒤 실제 출력', () => {
+    const long = '# 최신\n' + Array.from({ length: 39 }, (_, i) => `- 줄 ${i + 1} ${'가나다라마바사'.repeat(6)}`).join('\n') + '\n';
+    const { ws, trace } = routedWs(long, 40);
+    trace(true);
+    const out = ask(ws, 'A', '/ashfall', { PASSBATON_CARD_CHARS: '400' });
+    expect(out).toContain('truncated');
+    const body = Buffer.from(out.replace(/\r?\n$/, ''), 'utf8');
+    const { frags } = ledger(ws, 'user-prompt');
+    audit(body, frags, /^$/);
+    const src = fileSource(ws, frags[0].ids!.split(',')[1]);
+    expect([src.from, src.to]).toEqual([1, 40]);
+    expect(src.shown).toBeGreaterThanOrEqual(1);
+    expect(src.shown).toBeLessThan(src.to);
+    expect(frags[0].bytes).toBe(body.length);
+    expect(frags[0].bytes).toBeLessThan(Buffer.byteLength(src.rangeText));   // 잘림 전 원천 길이가 아니다
+  });
+
+  it('명령 없는 턴의 재발행: 원천이 바뀌면 해시가 바뀐 새 id · 같은 행 · SessionStart(compact) 도 같은 형식', () => {
+    const { ws, dbPath, trace } = routedWs('# 최신\n- 다음: 첫 판\n');
+    ask(ws, 'A', '/ashfall');
+    fs.writeFileSync(path.join(ws, 'apps', 'game', 'docs', 'HANDOFF.md'), '# 최신\n- 다음: 바뀐 판 N174\n');
+    trace(true);
+    const out = ask(ws, 'A', '계속 해줘');
+    expect(out).toContain('바뀐 판 N174');
+    const body = Buffer.from(out.replace(/\r?\n$/, ''), 'utf8');
+    const up = ledger(ws, 'user-prompt').frags;
+    expect(up.map(f => f.src)).toEqual(['routed-card']);
+    audit(body, up, /^$/);
+    const [rowId, fileId] = up[0].ids!.split(',');
+    const rows = routeRows(dbPath, 'A');
+    expect(rowId).toBe(`session_route:${rows[0].session_id}/${rows[0].project}`);
+    expect(fileSource(ws, fileId).rangeText).toContain('바뀐 판 N174');
+    const ss = run(SESSION_START, ws, { cwd: ws, session_id: 'A', source: 'compact' });
+    expect(ss).toContain('바뀐 판 N174');
+    const card = ledger(ws, 'session-start').frags.find(f => f.src === 'routed-card')!;
+    expect(card.ids).toBe(up[0].ids);
+  });
+
+  it('해제: 지운 그 행의 id 만 · 행이 없던 세션은 조각도 id 도 없다(만들지 않는다) · 선언 없는 대상은 파일 id 없음', () => {
+    const { ws, dbPath, trace } = routedWs('# 최신\n- 다음: 해제 시험\n');
+    ask(ws, 'A', '/ashfall');
+    const before = routeRows(dbPath, 'A');
+    expect(before).toHaveLength(1);
+    trace(true);
+    const out = ask(ws, 'A', '/home');
+    expect(out).toContain('Route released');
+    expect(routeRows(dbPath, 'A')).toHaveLength(0);
+    const rel = ledger(ws, 'user-prompt').frags;
+    expect(rel.map(f => [f.src, f.ids])).toEqual([['route-released', `session_route:${before[0].session_id}/${before[0].project}`]]);
+    audit(Buffer.from(out.replace(/\r?\n$/, ''), 'utf8'), rel, /^$/);
+
+    fs.rmSync(path.join(ws, '.claude', 'hook-trace.log'));
+    expect(ask(ws, 'C', '/home')).toBe('');                               // 행 없음 → 낼 것 없음
+    expect(ledger(ws, 'user-prompt').frags).toEqual([]);
+
+    fs.rmSync(path.join(ws, 'apps', 'other', '.claude', 'passbaton.config.json'));
+    const other = ask(ws, 'D', '/other');
+    expect(other).toContain('declares no continuity.sources');
+    const o = ledger(ws, 'user-prompt').frags;
+    const rowsD = routeRows(dbPath, 'D');
+    expect(o.map(f => [f.src, f.ids])).toEqual([['routed-card', `session_route:${rowsD[0].session_id}/${rowsD[0].project}`]]);
   });
 });

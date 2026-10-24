@@ -18,7 +18,7 @@ import { traceResumeEvent } from '../utils/resume-event.js';
 import { readTailLines, matchCompaction } from '../utils/compact-id.js';
 import { readRunOrigin } from '../utils/run-origin.js';
 import { viaLabel } from '../utils/summary-source.js';
-import { readRoutingDeclaration, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd } from '../utils/routing.js';
+import { readRoutingDeclaration, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd, routeRowId } from '../utils/routing.js';
 
 interface SessionInput {
   cwd?: string;
@@ -223,8 +223,8 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
     //   ★ 루트 판별은 UserPromptSubmit 과 같은 규칙(실제 cwd ↔ 루트 실제 경로 · reply-147 ①).
     if (sessionId && (source === 'compact' || source === 'resume') && isWorkspaceRootCwd(hookCwd, workspaceRoot)) {
       try {
-        const row = db.prepare('SELECT command, target_rel, target_name FROM session_route WHERE session_id = ? AND project = ?')
-          .get(sessionId, project) as { command: string; target_rel: string; target_name: string } | undefined;
+        const row = db.prepare('SELECT session_id, project, command, target_rel, target_name FROM session_route WHERE session_id = ? AND project = ?')
+          .get(sessionId, project) as { session_id: string; project: string; command: string; target_rel: string; target_name: string } | undefined;
         if (row) {
           const decl = readRoutingDeclaration(workspaceRoot);
           const t = decl.commands.size > 0 ? currentRoute(decl, row.command, row.target_rel) : null;
@@ -232,16 +232,16 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
             // 골랐던 매핑이 사라졌다 — 한 번 알리고 지운다(UPS 와 같은 처리)
             db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project);
             lines.push(led.add('route-cleared', routeClearedBlock(row.command, row.target_name, project,
-              decl.disabled ?? (decl.commands.size === 0 ? 'routing is no longer declared' : `${row.command} no longer maps to ${row.target_rel}`)), `route:${row.target_rel}`));
+              decl.disabled ?? (decl.commands.size === 0 ? 'routing is no longer declared' : `${row.command} no longer maps to ${row.target_rel}`)), routeRowId(row)));
           } else {
             const block = routedBlock(row.command, t, project, releaseCommand(decl), CARD_CHARS);
             const cost = estimateTokens(block.text);
             if (tokenBudget > cost) {
-              lines.push(led.add('routed-card', block.text, `route:${t.rel}@${block.hash}`));
+              lines.push(led.add('routed-card', block.text, [routeRowId(row), ...block.sources].join(',')));
               tokenBudget -= cost;
               db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
             } else {
-              led.omit('routed-card', 'budget', `route:${t.rel}`);
+              led.omit('routed-card', 'budget', routeRowId(row));
               // ⛔ 예산이 모자라 못 냈다 — 컴팩션으로 앞 카드는 사라졌으니 옛 해시로 다음 턴까지 억제하면 안 된다(reply-147 ⑤)
               db.prepare("UPDATE session_route SET card_hash = NULL, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(sessionId, project);
             }

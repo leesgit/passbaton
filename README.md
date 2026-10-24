@@ -170,6 +170,19 @@ excerpts of them first**, each with its line range and a content hash:
   transcript lines — API request copies (`api-request-blob`) and notification renders are skipped, and notifications with
   attributes (`<system-reminder id="…">`) are stripped. If no human request can be identified, the line says
   `not identified` instead of showing leftover text.
+- (v2.8+) **Partial state writes keep the other fields.** Every writer of `active_context` (Stop, PostToolUse, PreCompact,
+  MCP `session_end`, …) now updates only the columns it actually has. An omitted field is kept; an explicit `null`/empty
+  string still clears it. Writing the State also writes where it came from, and only a State write moves `updated_at`.
+- (v2.8+) **Past-work lookup stays in the current project.** "Last time …" prompts search sessions, memories and solutions
+  filtered to the current project *before* sorting and `LIMIT`; rows with no project are never shown, nothing is searched when
+  the project is unknown, and memories need the same eligibility as at SessionStart (unverified ones are not injected).
+- (v2.8+) **Injection ledger** (with `hookTrace` on). Each hook writes, per emitted fragment, its source, source ids, UTF-8
+  bytes, byte offset in the emitted body and a hash, plus one line per omitted fragment with the reason and an `emitted`
+  total — all measured on the body actually printed; turning the trace on or off does not change that body. Source ids are
+  the real ones: DB rows by their keys (`s:12`, `m:4`, `active_context`, `session_route:<session>/<project>`); files in a
+  routed card as `<workspace path>:<from>-<to>@<sha1 of that range>` (`~<last shown line>` when cut), files in the
+  SessionStart card as `<path>@<sha1>`. A source that could not be read is written as `<path>@<outcome>` without a hash; no
+  DB id is written for a row that does not exist.
 
 ### Routing from a workspace root (v2.7.0+)
 

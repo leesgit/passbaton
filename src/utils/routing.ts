@@ -23,7 +23,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { buildResumeCard } from './resume-card.js';
+import { buildResumeCard, type ResumeCard } from './resume-card.js';
 
 export interface RouteTarget {
   /** 워크스페이스 기준 상대경로 · "." = 루트(선택 해제) */
@@ -145,10 +145,28 @@ export function routeClearedBlock(command: string, targetName: string, rootProje
 }
 
 /** 라우팅된 프로젝트의 카드 블록과 그 해시. 카드 선언이 없으면 그렇다고 쓴다(지어내지 않는다). */
-export function routedBlock(command: string, target: RouteTarget, rootProject: string, release: string, maxChars: number): { text: string; hash: string } {
+export function routedBlock(command: string, target: RouteTarget, rootProject: string, release: string, maxChars: number): { text: string; hash: string; sources: string[] } {
   const card = target.dir ? buildResumeCard(target.dir, maxChars) : null;
   const body = card ? card.text : `⚠ ${target.name} declares no continuity.sources in ${target.rel}/.claude/passbaton.config.json — no resume card`;
   const text = `\n<routed-context project="${target.name}" via="${command}">\n${routeBanner(command, target, rootProject, release)}\n\n${body}\n</routed-context>\n`;
   // ★ 해시는 **실제로 내는 블록 전체** — 본문만 잡으면 해제 명령·별칭이 바뀌어도 안내가 안 바뀐다(reply-147 ③)
-  return { text, hash: cardHash(text) };
+  return { text, hash: cardHash(text), sources: card ? cardSourceIds(card, target.rel) : [] };
 }
+
+/**
+ * 주입 원장용 파일 원천 식별(2.8 · Astra reply-174 PB174-020) — 카드가 **실제로 읽은** 값만 쓴다:
+ *   범위가 있는 원천 = `<워크스페이스 기준 경로>:<선택 범위>@<그 범위의 sha1 앞 10 — 카드에 찍힌 값>` (+ 잘렸으면 `~<보인 끝 줄>`)
+ *   범위 없는 원천(없음·거부·읽기 실패·블록 없음) = `<경로>@<결과>` — 해시를 만들지 않는다.
+ */
+export function cardSourceIds(card: ResumeCard, rel: string): string[] {
+  const base = path.posix.normalize(rel.replace(/\\/g, '/'));
+  return card.items.map(it => {
+    const p = path.posix.join(base, it.path.replace(/\\/g, '/'));
+    if (it.from === undefined || it.to === undefined || !it.sha) return `${p}@${it.outcome}`;
+    const shown = it.truncated && it.shownTo !== undefined && it.shownTo < it.to ? `~${it.shownTo}` : '';
+    return `${p}:${it.from}-${it.to}@${it.sha}${shown}`;
+  });
+}
+
+/** 원장용 DB 원천 식별 — **읽은 session_route 행의 값**으로만(입력으로 짓지 않는다) */
+export const routeRowId = (row: { session_id: string; project: string }) => `session_route:${row.session_id}/${row.project}`;

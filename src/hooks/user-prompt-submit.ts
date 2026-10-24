@@ -13,7 +13,7 @@ import { migrateSchema } from '../db/migrate.js';
 import { findWorktreeRoot, readHead, MAX_ROOTS } from '../utils/worktree.js';
 import { readWorkspaceDeclaration } from '../utils/workspace-config.js';
 import { extractDirectivesDetailed } from '../utils/directive.js';
-import { readRoutingDeclaration, leadingCommand, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd } from '../utils/routing.js';
+import { readRoutingDeclaration, leadingCommand, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd, routeRowId } from '../utils/routing.js';
 import { clampCardChars } from '../utils/resume-card.js';
 import { InjectLedger } from '../utils/inject-ledger.js';
 
@@ -511,7 +511,11 @@ const ROUTE_CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
  * - 명령 없음 + 선택 있음 → 카드 내용이 바뀌었을 때만 다시 냄
  * 실패는 조용히 무시한다 — 라우팅이 안 돼도 훅이 세션을 깨지 않는다.
  */
-function routeTurn(dbPath: string, project: string, workspaceRoot: string, input: PromptInput): string | null {
+/** 낸 라우팅 조각 — 원장 원천(src)·원천 식별(ids)과 함께. 본문은 text 그대로다 */
+type RoutedPart = { src: 'routed-card' | 'route-released' | 'route-cleared'; text: string; ids?: string };
+const joinIds = (row: string | undefined, files: string[] = []) => [row, ...files].filter(Boolean).join(',') || undefined;
+
+function routeTurn(dbPath: string, project: string, workspaceRoot: string, input: PromptInput): RoutedPart | null {
   const sessionId = input.session_id;
   if (!sessionId || !fs.existsSync(dbPath)) return null;
   // ★ 이름이 아니라 실제 경로로 — 루트와 같은 이름의 하위 앱에서 라우팅하지 않는다(reply-147 ①).
@@ -523,12 +527,14 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
     db.pragma('journal_mode = WAL');
     migrateSchema(db);
     try {
-      const row = db.prepare('SELECT command, target_rel, target_name, card_hash FROM session_route WHERE session_id = ? AND project = ?')
-        .get(sessionId, project) as { command: string; target_rel: string; target_name: string; card_hash: string | null } | undefined;
-      const clear = (why: string): string | null => {
+      const ROW_SQL = 'SELECT session_id, project, command, target_rel, target_name, card_hash FROM session_route WHERE session_id = ? AND project = ?';
+      type RouteRow = { session_id: string; project: string; command: string; target_rel: string; target_name: string; card_hash: string | null };
+      const row = db.prepare(ROW_SQL).get(sessionId, project) as RouteRow | undefined;
+      // 2.8 (PB174-020): 원장 DB 원천 = **읽은 행**의 키 — 행이 없으면 DB id 를 쓰지 않는다
+      const clear = (why: string): RoutedPart | null => {
         if (!row) return null;
         db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project);
-        return routeClearedBlock(row.command, row.target_name, project, why);
+        return { src: 'route-cleared', text: routeClearedBlock(row.command, row.target_name, project, why), ids: routeRowId(row) };
       };
       // 라우팅이 꺼졌거나(해제 명령 없음 등) 선언이 사라졌다 — 남은 선택은 한 번 알리고 지운다
       if (decl.commands.size === 0) return clear(decl.disabled ?? 'routing is no longer declared');
@@ -538,7 +544,8 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
       const release = releaseCommand(decl);
       if (cmd && target && target.dir === null) {
         const had = db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project).changes > 0;
-        return had ? `\n<routed-context project="${project}" via="${cmd}">\nRoute released — back to ${project} (no routed project in this session)\n</routed-context>\n` : null;
+        if (!had) return null;
+        return { src: 'route-released', ids: row ? routeRowId(row) : undefined, text: `\n<routed-context project="${project}" via="${cmd}">\nRoute released — back to ${project} (no routed project in this session)\n</routed-context>\n` };
       }
       if (cmd && target) {
         const block = routedBlock(cmd, target, project, release, ROUTE_CARD_CHARS);
@@ -549,7 +556,9 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
           ON CONFLICT(session_id, project) DO UPDATE SET command = excluded.command, target_rel = excluded.target_rel,
             target_name = excluded.target_name, card_hash = excluded.card_hash, updated_at = excluded.updated_at
         `).run(sessionId, project, cmd, target.rel, target.name, block.hash);
-        return same ? null : block.text;
+        if (same) return null;
+        const saved = db.prepare(ROW_SQL).get(sessionId, project) as RouteRow | undefined;   // 방금 쓴 행을 다시 읽어 그 키로
+        return { src: 'routed-card', text: block.text, ids: joinIds(saved ? routeRowId(saved) : undefined, block.sources) };
       }
       if (row) {
         // 명령 없는 턴: 선택은 유지 · 카드 내용이 바뀐 때만 다시
@@ -559,7 +568,7 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
         const block = routedBlock(row.command, t, project, release, ROUTE_CARD_CHARS);
         if (block.hash === row.card_hash) return null;
         db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
-        return block.text;
+        return { src: 'routed-card', text: block.text, ids: joinIds(routeRowId(row), block.sources) };
       }
       return null;
     } finally {
@@ -651,7 +660,8 @@ async function main() {
 
     // 2.7 (PB139-12): 루트 세션의 명시적 프로젝트 선택 → 그 프로젝트의 재개 카드(같은 단일 출력에 싣는다)
     const routed = routeTurn(dbPath, project, workspaceRoot, input);
-    if (routed) parts.push(led.add('routed-card', routed));
+    // 2.8 (PB174-020): 원천 식별 = 파일(경로:범위@sha1) + 실제 session_route 행 · 본문은 그대로(add 는 글을 돌려줄 뿐)
+    if (routed) parts.push(led.add(routed.src, routed.text, routed.ids));
 
     const body = parts.length > 0 ? parts.join('') : null;
     if (body) emitContext(body, 'UserPromptSubmit', input.transcript_path);
