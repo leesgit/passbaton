@@ -270,8 +270,32 @@ interface PastWorkResult {
   solutions: Array<{ signature: string; solution: string }>;
 }
 
-function searchPastWork(db: Database.Database, keyword: string): PastWorkResult {
+/**
+ * 「저번에/예전에 …」 과거 참조 검색 (2.8 · Astra reply-170 PB170-020 · N4).
+ *
+ * 2.7.3 까지는 세 원천(sessions·memories·solutions) 모두 **project 조건이 없었고**, memories 는 중요도·unverified
+ * 거름도 없었다. 그래서 다른 프로젝트의 기억·정규식 조각(observation/2 + unverified)이 `<past-context project="현재">`
+ * 이름표를 달고 주입됐다(10-24 「instead of waking up, …」). SessionStart(:562)·키워드 경로는 이미 막혀 있었다.
+ *
+ * ⛔ 계약:
+ *   - 세 원천 모두 **현재 프로젝트 행만** — WHERE 에서 거른 뒤 정렬·LIMIT(뒤에서 거르면 다른 프로젝트 행이 칸을 먹는다).
+ *   - project 가 NULL·빈 행(출처 프로젝트 불명)은 내지 않는다 — 전역 행으로 보지 않는다.
+ *   - 현재 프로젝트를 모르면 아무것도 찾지 않는다 — 전역 검색으로 대체하지 않는다.
+ *   - memories 는 SessionStart 와 같은 주입 자격(MEMORY_ELIGIBLE) — 중요도가 높아도 unverified 는 차단.
+ */
+// SessionStart [Priority 5] 의 주입 자격과 같은 규칙(전역 허용만 뺐다 — 과거 참조는 현재 프로젝트 것만)
+const MEMORY_ELIGIBLE = `
+  m.memory_type IN ('decision', 'learning', 'error', 'preference', 'reference', 'observation')
+  AND m.importance >= 3
+  AND COALESCE(m.tags, '') NOT LIKE '%auto-tracked%'
+  AND COALESCE(m.tags, '') NOT LIKE '%auto-compact%'
+  AND COALESCE(m.tags, '') NOT LIKE '%unverified%'
+  AND NOT (m.memory_type = 'decision' AND COALESCE(m.tags, '') LIKE '%auto-extracted%'
+           AND COALESCE(m.tags, '') NOT LIKE '%quarantined-2.6%')`;
+
+function searchPastWork(db: Database.Database, keyword: string, project: string | null): PastWorkResult {
   const result: PastWorkResult = { sessions: [], memories: [], solutions: [] };
+  if (!project) return result;
 
   // C3 (2026-07-08): 다단어 구("GCP 코인 정보")를 통째 LIKE/MATCH하면
   //   조사·어순 때문에 거의 안 맞았음. 구를 토큰화해 OR 검색으로 커버.
@@ -293,13 +317,14 @@ function searchPastWork(db: Database.Database, keyword: string): PastWorkResult 
     const sessions = db.prepare(`
       SELECT last_work, timestamp FROM sessions
       WHERE (${likeClause})
+        AND project = ?
         AND last_work != 'Session ended'
         AND last_work != 'Session work completed'
         AND last_work != 'Session started'
         AND last_work != ''
         AND timestamp > datetime('now', '-30 days')
       ORDER BY timestamp DESC LIMIT 3
-    `).all(...likeParams) as Array<{ last_work: string; timestamp: string }>;
+    `).all(...likeParams, project) as Array<{ last_work: string; timestamp: string }>;
 
     for (const s of sessions) {
       const work = s.last_work.length > 80 ? s.last_work.slice(0, 80) + '...' : s.last_work;
@@ -314,8 +339,10 @@ function searchPastWork(db: Database.Database, keyword: string): PastWorkResult 
       SELECT m.content, m.memory_type FROM memories m
       JOIN memories_fts fts ON m.id = fts.rowid
       WHERE memories_fts MATCH ?
+        AND m.project = ?
+        AND ${MEMORY_ELIGIBLE}
       ORDER BY rank LIMIT 2
-    `).all(ftsQuery) as Array<{ content: string; memory_type: string }>;
+    `).all(ftsQuery, project) as Array<{ content: string; memory_type: string }>;
 
     for (const m of memories) {
       const content = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
@@ -324,13 +351,15 @@ function searchPastWork(db: Database.Database, keyword: string): PastWorkResult 
   } catch {
     // FTS5 매칭 실패 시 LIKE 폴백 (토큰 OR)
     try {
-      const likeClause = searchTokens.map(() => 'content LIKE ?').join(' OR ');
+      const likeClause = searchTokens.map(() => 'm.content LIKE ?').join(' OR ');
       const likeParams = searchTokens.map(t => `%${t}%`);
       const memories = db.prepare(`
-        SELECT content, memory_type FROM memories
-        WHERE ${likeClause}
-        ORDER BY importance DESC, created_at DESC LIMIT 2
-      `).all(...likeParams) as Array<{ content: string; memory_type: string }>;
+        SELECT m.content, m.memory_type FROM memories m
+        WHERE (${likeClause})
+          AND m.project = ?
+          AND ${MEMORY_ELIGIBLE}
+        ORDER BY m.importance DESC, m.created_at DESC LIMIT 2
+      `).all(...likeParams, project) as Array<{ content: string; memory_type: string }>;
 
       for (const m of memories) {
         const content = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
@@ -346,9 +375,10 @@ function searchPastWork(db: Database.Database, keyword: string): PastWorkResult 
     for (const t of searchTokens) { params.push(`%${t}%`, `%${t}%`); }
     const solutions = db.prepare(`
       SELECT error_signature, solution FROM solutions
-      WHERE ${clause}
+      WHERE (${clause})
+        AND project = ?
       ORDER BY created_at DESC LIMIT 2
-    `).all(...params) as Array<{ error_signature: string; solution: string }>;
+    `).all(...params, project) as Array<{ error_signature: string; solution: string }>;
 
     for (const s of solutions) {
       const sol = s.solution.length > 80 ? s.solution.slice(0, 80) + '...' : s.solution;
@@ -577,7 +607,7 @@ async function main() {
       if (keyword) {
         try {
           const db = new Database(dbPath, { readonly: true });
-          const pastWork = searchPastWork(db, keyword);
+          const pastWork = searchPastWork(db, keyword, project);
           const pastSection = formatPastWork(pastWork);
           db.close();
           if (pastSection) {
