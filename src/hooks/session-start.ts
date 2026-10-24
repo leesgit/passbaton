@@ -12,7 +12,9 @@ import { trace, tpathOf } from '../utils/hook-trace.js';
 import { resolveWorkspaceRoot } from '../utils/workspace.js';
 import { ensureSessionsDb } from '../db/bootstrap.js';
 import { revalidateDirective } from '../utils/directive.js';
-import { buildResumeCard, clampCardChars } from '../utils/resume-card.js';
+import { buildResumeCard, clampCardChars, type ResumeCard } from '../utils/resume-card.js';
+import { InjectLedger, sha12 } from '../utils/inject-ledger.js';
+import { traceResumeEvent } from '../utils/resume-event.js';
 import { readTailLines, matchCompaction } from '../utils/compact-id.js';
 import { readRunOrigin } from '../utils/run-origin.js';
 import { viaLabel } from '../utils/summary-source.js';
@@ -129,39 +131,40 @@ const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
  *   - 2.7.3 (reply-165 PB165-200): 요약의 생성 출처(via)는 **고른 기록 그 행의 칸**에서만 — active_context 면 state_source,
  *     대체 sessions 행이면 그 행의 summary_source. 칸이 없거나 NULL 이면 via unknown(글 모양으로 추정하지 않는다).
  */
-type PickedState = { text: string; blockers: string | null; meta: string | null; via: string | null };
+// src: 2.8 (PB170-100 N3) 주입 원장의 원천 식별 — active_context · sessions:<id> · none (출력에는 쓰지 않는다)
+type PickedState = { text: string; blockers: string | null; meta: string | null; via: string | null; src?: string };
 function selectState(db: Database.Database, project: string, thisOrigin: 'loop' | 'unknown'): PickedState | null {
   const activeCols = new Set((db.prepare('PRAGMA table_info(active_context)').all() as Array<{ name: string }>).map(c => c.name));
   const active = db.prepare(`SELECT current_state, blockers, updated_at${activeCols.has('state_source') ? ', state_source' : ''} FROM active_context WHERE project = ?`).get(project) as
     { current_state: string | null; blockers: string | null; updated_at: string | null; state_source?: string | null } | undefined;
   if (!active?.current_state) return null;
   const via = viaLabel(active.state_source);
-  if (thisOrigin === 'loop') return { text: active.current_state, blockers: active.blockers, meta: null, via };
+  if (thisOrigin === 'loop') return { text: active.current_state, blockers: active.blockers, meta: null, via, src: 'active_context' };
 
   const cols = new Set((db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map(c => c.name));
   const when = (t: string | null | undefined) => (t ? `recorded ${t.slice(0, 16)} (DB time)` : 'recorded ?');
   if (!cols.has('run_origin')) {
     // 2.7.2 까지의 DB — 출처를 확인할 수 없다(loop 로 확인된 행이 없다)
-    return { text: active.current_state, blockers: active.blockers, meta: `${when(active.updated_at)} · origin unknown`, via };
+    return { text: active.current_state, blockers: active.blockers, meta: `${when(active.updated_at)} · origin unknown`, via, src: 'active_context' };
   }
   const linked = db.prepare('SELECT run_origin FROM sessions WHERE project = ? AND last_work = ?')
     .all(project, active.current_state) as Array<{ run_origin: string | null }>;
   if (!linked.some(r => r.run_origin === 'loop')) {
     const how = linked.length > 0 ? 'origin unknown' : 'origin unknown · not linked to a session record';
-    return { text: active.current_state, blockers: active.blockers, meta: `${when(active.updated_at)} · ${how}`, via };
+    return { text: active.current_state, blockers: active.blockers, meta: `${when(active.updated_at)} · ${how}`, via, src: 'active_context' };
   }
 
   // 확인된 loop 기록 → 버린다. loop 를 뺀 최신 적격 행 하나.
   const hasEvidence = ['file_coverage', 'workspace_writes', 'modified_files'].every(c => cols.has(c));
   const hasSource = cols.has('summary_source');
   const rows = db.prepare(`
-    SELECT last_work, issues, timestamp${hasEvidence ? ', file_coverage, workspace_writes, modified_files' : ''}${hasSource ? ', summary_source' : ''} FROM sessions
+    SELECT id, last_work, issues, timestamp${hasEvidence ? ', file_coverage, workspace_writes, modified_files' : ''}${hasSource ? ', summary_source' : ''} FROM sessions
     WHERE project = ?
       AND COALESCE(run_origin, 'unknown') != 'loop'
       AND last_work NOT IN ('Session ended', 'Session work completed', 'Session started', '')
       AND length(last_work) > 15
     ORDER BY timestamp DESC, id DESC LIMIT 200
-  `).all(project) as Array<{ last_work: string; issues: string | null; timestamp: string | null;
+  `).all(project) as Array<{ id: number; last_work: string; issues: string | null; timestamp: string | null;
     file_coverage?: string | null; workspace_writes?: string | null; modified_files?: string | null; summary_source?: string | null }>;
   const parse = <T>(raw: string | null | undefined, fallback: T): T => {
     if (!raw) return fallback;
@@ -177,19 +180,23 @@ function selectState(db: Database.Database, project: string, thisOrigin: 'loop' 
   };
   const row = rows.find(worked);
   if (!row) {
-    return { text: 'none', blockers: null, meta: 'no eligible record — the last recorded state is from a loop run, and loop records are excluded from this card', via: null };
+    return { text: 'none', blockers: null, meta: 'no eligible record — the last recorded state is from a loop run, and loop records are excluded from this card', via: null, src: 'none' };
   }
   // MCP session_end 는 blockers 를 issues 에 글 그대로 적는다(훅 행은 JSON 메타). 같은 행의 것만 붙인다.
   const blockers = row.issues && row.issues.trim() !== '' && parse<unknown>(row.issues, undefined) === undefined ? row.issues : null;
-  return { text: row.last_work, blockers, meta: `${when(row.timestamp)} · origin unknown · newer loop records excluded`, via: viaLabel(row.summary_source) };
+  return { text: row.last_work, blockers, meta: `${when(row.timestamp)} · origin unknown · newer loop records excluded`, via: viaLabel(row.summary_source), src: `sessions:${row.id}` };
 }
 
-function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string, transcriptPath?: string, hookCwd?: string): string | null {
+// 2.8 (PB170-100 N3): 카드 조각의 원천 식별 — 원천마다 경로@sha1(못 읽었으면 결과)
+const cardIds = (c: ResumeCard) => c.items.map(i => `${i.path}@${i.sha ?? i.outcome}`).join(',');
+
+function loadContext(dbPath: string, project: string, source?: string, projectPath?: string, sessionId?: string, transcriptPath?: string, hookCwd?: string,
+  led: InjectLedger = new InjectLedger('session-start', '', null)): string | null {
   // 재개 카드는 DB 가 없어도 낸다 — 정본은 레포에 있다.
   // 2.7.3 (PB154-C): 출처가 loop 이고 프로젝트 설정이 loopCard: "minimal" 일 때만 최소 카드(그 판단은 카드 쪽이 한다)
   const card = projectPath ? buildResumeCard(projectPath, CARD_CHARS, { origin: readRunOrigin() }) : null;
   if (!fs.existsSync(dbPath)) {
-    return card ? `# ${project} - Session Resumed\n\n${card.text}` : null;
+    return card ? `${led.add('header', `# ${project} - Session Resumed\n`)}\n${led.add('card', card.text, cardIds(card))}` : null;
   }
 
   // dbPath is "<workspaceRoot>/.claude/sessions.db" → strip two levels for feature-flag lookups.
@@ -202,12 +209,12 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
     // 노이즈 메모리 자동 정리
     cleanupNoiseMemories(db);
 
-    const lines: string[] = [`# ${project} - Session Resumed\n`];
+    const lines: string[] = [led.add('header', `# ${project} - Session Resumed\n`)];
     let tokenBudget = MAX_CONTEXT_TOKENS;
 
     // [Priority 0] 재개 카드 — 레포 정본 발췌. 있으면 아래 DB 요약은 보조다.
     if (card) {
-      lines.push(card.text, '');
+      lines.push(led.add('card', card.text, cardIds(card)), '');
       tokenBudget -= estimateTokens(card.text);
     }
 
@@ -224,16 +231,17 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
           if (!t) {
             // 골랐던 매핑이 사라졌다 — 한 번 알리고 지운다(UPS 와 같은 처리)
             db.prepare('DELETE FROM session_route WHERE session_id = ? AND project = ?').run(sessionId, project);
-            lines.push(routeClearedBlock(row.command, row.target_name, project,
-              decl.disabled ?? (decl.commands.size === 0 ? 'routing is no longer declared' : `${row.command} no longer maps to ${row.target_rel}`)));
+            lines.push(led.add('route-cleared', routeClearedBlock(row.command, row.target_name, project,
+              decl.disabled ?? (decl.commands.size === 0 ? 'routing is no longer declared' : `${row.command} no longer maps to ${row.target_rel}`)), `route:${row.target_rel}`));
           } else {
             const block = routedBlock(row.command, t, project, releaseCommand(decl), CARD_CHARS);
             const cost = estimateTokens(block.text);
             if (tokenBudget > cost) {
-              lines.push(block.text);
+              lines.push(led.add('routed-card', block.text, `route:${t.rel}@${block.hash}`));
               tokenBudget -= cost;
               db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
             } else {
+              led.omit('routed-card', 'budget', `route:${t.rel}`);
               // ⛔ 예산이 모자라 못 냈다 — 컴팩션으로 앞 카드는 사라졌으니 옛 해시로 다음 턴까지 억제하면 안 된다(reply-147 ⑤)
               db.prepare("UPDATE session_route SET card_hash = NULL, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(sessionId, project);
             }
@@ -254,6 +262,10 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
         const h = db.prepare('SELECT request, pending, active_file, pre_uuid FROM compact_handover WHERE session_id = ? AND project = ?')
           .get(sessionId, project) as { request: string | null; pending: number; active_file: string | null; pre_uuid: string | null } | undefined;
         const current = !!h && matchCompaction(readTailLines(transcriptPath), h.pre_uuid) === 'current';
+        const hid = `compact_handover:${sessionId}`;
+        if (!h) led.omit('recovered', 'no-handover-row', hid);
+        else if (!current) led.omit('recovered', 'not-this-compaction', hid);
+        else if (!(h.request || h.active_file)) led.omit('recovered', 'empty-handover', hid);
         if (h && current && (h.request || h.active_file)) {
           const bits = ['♻️ **Recovered after compaction**'];
           if (h.request) bits.push(`- Last human request (a request, not a result${h.pending ? ' · no reply yet' : ''}): ${h.request}`);
@@ -262,8 +274,10 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
           // 카드 다음 자리다. 카드가 예산을 다 먹었으면 넣지 않는다 — 예산을 넘기지 않는 것이 먼저
           const cost = estimateTokens(block);
           if (tokenBudget > cost) {
-            lines.push(block, '');
+            lines.push(led.add('recovered', block, hid), '');
             tokenBudget -= cost;
+          } else {
+            led.omit('recovered', 'budget', hid);
           }
         }
       } catch { /* 테이블이 아직 없는 DB */ }
@@ -283,9 +297,11 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
       const stateBlock = `${stateLabel}: ${picked.text}${tail ? ` _(${tail})_` : ''}` + (picked.blockers ? `\n🚧 **Blocker**: ${picked.blockers}` : '');
       const cost = estimateTokens(stateBlock);
       if (tokenBudget > cost) {
-        lines.push(stateBlock);
+        lines.push(led.add('state', stateBlock, picked.src));
         lines.push('');
         tokenBudget -= cost;
+      } else {
+        led.omit('state', 'budget', picked.src);
       }
     }
 
@@ -429,7 +445,7 @@ function renderFileEvidence(row: {
     const hideLoop = thisOrigin !== 'loop' && hasOrigin;
     const markUnknown = thisOrigin !== 'loop';
     const recentSessions = db.prepare(`
-      SELECT last_work, next_tasks, issues, timestamp${extraCols}${hasOrigin ? ', run_origin' : ''}${hasSummarySource ? ', summary_source' : ''} FROM sessions
+      SELECT id, last_work, next_tasks, issues, timestamp${extraCols}${hasOrigin ? ', run_origin' : ''}${hasSummarySource ? ', summary_source' : ''} FROM sessions
       WHERE project = ?
         ${hideLoop ? "AND COALESCE(run_origin, 'unknown') != 'loop'" : ''}
         AND last_work != 'Session ended'
@@ -439,7 +455,7 @@ function renderFileEvidence(row: {
         AND length(last_work) > 15
       ORDER BY timestamp DESC LIMIT 3
     `).all(project) as Array<{
-      last_work: string; next_tasks: string; issues: string; timestamp: string;
+      id: number; last_work: string; next_tasks: string; issues: string; timestamp: string;
       user_intent?: string | null; modified_files?: string | null;
       workspace_writes?: string | null; file_coverage?: string | null;
       run_origin?: string | null; summary_source?: string | null;
@@ -478,9 +494,12 @@ function renderFileEvidence(row: {
         }
       }
       const cost = estimateTokens(sessionLines.join('\n'));
+      const sids = `sessions:${recentSessions.map(s => s.id).join(',')}`;
       if (tokenBudget > cost) {
-        lines.push(...sessionLines, '');
+        lines.push(led.add('recent-sessions', sessionLines.join('\n'), sids), '');
         tokenBudget -= cost;
+      } else {
+        led.omit('recent-sessions', 'budget', sids);
       }
     }
 
@@ -509,13 +528,16 @@ function renderFileEvidence(row: {
         // 지시사항은 예산 초과해도 high priority는 포함
         const highOnly = directives.filter(d => d.priority === 'high');
         if (tokenBudget > cost) {
-          lines.push(...directiveLines, '');
+          lines.push(led.add('directives', directiveLines.join('\n'), `n:${directives.length}`), '');
           tokenBudget -= cost;
         } else if (highOnly.length > 0) {
           const criticalLines = ['## Directives'];
           for (const d of highOnly) criticalLines.push(`- 🔴 ${d.directive}`);
-          lines.push(...criticalLines, '');
+          lines.push(led.add('directives', criticalLines.join('\n'), `n:${highOnly.length}`), '');
+          led.omit('directives', 'budget-normal-priority', `n:${directives.length - highOnly.length}`);
           tokenBudget -= estimateTokens(criticalLines.join('\n'));
+        } else {
+          led.omit('directives', 'budget', `n:${directives.length}`);
         }
       }
     } catch { /* table may not exist yet */ }
@@ -537,8 +559,10 @@ function renderFileEvidence(row: {
           }
           const cost = estimateTokens(taskLines.join('\n'));
           if (tokenBudget > cost) {
-            lines.push(...taskLines, '');
+            lines.push(led.add('tasks', taskLines.join('\n'), `n:${tasks.length}`), '');
             tokenBudget -= cost;
+          } else {
+            led.omit('tasks', 'budget', `n:${tasks.length}`);
           }
         }
       } catch { /* table may not exist */ }
@@ -593,8 +617,10 @@ function renderFileEvidence(row: {
         }
         const cost = estimateTokens(memoryLines.join('\n'));
         if (tokenBudget > cost) {
-          lines.push(...memoryLines, '');
+          lines.push(led.add('memories', memoryLines.join('\n'), `n:${memoryLines.length - 1}`), '');
           tokenBudget -= cost;
+        } else {
+          led.omit('memories', 'budget');
         }
       }
     } catch { /* ignore */ }
@@ -620,7 +646,7 @@ function renderFileEvidence(row: {
           // 2.7.3 (reply-156 PB156-100): 출처로 거르지 않는다 — 세션 출처와 검증 결과의 유효성은 별개다.
           //   카드에 「프로젝트 공용 검증 기록」 임을 밝힌다(대상·시점·결과는 그대로).
           const warn = `\n⚠️ **Heads up** (project-wide verification record — sessions of every origin, loop runs included): a recent session (${bad.ts}) ended with ${why}. Check before building on top.`;
-          lines.push(warn);
+          lines.push(led.add('verification-ledger', warn, `sessions@${bad.ts}`));
           tokenBudget -= estimateTokens(warn);
         }
       }
@@ -639,7 +665,7 @@ function renderFileEvidence(row: {
           // Windows 경로(역슬래시)도 파일명만 — 전에는 전체 절대 경로가 그대로 나갔다.
         const files = hot.map(h => `${h.file_path.split(/[\\/]/).pop()} (${h.access_count}×)`).join(', ');
           const hotLine = `\n**Hot files** (you edit these most here): ${files}`;
-          lines.push(hotLine);
+          lines.push(led.add('hot-files', hotLine, `hot_paths:${hot.length}`));
           tokenBudget -= estimateTokens(hotLine);
         }
       }
@@ -656,7 +682,7 @@ function renderFileEvidence(row: {
       if (solCount > 0) {
         const solLine = `\nSolutions: ${solCount} recorded (look up with solution_find)\n`;
         if (tokenBudget > 10) {
-          lines.push(solLine);
+          lines.push(led.add('solution-stats', solLine, `solutions:${solCount}`));
           tokenBudget -= estimateTokens(solLine);
         }
       }
@@ -664,8 +690,7 @@ function renderFileEvidence(row: {
 
     db.close();
 
-    lines.push('---');
-    lines.push('_Auto-injected by session-continuity v2. Use `session_end` when done._');
+    lines.push(led.add('footer', '---\n_Auto-injected by session-continuity v2. Use `session_end` when done._'));
 
     return lines.join('\n');
   } catch (e) {
@@ -707,7 +732,9 @@ async function main() {
     ensureSessionsDb(resolvedRoot);
 
     const dbPath = path.join(workspaceRoot, '.claude', 'sessions.db');
-    const context = loadContext(dbPath, project, input.source, found?.dir, input.session_id, input.transcript_path, input.cwd);
+    // 2.8 (PB170-100 N3): 조각 원장 — hookTrace 가 꺼져 있으면 아무것도 안 쓰고, 본문은 그대로다
+    const led = new InjectLedger('session-start', workspaceRoot, project);
+    const context = loadContext(dbPath, project, input.source, found?.dir, input.session_id, input.transcript_path, input.cwd, led);
 
     // 주입 결과는 별도 줄. injected 는 **문자 수**다 (토큰 아님 — 예산은 2000 토큰이고
     // 한글은 문자당 토큰이 더 든다. 대략 len/4 보다 나쁘다).
@@ -718,7 +745,14 @@ async function main() {
     });
 
     if (context) {
-      emitContext(`\n<session-context project="${project}">\n${context}\n</session-context>\n`, 'SessionStart', input.transcript_path);
+      const body = `\n<session-context project="${project}">\n${context}\n</session-context>\n`;
+      emitContext(body, 'SessionStart', input.transcript_path);
+      led.flush(body);
+      // 2.8 (PB170-100 C9): 재개 사건 기록의 자동 칸 — 판정 칸은 사람·대화 세션(docs/resume-events.md)
+      traceResumeEvent(workspaceRoot, {
+        project, host: isCodexHost(input.transcript_path) ? 'codex' : isGeminiHost(input.transcript_path) ? 'gemini' : 'claude',
+        source: input.source, session: input.session_id, card: led.idsOf('card'), emittedSha: sha12(body),
+      });
     } else {
       // Only Claude gets the plain "no context" placeholder; Codex and Gemini
       // expect JSON-only stdout, so a stray console.log would corrupt their parsing.

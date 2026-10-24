@@ -15,6 +15,7 @@ import { readWorkspaceDeclaration } from '../utils/workspace-config.js';
 import { extractDirectivesDetailed } from '../utils/directive.js';
 import { readRoutingDeclaration, leadingCommand, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd } from '../utils/routing.js';
 import { clampCardChars } from '../utils/resume-card.js';
+import { InjectLedger } from '../utils/inject-ledger.js';
 
 interface PromptInput {
   prompt?: string;
@@ -225,7 +226,7 @@ function searchTriggeredMemories(
   db: Database.Database,
   keywords: string[],
   project: string | null
-): Array<{ content: string; memory_type: string; score: number }> {
+): Array<{ id: number; content: string; memory_type: string; score: number }> {
   // IDF 필터: 흔한 토큰 제거
   const meaningful = filterByIdf(db, keywords);
   if (meaningful.length < 2) return [];  // IDF 통과 토큰 2개 이상일 때만 trigger
@@ -246,7 +247,7 @@ function searchTriggeredMemories(
     if (project) params.push(project);
 
     const rows = db.prepare(`
-      SELECT m.content, m.memory_type, bm25(memories_fts) AS score
+      SELECT m.id, m.content, m.memory_type, bm25(memories_fts) AS score
       FROM memories_fts fts
       JOIN memories m ON m.id = fts.rowid
       WHERE memories_fts MATCH ?
@@ -255,7 +256,7 @@ function searchTriggeredMemories(
       AND (m.tags NOT LIKE '%auto-tracked%' OR m.tags IS NULL)
       ORDER BY score ASC
       LIMIT 5
-    `).all(...params) as Array<{ content: string; memory_type: string; score: number }>;
+    `).all(...params) as Array<{ id: number; content: string; memory_type: string; score: number }>;
 
     // bm25 score < -2 강한 매칭만 (낮을수록 관련도 높음)
     return rows.filter(r => r.score < -2).slice(0, 2);
@@ -264,11 +265,16 @@ function searchTriggeredMemories(
   }
 }
 
+// id: 2.8 (PB170-100 N3) 주입 원장의 원천 식별 — 출력에는 쓰지 않는다
 interface PastWorkResult {
-  sessions: Array<{ date: string; work: string }>;
-  memories: Array<{ type: string; content: string }>;
-  solutions: Array<{ signature: string; solution: string }>;
+  sessions: Array<{ id: number; date: string; work: string }>;
+  memories: Array<{ id: number; type: string; content: string }>;
+  solutions: Array<{ id: number; signature: string; solution: string }>;
 }
+const pastIds = (p: PastWorkResult) =>
+  [['s', p.sessions], ['m', p.memories], ['sol', p.solutions]]
+    .filter(([, rows]) => (rows as unknown[]).length > 0)
+    .map(([k, rows]) => `${k}:${(rows as Array<{ id: number }>).map(r => r.id).join(',')}`).join(';');
 
 /**
  * 「저번에/예전에 …」 과거 참조 검색 (2.8 · Astra reply-170 PB170-020 · N4).
@@ -315,7 +321,7 @@ function searchPastWork(db: Database.Database, keyword: string, project: string 
     const likeClause = searchTokens.map(() => 'last_work LIKE ?').join(' OR ');
     const likeParams = searchTokens.map(t => `%${t}%`);
     const sessions = db.prepare(`
-      SELECT last_work, timestamp FROM sessions
+      SELECT id, last_work, timestamp FROM sessions
       WHERE (${likeClause})
         AND project = ?
         AND last_work != 'Session ended'
@@ -324,11 +330,11 @@ function searchPastWork(db: Database.Database, keyword: string, project: string 
         AND last_work != ''
         AND timestamp > datetime('now', '-30 days')
       ORDER BY timestamp DESC LIMIT 3
-    `).all(...likeParams, project) as Array<{ last_work: string; timestamp: string }>;
+    `).all(...likeParams, project) as Array<{ id: number; last_work: string; timestamp: string }>;
 
     for (const s of sessions) {
       const work = s.last_work.length > 80 ? s.last_work.slice(0, 80) + '...' : s.last_work;
-      result.sessions.push({ date: s.timestamp?.slice(0, 10) || 'unknown', work });
+      result.sessions.push({ id: s.id, date: s.timestamp?.slice(0, 10) || 'unknown', work });
     }
   } catch { /* ignore */ }
 
@@ -336,17 +342,17 @@ function searchPastWork(db: Database.Database, keyword: string, project: string 
   try {
     const ftsQuery = searchTokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
     const memories = db.prepare(`
-      SELECT m.content, m.memory_type FROM memories m
+      SELECT m.id, m.content, m.memory_type FROM memories m
       JOIN memories_fts fts ON m.id = fts.rowid
       WHERE memories_fts MATCH ?
         AND m.project = ?
         AND ${MEMORY_ELIGIBLE}
       ORDER BY rank LIMIT 2
-    `).all(ftsQuery, project) as Array<{ content: string; memory_type: string }>;
+    `).all(ftsQuery, project) as Array<{ id: number; content: string; memory_type: string }>;
 
     for (const m of memories) {
       const content = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
-      result.memories.push({ type: m.memory_type, content });
+      result.memories.push({ id: m.id, type: m.memory_type, content });
     }
   } catch {
     // FTS5 매칭 실패 시 LIKE 폴백 (토큰 OR)
@@ -354,16 +360,16 @@ function searchPastWork(db: Database.Database, keyword: string, project: string 
       const likeClause = searchTokens.map(() => 'm.content LIKE ?').join(' OR ');
       const likeParams = searchTokens.map(t => `%${t}%`);
       const memories = db.prepare(`
-        SELECT m.content, m.memory_type FROM memories m
+        SELECT m.id, m.content, m.memory_type FROM memories m
         WHERE (${likeClause})
           AND m.project = ?
           AND ${MEMORY_ELIGIBLE}
         ORDER BY m.importance DESC, m.created_at DESC LIMIT 2
-      `).all(...likeParams, project) as Array<{ content: string; memory_type: string }>;
+      `).all(...likeParams, project) as Array<{ id: number; content: string; memory_type: string }>;
 
       for (const m of memories) {
         const content = m.content.length > 80 ? m.content.slice(0, 80) + '...' : m.content;
-        result.memories.push({ type: m.memory_type, content });
+        result.memories.push({ id: m.id, type: m.memory_type, content });
       }
     } catch { /* ignore */ }
   }
@@ -374,15 +380,15 @@ function searchPastWork(db: Database.Database, keyword: string, project: string 
     const params: string[] = [];
     for (const t of searchTokens) { params.push(`%${t}%`, `%${t}%`); }
     const solutions = db.prepare(`
-      SELECT error_signature, solution FROM solutions
+      SELECT id, error_signature, solution FROM solutions
       WHERE (${clause})
         AND project = ?
       ORDER BY created_at DESC LIMIT 2
-    `).all(...params, project) as Array<{ error_signature: string; solution: string }>;
+    `).all(...params, project) as Array<{ id: number; error_signature: string; solution: string }>;
 
     for (const s of solutions) {
       const sol = s.solution.length > 80 ? s.solution.slice(0, 80) + '...' : s.solution;
-      result.solutions.push({ signature: s.error_signature, solution: sol });
+      result.solutions.push({ id: s.id, signature: s.error_signature, solution: sol });
     }
   } catch { /* ignore */ }
 
@@ -594,11 +600,13 @@ async function main() {
     //   JSON 객체 하나만 받는다 — 조각마다 emitContext 를 부르면 객체가 둘 이상 붙어 전부 버려진다.
     //   조각은 순서대로 모으고(알림 → 과거 문맥 → 트리거 문맥) 하나로 합친다.
     const parts: string[] = [];
+    // 2.8 (PB170-100 N3): 조각마다 원천·바이트·생략 사유 — hookTrace 가 꺼져 있으면 아무것도 안 쓰고, 본문은 그대로다
+    const led = new InjectLedger('user-prompt', workspaceRoot, project);
 
     // 사용자 프롬프트에서 지시사항 추출 (DB 저장 · 거부된 #기억 알림만 출력 후보)
     if (input.prompt) {
       const notice = extractAndSaveDirectives(dbPath, project, input.prompt, input.transcript_path);
-      if (notice) parts.push(notice);
+      if (notice) parts.push(led.add('directive-notice', notice));
     }
 
     // 1. 명시적 과거 참조 ("저번에", "예전에" 등) — 기존 동작 유지
@@ -611,7 +619,9 @@ async function main() {
           const pastSection = formatPastWork(pastWork);
           db.close();
           if (pastSection) {
-            parts.push(`\n<past-context project="${project}">\n${pastSection}\n</past-context>\n`);
+            parts.push(led.add('past-context', `\n<past-context project="${project}">\n${pastSection}\n</past-context>\n`, pastIds(pastWork)));
+          } else {
+            led.omit('past-context', 'no-eligible-rows');
           }
         } catch { /* ignore */ }
       } else {
@@ -630,7 +640,9 @@ async function main() {
                 const content = m.content.length > 120 ? m.content.slice(0, 120) + '...' : m.content;
                 lines.push(`- [${m.memory_type}] ${content}`);
               }
-              parts.push(`\n<triggered-context project="${project ?? 'global'}" keywords="${triggerKws.join(',')}">\n${lines.join('\n')}\n</triggered-context>\n`);
+              parts.push(led.add('triggered-context',
+                `\n<triggered-context project="${project ?? 'global'}" keywords="${triggerKws.join(',')}">\n${lines.join('\n')}\n</triggered-context>\n`,
+                `m:${triggered.map(m => m.id).join(',')}`));
             }
           }
         } catch { /* ignore */ }
@@ -639,9 +651,11 @@ async function main() {
 
     // 2.7 (PB139-12): 루트 세션의 명시적 프로젝트 선택 → 그 프로젝트의 재개 카드(같은 단일 출력에 싣는다)
     const routed = routeTurn(dbPath, project, workspaceRoot, input);
-    if (routed) parts.push(routed);
+    if (routed) parts.push(led.add('routed-card', routed));
 
-    if (parts.length > 0) emitContext(parts.join(''), 'UserPromptSubmit', input.transcript_path);
+    const body = parts.length > 0 ? parts.join('') : null;
+    if (body) emitContext(body, 'UserPromptSubmit', input.transcript_path);
+    led.flush(body);
 
     process.exit(0);
   } catch (e) {
