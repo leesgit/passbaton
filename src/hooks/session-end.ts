@@ -930,6 +930,8 @@ async function main() {
         checked: number;
         elapsedMs: number;
         uncovered: string[];
+        /** 2.8 (PB195-500 · L-48): 등록됐지만 디렉터리가 사라진 루트(basename) — roots·uncovered 에 넣지 않는다(예상된 건너뜀 · 주입 줄 잡음 아님) */
+        removed?: string[];
         /** 설정(`workspace.roots`)이 선언한 루트 수 — 등록·관측과 따로 센다(2.7 PB139-11) */
         declared?: number;
         /** 선언 중 워킹트리로 풀린 수(reply-147) */
@@ -1076,6 +1078,7 @@ async function main() {
       } else if (roots.length > 0) {
         const started = Date.now();
         const uncovered: string[] = [];
+        const removed: string[] = [];
         const results: RootWrites[] = [];
 
         // ★ 훅 전체 데드라인. 루트당 5초 × 8루트 = 40초를 그냥 기다릴 수는 없다.
@@ -1120,8 +1123,10 @@ async function main() {
             if (!r.headBaseline) uncovered.push(`${path.basename(r.root)}: no HEAD baseline (commits invisible)`);
             // 다음 턴이 이 턴의 커밋을 다시 세지 않도록 기준선을 옮긴다.
             try { advance.run(sessionId, project, r.root, r.head ?? null); } catch { /* noop */ }
+          } else if (r.status === 'missing') {
+            removed.push(path.basename(r.root));
           } else {
-            uncovered.push(`${path.basename(r.root)}: ${r.status}`);
+            uncovered.push(`${path.basename(r.root)}: ${r.status}`);   // 실제 실패는 그대로 보인다
           }
         }
 
@@ -1146,10 +1151,11 @@ async function main() {
         coverage.workspace = {
           boundary: 'turn_start',
           scope: 'registered roots only',
-          roots: roots.length,
+          roots: roots.length - removed.length,
           checked: results.filter(r => r.status === 'checked' || r.status === 'truncated').length,
           elapsedMs: Date.now() - started,
           uncovered,
+          ...(removed.length ? { removed } : {}),
           artifacts: artifactCoverage,
           ...declFields,
         };

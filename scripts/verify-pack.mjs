@@ -7,6 +7,7 @@
  *   node scripts/verify-pack.mjs --break=shell   # 역검증: 옛 postinstall(셸 문법)로 포장 → 빨개져야
  *   node scripts/verify-pack.mjs --strict        # npm 설치 스크립트 정책: 엄격·승인 없음 → 설치 실패 /
  *                                                #   엄격·README 의 승인 목록 → 전부 초록
+ *   node scripts/verify-pack.mjs --break=cli     # 역검증(PB195-500 L-50): 카드 CLI 필수 파일을 뺀 tarball → 빨개져야
  *   node scripts/verify-pack.mjs --recover       # 스크립트를 건너뛴 설치(npm v12 기본 차단과 같은 꼴) → 빨개지고,
  *                                                #   README 의 복구 명령 → 전부 초록
  *
@@ -52,6 +53,10 @@ try {
   if (breakMode === 'shell') {
     fs.writeFileSync(pkgFile, pkgText.replace('"node scripts/postinstall.cjs"', '"node dist/hooks/install.js install 2>/dev/null || true"'));
   }
+  if (breakMode === 'cli') {
+    // 카드 CLI 의 필수 모듈 하나를 포장에서 뺀다 — 설치본에서 passbaton-card 가 실패해야 한다
+    fs.writeFileSync(pkgFile, pkgText.replace('"files": [', '"files": [\n    "!dist/utils/card-snapshot.js",'));
+  }
   const p = npm(['pack', '--pack-destination', work, '--json'], { cwd: ROOT });
   if (p.status !== 0) { console.error(p.stderr); process.exit(2); }
   const info = JSON.parse(p.stdout)[0];
@@ -60,6 +65,10 @@ try {
   console.log('pack');
   check('tarball 에 postinstall 래퍼와 dist 설치기가 있다',
     files.includes('scripts/postinstall.cjs') && files.includes('dist/hooks/install.js') && files.includes('dist/index.js'));
+  // 2.8 (PB195-500 · L-50): 두 CLI 와 그 필수 모듈이 후보 tarball 에 있다
+  const cliFiles = ['dist/cli-card.js', 'dist/utils/card-snapshot.js', 'dist/cli-search.js', 'dist/utils/source-search.js'];
+  check('tarball 에 passbaton-card·passbaton-search 와 필수 모듈이 있다', cliFiles.every(f => files.includes(f)),
+    cliFiles.filter(f => !files.includes(f)).join(', ') || cliFiles.join(', '));
 } finally {
   fs.writeFileSync(pkgFile, pkgText);
 }
@@ -151,6 +160,32 @@ async function verifyInstalled(e) {
     dbOk ? '' : (stderr.trim().split('\n').find(l => /Error/.test(l)) ?? JSON.stringify(stored ?? stats ?? null)).slice(0, 200));
   check('MCP stdout 은 JSON-RPC 뿐', nonJson.length === 0, nonJson.slice(0, 2).join(' | '));
   child.kill();
+
+  // 2.8 (PB195-500 · L-50): 설치된 bin 으로 두 CLI — 소스 트리·세션 임시 사본 없이. ⛔ `--version` 을 쓰지 않는다(R-83).
+  const shim = name => win ? path.join(e.prefix, `${name}.cmd`) : path.join(e.prefix, 'bin', name);
+  const runBin = (name, args) => spawnSync(shim(name), args, { cwd: e.ws, env: e.env, encoding: 'utf8', shell: win });
+  const proj = path.join(e.ws, 'cliproj');
+  fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
+  fs.mkdirSync(path.join(proj, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'docs', 'HANDOFF.md'), '# 인계\n- 지금 작업: 미니맵 래칫 상향 검토\n');
+  fs.writeFileSync(path.join(proj, '.claude', 'passbaton.config.json'), JSON.stringify({
+    continuity: { sources: [{ path: 'docs/HANDOFF.md', lines: 5 }] },
+    search: { sources: [{ path: 'docs/HANDOFF.md' }] },
+  }));
+  const cardOut = path.join(e.ws, 'card.md');
+  const metaOut = path.join(e.ws, 'card.meta.json');
+  const c = runBin('passbaton-card', ['--project-dir', proj, '--out', cardOut, '--meta', metaOut, '--no-git']);
+  const meta = readJson(metaOut);
+  const pkgVersion = readJson(path.join(pkgDir, 'package.json'))?.version;
+  check('설치본 passbaton-card 가 카드·메타를 만든다(메타 packageVersion = 설치된 판)',
+    c.status === 0 && fs.existsSync(cardOut) && !!meta && meta.packageVersion === pkgVersion,
+    c.status === 0 ? `packageVersion ${meta?.packageVersion} / installed ${pkgVersion}` : lastLines(c));
+  const v = runBin('passbaton-card', ['--verify', metaOut, '--card', cardOut]);
+  check('설치본 passbaton-card --verify 종료 0', v.status === 0, v.status === 0 ? '' : lastLines(v));
+  const s = runBin('passbaton-search', ['--project-dir', proj, '--no-git', '--json', '래칫']);
+  let hits = -1;
+  try { hits = JSON.parse(s.stdout).results.length; } catch { /* 아래 실패 */ }
+  check('설치본 passbaton-search 가 선언 원천에서 찾는다', s.status === 0 && hits > 0, s.status === 0 ? `results ${hits}` : lastLines(s));
 }
 
 /** 한 시나리오: 실패 수를 돌려준다. */
