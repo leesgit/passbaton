@@ -25,7 +25,7 @@ import {
   GetPromptRequestSchema
 } from '@modelcontextprotocol/sdk/types.js';
 import * as fs from 'fs/promises';
-import { mkdirSync, existsSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync } from 'fs';
 import * as path from 'path';
 import { execSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -34,6 +34,46 @@ import { tokenizeQuery, buildFtsQuery } from './utils/tokenize.js';
 import { migrateSchema } from './db/migrate.js';
 import { buildResumeCard } from './utils/resume-card.js';
 import { writeActiveContext } from './utils/active-context.js';
+
+// ===== CLI 인자 — 초기화보다 먼저 (2.8 · Astra reply-195 PB195-100 · 원장 B4) =====
+// 이 아래(WORKSPACE_ROOT 탐지 → `.claude/` 생성 → `new Database` → 스키마·이주)는 모듈 최상위에서 곧바로 돈다.
+// 예전엔 인자를 파일 맨 끝에서 봐서 `--help`·`config` 도 DB 를 먼저 열었고, `--version` 은 분기가 없어
+// stdio 서버까지 떴다(10-24 tarball 확인 중 실제 `~/.claude/sessions.db` 를 연 사고 · R-83).
+// ⛔ 정보·하위 명령 인자는 여기서 끝낸다 — 이 블록 위로 부작용 있는 코드를 올리지 않는다.
+// (no arg) = MCP 서버(파일 끝 main) · 모르는 인자는 예전처럼 서버로 간다(호스트가 붙이는 인자 호환).
+const CLI_COMMANDS = new Set(['install', 'uninstall', 'remove', 'status']);
+const cliArg = process.argv[2];
+
+if (cliArg === '--version' || cliArg === '-v' || cliArg === 'version') {
+  // 버전 정본 = package.json(dist/index.js 기준 ../package.json)
+  let version = 'unknown';
+  try {
+    const pj = JSON.parse(readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')) as { version?: unknown };
+    if (typeof pj.version === 'string') version = pj.version;
+  } catch { /* unknown 그대로 */ }
+  console.log(version);
+  process.exit(version === 'unknown' ? 1 : 0);
+} else if (cliArg === 'config') {
+  // Feature-flag CLI: `passbaton config [set|preset|reset|path]`
+  const { runConfigCli } = await import('./cli-config.js');
+  process.exit(runConfigCli(process.argv.slice(3)));
+} else if (cliArg && (CLI_COMMANDS.has(cliArg) || cliArg === 'help' || cliArg === '--help' || cliArg === '-h')) {
+  if (cliArg === 'help' || cliArg === '--help' || cliArg === '-h') {
+    console.log('Usage: npx passbaton [install|uninstall|status|config|--version]');
+    console.log('  install    Register lifecycle hooks for Claude Code / Codex CLI / Gemini CLI');
+    console.log('  uninstall  Remove the hooks');
+    console.log('  status     Show installed hooks');
+    console.log('  config     View / toggle feature flags (on/off)');
+    console.log('  --version  Print the package version (no server, no database)');
+    console.log('  (no arg)   Start the MCP server (stdio) — used by the hook runtime');
+    process.exit(0);
+  }
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const installerPath = path.join(here, 'hooks', 'install.js');
+  const result = spawnSync(process.execPath, [installerPath, cliArg], { stdio: 'inherit' });
+  process.exit(result.status ?? 0);
+}
 
 // @xenova/transformers - 동적 import (sharp 의존성 문제 방지)
 let transformersModule: { pipeline: unknown; env: Record<string, unknown> } | null = null;
@@ -2577,30 +2617,6 @@ async function main() {
   console.error('Project Manager MCP v5 started (24 tools + 3 prompts for auto-injection)');
 }
 
-// CLI subcommands (install/uninstall/status/help) → delegate to the hooks installer.
-// Without this, `npx passbaton install` runs the default bin
-// (the MCP server), which ignores the arg and hangs on stdio — looks broken to users.
-const CLI_COMMANDS = new Set(['install', 'uninstall', 'remove', 'status']);
-const cliArg = process.argv[2];
-
-if (cliArg === 'config') {
-  // Feature-flag CLI: `passbaton config [set|preset|reset|path]`
-  const { runConfigCli } = await import('./cli-config.js');
-  process.exit(runConfigCli(process.argv.slice(3)));
-} else if (cliArg && (CLI_COMMANDS.has(cliArg) || cliArg === 'help' || cliArg === '--help' || cliArg === '-h')) {
-  if (cliArg === 'help' || cliArg === '--help' || cliArg === '-h') {
-    console.log('Usage: npx passbaton [install|uninstall|status|config]');
-    console.log('  install    Register lifecycle hooks for Claude Code / Codex CLI / Gemini CLI');
-    console.log('  uninstall  Remove the hooks');
-    console.log('  status     Show installed hooks');
-    console.log('  config     View / toggle feature flags (on/off)');
-    console.log('  (no arg)   Start the MCP server (stdio) — used by the hook runtime');
-    process.exit(0);
-  }
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const installerPath = path.join(here, 'hooks', 'install.js');
-  const result = spawnSync(process.execPath, [installerPath, cliArg], { stdio: 'inherit' });
-  process.exit(result.status ?? 0);
-} else {
-  main().catch(console.error);
-}
+// CLI 인자(install/uninstall/status/config/help/--version)는 파일 위 「CLI 인자」 블록이 초기화 전에 끝낸다.
+// 여기 오면 인자 없음(또는 모르는 인자) = MCP 서버.
+main().catch(console.error);
