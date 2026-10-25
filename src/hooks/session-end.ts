@@ -23,6 +23,7 @@ import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils
 import { migrateSchema } from '../db/migrate.js';
 import { readRunOrigin } from '../utils/run-origin.js';
 import { writeActiveContext } from '../utils/active-context.js';
+import { acquireStopLock } from '../utils/stop-lock.js';
 import type { SummarySource } from '../utils/summary-source.js';
 import { humanTurn, requestLine } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
@@ -731,29 +732,12 @@ async function main() {
     const lockKey = input.transcript_path
       ? crypto.createHash('md5').update(`${input.transcript_path}\u0000${turnPart}`).digest('hex').slice(0, 16)
       : (input.session_id ? `${input.session_id}-${turnPart}` : null);
+    // ★ 2.8 (reply-195 PB195-300 · L-06): 처리 진입 중복 방지 락 — 역할·수명은 utils/stop-lock.ts 머리 주석.
+    //   예전 락은 지우지 않아 Stop 마다 쌓였고(5 초 뒤엔 무효), 처리 중이어도 5 초가 지나면 막지 못했다.
     if (lockKey) {
-      const lockPath = path.join(path.dirname(dbPath), `.session-end-${lockKey}.lock`);
-      const now = Date.now();
-      try {
-        // Phase 5: atomic `wx` (존재 시 EEXIST throw) → 두 hook 인스턴스가 거의 동시에 진입하는 race 차단
-        // 베이스라인: id=1606/1607이 ~500ms 차이로 동시 INSERT 됨 (debug.log 13:26:51.205 + 13:26:51.702)
-        fs.writeFileSync(lockPath, String(now), { flag: 'wx' });
-      } catch (e: unknown) {
-        // 파일이 이미 존재 (다른 hook 인스턴스가 처리 중) → mtime 확인 후 5초 내면 차단
-        if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
-          try {
-            const lockMtime = fs.statSync(lockPath).mtimeMs;
-            if (now - lockMtime < 5000) {
-              process.exit(0); // 5초 내 재발화 차단
-            }
-            // 5초 지난 stale 락 → 덮어쓰기 (이 호출이 새 작업)
-            fs.writeFileSync(lockPath, String(now));
-          } catch {
-            // stat/write 실패는 fail-soft
-          }
-        }
-        // 그 외 락 파일 에러는 무시 (fail-soft)
-      }
+      const lock = acquireStopLock(path.dirname(dbPath), lockKey);
+      if (!lock.proceed) process.exit(0);   // 같은 이벤트를 다른 인스턴스가 처리 중이거나 방금 끝냈다
+      process.on('exit', lock.release);      // 모든 process.exit 경로에서 완료 표시
     }
 
     // 디버그 로그
