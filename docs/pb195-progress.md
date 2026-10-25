@@ -148,3 +148,58 @@
 ### 시간
 
 - 300: 00:22–00:32 ≈ 0.17 h / 상한 2.0 h.
+
+## PB195-400 — 정체성 잔재 · L-31 감사 (03:43–03:58)
+
+### 호환 필요성 확인 (읽기만)
+
+- 이 PC 의 실제 사용처는 **구 bin 이름을 쓰지 않는다**: `~/.claude/settings.json` 훅 = node 절대 경로 + 설치본 `dist/hooks/*.js`(bin 이름 아님) · `~/.claude.json` 전역 `project-manager` = node + `dist/index.js` · `~/.codex/hooks.json` = `passbaton-hook-*`(새 이름) · `GitHub/*/.mcp.json`·`.claude/settings*.json`·`.codex/hooks.json` 에 `claude-hook-*`/`claude-session-*` 0 건.
+- 그래도 별칭은 유지: npm 사용자 중 v1(`claude-session-continuity-mcp`)에서 온 설치가 훅 줄을 다시 쓰지 않았으면 `claude-hook-*` 를 PATH 로 부른다(README 「nothing breaks」 약속 · `install.ts` 가 옛 접두사를 인식해 교체) — 지우면 조용히 실패한다.
+- **별칭 정책(README 에 명시)**: 구 bin 7 개는 2.x 동안 같은 파일을 가리키는 deprecated 별칭 · 제거는 메이저 + 릴리스 노트에서만 · 시험이 고정.
+
+### 수정 (커밋 `36837a7`)
+
+- B1 `serverInfo`: `project-manager-v5`/`5.0.0` → `passbaton`/package.json 버전(`PKG_VERSION` — `--version` 과 같은 원천). 호스트 설정의 서버 **키** `project-manager` 는 도구 이름(`mcp__project-manager__*`)을 정하므로 그대로.
+- B3 도구 수: 기동 줄 `24 tools + 3 prompts` 하드코딩 → `listedTools()`·`listedPrompts()`(tools/list·prompts/list 와 같은 함수) 길이 · 읽기 전용이면 걸러진 수 + `· read-only`. 실제 등록 = **26 tools + 3 prompts**(읽기 전용은 더 적음). 머리 주석 「24개 도구」 정리.
+- `glama.json`: 「25 MCP tools」 삭제 · version 2.1.2 → 2.8.0.
+- A1 구 bin: 그대로 유지 + README 「Alias policy (2.8)」.
+- 남김(범위 밖·기록만): `index.ts` 머리 주석의 카테고리별 개수(1~8 · resume_card 미포함) · README 1034 줄 「v4 API (24 tools)」 = 과거 이력 줄.
+
+### 시험 `tests/identity-2.8.e2e.test.ts` 12 개
+
+- 실제 서버(stdio)의 initialize `serverInfo` = `{name: package.name, version: package.version}`.
+- tools/list 이름 집합 = 공개 도구 표(26 · 권한 설정이 기대는 계약) · 기동 줄 `passbaton MCP <버전> started (<tools/list 수> tools + <prompts/list 수> prompts)`.
+- 읽기 전용: 기동 줄 수 = 걸러진 tools/list 수(수가 실제로 달라지는 양성 대조).
+- glama.json 버전 = package · 「N MCP tools」 를 적으면 N = 등록 수.
+- 구 별칭 7 개 각각 bin 에 있고 새 이름과 **같은 파일** · dist 에 실제 파일 · README 정책 문구.
+- 검증: build 0 · tsc 0 · 관련(identity + cli-info) 21/21 · 전체 **689 + 1 skip**(52 파일).
+- 역검증(`36837a7` 분리 worktree · `scratchpad/pb195/mut/m400.mjs` · `m400.log`) **6/6 RED-OK**:
+  - I-1 serverInfo 를 옛 값으로 → 빨강(serverInfo)
+  - I-2 등록 도구 하나 이름 변경(`graph_explore`→`graph_explorer`) → 빨강(실제 tools/list 대조)
+  - I-3 기동 줄 수 하드코딩 24 → 빨강 2
+  - I-4 기동 줄이 읽기 전용 거름 무시 → 빨강(읽기 전용)
+  - I-5 구 별칭 `claude-hook-session-end` 제거 → 빨강(호환)
+  - I-6 구 별칭 `claude-session-continuity-mcp` 가 다른 파일 → 빨강(호환)
+- 홈 점검(u0~u6): 묶음 앞뒤 모두 새 행 0 · 새 락 0 = CLEAN. 참고: 대화 세션이 사고 잔여를 지운 뒤 새 기준 sha `f1be47b7` · mtime 2026-10-25T18:42:44Z(묶음 중 불변).
+- A-local: **충족**(공개 이름·서버 식별·도구 수 = 실제 등록 · 별칭 정책 명시 + 호환 시험).
+
+### L-31 이중 MCP 등록 — 감사만 (설정 무수정)
+
+- 유효 설정의 출처 둘:
+  1. `~/.claude.json` 전역 `mcpServers.project-manager` = `C:\Program Files\nodejs\node.exe` + 설치본 `dist/index.js`(WORKSPACE_ROOT 없음 → cwd 탐지).
+  2. 프로젝트 `ai-service-generator/.mcp.json` `passbaton` = `npx -y passbaton` + `WORKSPACE_ROOT=…/ai-service-generator`. `.claude/settings.local.json` 의 `enableAllProjectMcpServers: true` 가 이것을 켠다(`enabledMcpjsonServers: ["project-manager"]` 는 .mcp.json 에 없는 이름 — 효과 없음).
+- **실제로 두 서버가 뜬다(관측)**: 현재 Claude 프로세스 `claude.exe` 33948(10-26 02:49) 아래 `node.exe dist/index.js` 38160(전역 등록) + `cmd → npx-cli -y passbaton(31336) → cmd → node …\npm\node_modules\passbaton\dist\index.js`(35676) — 둘 다 **같은 설치본 2.7.2 · 같은 DB**(cwd 탐지 결과와 WORKSPACE_ROOT 가 같은 루트). 이 세션 도구 목록에도 `mcp__project-manager__*`·`mcp__passbaton__*` 가 26 개씩 둘 다 있다. 10-22 부터 살아 있는 다른 `claude.exe` 26560 아래에도 npx 경유 서버 둘(23540·9176)이 있다.
+- 영향(추론): 같은 도구 26 개가 두 이름으로 모델 입력에 들어감 · 같은 DB 에 쓰는 프로세스 둘(WAL 이라 깨지진 않음) · `npx` 쪽은 매 기동 레지스트리 확인 비용. 실제 해(오동작) 관측은 없음.
+- 해결안(사용자 결정 · 전역/프로젝트 설정 수정은 사용자 몫): **(가 · 권장)** 프로젝트 `.claude/settings.local.json` 에 `"disabledMcpjsonServers": ["passbaton"]`(또는 `enableAllProjectMcpServers: false`) — 전역 `project-manager` 하나만 남고 권한 규칙의 도구 이름 유지. (나) `.mcp.json` 에서 `passbaton` 항목 삭제(레포 공유 설정이라 다른 사람에겐 영향). (다) 전역을 지우고 프로젝트 것만 — 도구 이름이 `mcp__passbaton__*` 로 바뀌어 권한 규칙 재작성 필요 · 비권장.
+- 판정: **미해결(설정 감사 + 실제 중복 기동 관측까지)**.
+
+### L-54 루트 탐지가 사용자 프로필까지 올라감 — 이번 범위 아님 · 재현 근거·제안만
+
+- 근거 1(시험 사고 00:05·00:06): HOME 만 바꾸면 `utils/workspace.ts` `candidateDirs` 의 홈 가드(`os.homedir()` = 바뀐 HOME)가 실제 프로필을 막지 못해 `%TEMP%\pb-eph-ptu-*` → `C:\Users\scea4`(`.claude/sessions.db` 있음 → reason `db`)로 잡혔다(`session-end-debug.log` `ws_root=C:\Users\scea4 (by=db)`).
+- 근거 2(자연 발생): `~/.claude/sessions.db` 의 10-21 행 `project=scea4`「reply with just: ok」 — 홈에서 띄운 실제 세션. 가드는 「cwd 자체가 홈이면 예외」 라 홈이 루트가 된다.
+- 근거 3(코드): **서버 `src/index.ts` 의 `detectWorkspaceRoot` 는 `utils/workspace.ts` 가 아닌 자체 사본이고 홈 가드가 없다** — 상위 어디든 `.claude` 가 있으면 루트(R-83 에서 `--version` 이 홈 DB 를 연 경로).
+- 제안: ① 서버가 `utils/workspace.ts` `resolveWorkspaceRoot` 를 쓰게(R-06 은 「순수 추출」 기각이지 동작 변경 동반은 허용) ② 홈 가드를 `os.homedir()` 와 `os.userInfo().homedir` 둘 다로 ③ cwd 가 홈 자체일 때 `.claude/sessions.db` 를 루트 근거로 쓰지 않기(사람 결정 — 홈에서 쓰는 사용자 영향) ④ 시험 하네스는 HOME·TMP 동시 격리(L-53).
+
+### 시간
+
+- 400: 03:43–03:58 ≈ 0.25 h / 상한 0.75 h.
