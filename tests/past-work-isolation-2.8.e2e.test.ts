@@ -47,7 +47,7 @@ const ORPHAN = '출처불명';
  * 부적격 묶음은 골라 깐다 — 음성 시험마다 **그 묶음만** 깔아야 고치기 전 코드에서 그 행이 실제로 새어 나온다
  * (묶음을 다 깔면 서로 칸을 먹어 한 묶음의 누수가 가려진다). 양성 대조는 전부 깔아 밀어내기까지 본다.
  */
-type Bad = { other?: boolean; unverified?: boolean; orphan?: boolean };
+type Bad = { other?: boolean; unverified?: boolean; orphan?: boolean; noFts?: boolean };
 const ALL: Bad = { other: true, unverified: true, orphan: true };
 function seeded(bad: Bad = ALL): { ws: string; proj: string } {
   const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pb-28pw-')));
@@ -69,6 +69,8 @@ function seeded(bad: Bad = ALL): { ws: string; proj: string } {
     END;
     CREATE TABLE IF NOT EXISTS solutions (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, error_signature TEXT NOT NULL,
       error_message TEXT, solution TEXT NOT NULL, related_files TEXT, keywords TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);`);
+  // FTS 표가 없는 DB(옛·손상) → memories 는 LIKE 폴백 경로로 찾는다. 그 경로도 같은 거름을 지켜야 한다(PB195-200).
+  if (bad.noFts) db.exec('DROP TRIGGER IF EXISTS memories_ai; DROP TABLE IF EXISTS memories_fts;');
 
   // sessions: 적격 1(가장 오래됨) · 타 프로젝트 3 + 프로젝트 빈 행 1(더 최신 — LIMIT 3 을 먼저 하면 적격이 밀려난다)
   const ses = db.prepare('INSERT INTO sessions (project, last_work, timestamp) VALUES (?, ?, ?)');
@@ -132,6 +134,12 @@ describe.skipIf(!built)('PB170-020 N4 과거 참조 — 현재 프로젝트·주
     const body = gameTurn({ unverified: true });
     expect(body).toContain(OK_MEMORY.slice(0, 80));
     expect(body).not.toContain('instead of waking up');
+  });
+
+  it('FTS 없는 DB(LIKE 폴백): 다른 프로젝트 기억은 나오지 않고 적격 기억은 나온다', () => {
+    const body = gameTurn({ other: true, noFts: true });
+    expect(body).toContain(OK_MEMORY.slice(0, 80));
+    expect(body.split(/\r?\n/).filter(l => l.includes(OTHER))).toEqual([]);
   });
 
   it('출처 프로젝트 불명(NULL·빈) 행은 전역으로 보지 않는다', () => {
