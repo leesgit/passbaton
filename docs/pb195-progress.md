@@ -243,3 +243,79 @@
 ### 시간
 
 - 500: 03:51–04:01 ≈ 0.17 h / 상한 0.75 h.
+
+## PB195-800 — 최종 단일 후보 검증 (04:51–05:00)
+
+### 결속 (같은 후보를 가리킨다)
+
+| 항목 | 값 |
+|---|---|
+| 소스 | `feat/2.8-continuity` **`64550fc`**(시험 2 줄 보정 커밋 · 패키지 내용은 `00dee89` 와 같음) · push 안 함 |
+| 2.7.3 포함 | `git merge-base --is-ancestor 41069a5 64550fc` = 참 |
+| tarball | `scratchpad/pb195/final/passbaton-2.8.0.tgz` · 288,892 B · 130 항목 · **sha256 `44f0f832b09979f1c47c489c0dba318ca5cb743f4ea5ac597fa9aa9f2d921310`** · npm integrity `sha512-x9KBV74k…WmvZwg==` · `00dee89`·`64550fc` 에서 다시 싸도 같은 sha256(시험은 패키지 밖) |
+| dist 트리 | 126 파일 · sha256 `6397f758…a61c160` — 빌드 트리(wt170 `dist/`)와 **격리 설치본** `node_modules/passbaton/dist` 가 같음 · 소스 없는 낡은 dist 파일 0 |
+| 설치본 회귀 지문 | 12 시험 파일 102 통과 + 1 건너뜀(glama.json — 패키지 밖) · 결과 지문 `9d98419b…54760b3`(`result-cand.json`) |
+| 소스 전체 시험 | `64550fc` · tsc 0 · 694 중 실패 0(54 파일 · 1 skip) · 결과 JSON sha256 앞 16 `f18ff22894de14bd` |
+| verify-pack(설치·훅·MCP·SQLite·두 CLI) | `64550fc` 에서 13/13 PASS |
+
+### 설치본 회귀 (`scratchpad/pb195/final/verify-final.mjs`)
+
+- 방법: 위 tarball 을 격리 prefix(`pb195-iso/home/tmp/final/prefix-cand`)에 `npm install -g --prefix` → 설치된 패키지 폴더 안 `tests/` 로 시험 사본(wt170 `64550fc`) 복사 · `../src/` import 는 `../dist/` 로 바꿔 **설치된 dist** 를 쓰게 · 실행기만 wt170 의 vitest · 런타임 의존성(better-sqlite3 네이티브 포함)은 설치본 것.
+- 대상: B4(cli-info-args 9) · State 보존(active-context 10) · 프로젝트 격리(past-work-isolation 7) · L-06(stop-lock 7 + stop-dedup 9) · 정체성(identity 11 + 1 skip) · files 줄(files-line 2 + noise 17) · L-49(recent-same-commit 2) · 두 CLI(card-snapshot 11 + source-search 15) · 옛 DB 이행(migrate 2) → **전부 초록**.
+- 첫 실행에서 2 건 빨강 → 원인은 시험 쪽: ① 서버를 두 번 띄우는 B4 양성 대조가 설치본 첫 실행에서 vitest 기본 5 초 초과 → 시험 시간 상한 60 초 ② identity 의 glama.json 검사(glama.json 은 패키지 `files` 밖) → 있을 때만. 커밋 `64550fc`(제품 코드 무변경 · tarball sha 그대로).
+
+### 역검증 — 낡은 dist · 누락 파일 tarball
+
+| tarball | sha256(앞 16) | 결과 |
+|---|---|---|
+| 후보 | `44f0f832b09979f1` | 102 통과 · 실패 0 |
+| **낡은 dist**(`5c50de5` 빌드 · 같은 2.8.0 이름) | `40689a8a7d84638b` | **18 빨강** — B4 8 · files 줄 2 · 정체성 4 · stop-lock 4 (State 보존·격리·CLI 는 5c50de5 에도 있어 초록 = 예상) |
+| **누락 파일**(`64550fc` 에서 `dist/utils/stop-lock.js` 제외) | `73fab21e4ee0e9df` | **22 빨강** — Stop 훅이 모듈 없음으로 실패 → stop-lock 7 · stop-dedup 9 · active-context(Stop 경로) 4 · files-line 2 |
+
+- 판정기가 이름·버전(셋 다 2.8.0)이 아니라 설치된 내용에서 갈린다.
+
+### 기존 DB 사본 이행 → 2.7.2 재열기 (`scratchpad/pb195/final/mig.mjs` · `mig.log`)
+
+- 원본은 복사만(실제 홈 DB `~/.claude/sessions.db` · 프로젝트 DB `ai-service-generator/.claude/sessions.db`+WAL) · 쓰기는 격리 사본에만 · 2.7.2 는 레지스트리에서 격리 prefix 에 따로 설치(`prefix-272`).
+- 순서: 사본 → 후보 서버(initialize · memory_stats · session_history) + 후보 SessionStart → 스키마·행 수 비교 → **2.7.2 서버·SessionStart 로 다시 열기**.
+
+| 사본 | 전 | 후보 이행 | 2.7.2 재열기 |
+|---|---|---|---|
+| 홈 DB(세션 1 · 표 15) | integrity ok | 서버 3/3 · SessionStart 0 · 추가 칸 없음(10-24 R-83 사고 때 이미 2.8 이 이행) · 행 변화 0 | 서버 3/3 · SessionStart 0 · integrity ok · 행 변화 0 |
+| 프로젝트 DB(세션 2,482 · 기억 241 · 표 20) | integrity ok | 서버 3/3 · SessionStart 0 · **칸 추가 3**: `sessions.run_origin`·`sessions.summary_source`·`active_context.state_source` · 삭제 0 · 행 변화 0 | 서버 3/3 · SessionStart 0 · integrity ok · 행 변화 0 |
+
+### 홈 점검
+
+- w0~w14 · 묶음 7 번 앞뒤 모두 새 행 0 · 새 락 0 = CLEAN. 참고 sha `f1be47b7` · mtime 18:42:44Z 불변.
+
+### A-local: 충족 · H: 효과 미판정 유지
+
+### 시간
+
+- 800: 04:51–05:00 ≈ 0.15 h / 상한 1.5 h. PB195 누계(000~800) ≈ 1.2 h / 8 h.
+
+## 후보 요약 초안 (900 용 · 대화 세션이 다듬어 제출)
+
+**후보**: passbaton 2.8.0 · 소스 `64550fc` · tarball sha256 `44f0f832…921310` · 2.7.3(`41069a5`) 포함 · npm 미배포 · push 안 함.
+
+**바뀐 것(2.7.2 대비 — 2.7.3 묶음 포함)**
+- 2.7.3: 선택 원천·요약 출처 표시·실행 출처(loop) 거름·잡음 축소(files 줄 정상 축약·Solutions 통계 줄).
+- 2.8(PB170·174·175): State 칸별 쓰기(Edit 마다 State·blockers 소실 수정) · 과거 참조 프로젝트 격리 · 해법 자동 주입 제거 · PreCompact 훅 전용 DB · 사람 요청 오표시 · 주입 원장 · `passbaton-card` · `passbaton-search`.
+- PB195: `--version`/`--help`/`config` 가 서버·DB 를 띄우지 않음(B4) · Stop 락 누적 중단 + 처리 중 상호배제 + 강제 종료 복구(L-06) · serverInfo `passbaton`/패키지 버전 · 기동 줄 도구 수 = 실제 등록(26+3) · 구 bin 7 개 별칭 정책 · files 줄에서 지워진 보조 에이전트 워크트리를 실패로 안 보임(L-48) · FTS 없는 DB 의 기억 폴백도 프로젝트 격리.
+
+**남은 결함·한계**
+- L-31 이중 MCP 등록(현재 세션에 서버 둘) — 설정 결정 필요(해결안 가/나/다).
+- L-54 서버 `index.ts` 의 루트 탐지에 홈 가드 없음 · 홈 자체 cwd 는 홈 DB 사용 — 제안만.
+- L-53 시험 하네스가 실제 HOME 을 홈 가드로 기대(HOME 만 바꾸면 샌다) — 미수정.
+- 기존 옛 형식 락 718 개(무효) · `agent-*: failed` 옛 행 153 개는 소급 정리 안 함.
+- L-45 같은 세션 같은 문구 줄이기 보류 · C3·C10·C14·C15·C17 보류 그대로.
+- 자연 재개 효과(U-01) 미판정 — 설치 뒤 수집.
+
+**되돌리는 법**: `npm install -g passbaton@2.7.2` → Claude Code 재시작. DB 이행은 칸 추가뿐(삭제 0) — 2.7.2 가 이행된 실제 DB 사본을 그대로 연다(위 표). 훅 등록 형식 변경 없음. 2.8 이 만든 v2 락 파일은 2.7.2 가 5 초 규칙으로만 본다(무해).
+
+**사용자 결정 항목**
+1. 2.8.0 npm 배포·전역 설치 여부와 시점(배포 간격 — 「너무 빠르다」 기존 의견) · main 병합 · push.
+2. L-31: (가) 프로젝트 `settings.local.json` 에 `disabledMcpjsonServers: ["passbaton"]`(권장) / (나) `.mcp.json` 항목 삭제 / (다) 전역 삭제(비권장).
+3. 기존 옛 락 718 개 정리 방식(① 둠 ② 설치 뒤 1 일 넘은 옛 형식만 한 번 수동 삭제 ③ 미리보기 있는 CLI 명령).
+4. L-54 ③(홈 cwd 에서 홈 DB 쓰기 중단) 여부.
+5. 설치 뒤 Astra 패킷의 카드 실행 경로를 wt170 사본에서 설치본 `passbaton-card` 로 바꿀지(L-50 후반).
