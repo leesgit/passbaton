@@ -82,7 +82,7 @@ describe.skipIf(!built)('PB195-100 B4 — 정보 인자: 서버·DB 기동 전�
       expect(r.timedOut).toBe(false);
       expect(r.code).toBe(0);
       expect(r.stdout.trim()).toBe(PKG_VERSION);
-      expect(r.stderr).not.toContain('MCP v5 started');
+      expect(r.stderr).not.toMatch(/MCP .*started/);
       expect(fs.existsSync(path.join(ws, '.claude'))).toBe(false);
       expect(fs.existsSync(path.join(home, '.claude', 'sessions.db'))).toBe(false);
     });

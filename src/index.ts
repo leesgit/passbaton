@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Project Manager MCP v5
+ * passbaton MCP 서버 (옛 이름 Project Manager MCP v5)
  *
- * 24개 도구 + 자동 컨텍스트 주입 (Prompts)
+ * 도구 + 자동 컨텍스트 주입 (Prompts) — 수는 아래 `tools`·`prompts` 배열이 정본(기동 줄이 실제 등록 수를 적는다)
  *
  * 카테고리:
  * 1. 세션/컨텍스트 (4개): session_start, session_end, session_history, search_sessions
@@ -44,16 +44,18 @@ import { writeActiveContext } from './utils/active-context.js';
 const CLI_COMMANDS = new Set(['install', 'uninstall', 'remove', 'status']);
 const cliArg = process.argv[2];
 
-if (cliArg === '--version' || cliArg === '-v' || cliArg === 'version') {
-  // 버전 정본 = package.json(dist/index.js 기준 ../package.json)
-  let version = 'unknown';
+// 버전 정본 = package.json(dist/index.js 기준 ../package.json) — `--version`·MCP serverInfo 가 같이 쓴다(PB195-400 B1)
+const PKG_VERSION: string = (() => {
   try {
     const pj = JSON.parse(readFileSync(
       path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')) as { version?: unknown };
-    if (typeof pj.version === 'string') version = pj.version;
-  } catch { /* unknown 그대로 */ }
-  console.log(version);
-  process.exit(version === 'unknown' ? 1 : 0);
+    return typeof pj.version === 'string' ? pj.version : 'unknown';
+  } catch { return 'unknown'; }
+})();
+
+if (cliArg === '--version' || cliArg === '-v' || cliArg === 'version') {
+  console.log(PKG_VERSION);
+  process.exit(PKG_VERSION === 'unknown' ? 1 : 0);
 } else if (cliArg === 'config') {
   // Feature-flag CLI: `passbaton config [set|preset|reset|path]`
   const { runConfigCli } = await import('./cli-config.js');
@@ -478,7 +480,9 @@ function resolveProject(project: string | undefined): string {
 
 // ===== MCP 서버 =====
 const server = new Server(
-  { name: 'project-manager-v5', version: '5.0.0' },
+  // 공개 이름·버전 = 패키지(PB195-400 B1 · 옛 `project-manager-v5`/5.0.0 잔재). ⚠ 호스트 설정의 서버 키(`project-manager`)는
+  //   도구 이름(mcp__project-manager__*)을 정하므로 여기서 바꾸지 않는다 — 그건 설치기 등록 키이고 별개다.
+  { name: 'passbaton', version: PKG_VERSION },
   {
     capabilities: {
       tools: { listChanged: true },
@@ -2504,11 +2508,18 @@ async function generateWorkContext(project: string): Promise<string> {
 
 // 읽기 전용 모드에서는 MCP 표준 주석 readOnlyHint 를 단다 — 클라이언트(예: Codex)가 이것을 보고
 // 승인 없이 부를 수 있다. 쓰기 모드에서는 달지 않는다: memory_search 등도 조회수를 쓰기 때문이다.
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: READONLY
+function listedTools(): Tool[] {
+  return READONLY
     ? tools.filter(t => READONLY_TOOLS.has(t.name))
         .map(t => ({ ...t, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } }))
-    : tools
+    : tools;
+}
+function listedPrompts(): Prompt[] {
+  return READONLY ? [] : prompts;
+}
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: listedTools()
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -2534,7 +2545,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // 읽기 전용 모드에서는 프롬프트를 내놓지 않는다 — work-context 는 꺼진 쓰기 도구를 부르라고 안내한다.
 server.setRequestHandler(ListPromptsRequestSchema, async () => ({
-  prompts: READONLY ? [] : prompts
+  prompts: listedPrompts()
 }));
 
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {
@@ -2614,7 +2625,8 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Project Manager MCP v5 started (24 tools + 3 prompts for auto-injection)');
+  // 수는 실제 등록(tools/list·prompts/list 가 내는 것)에서 — 하드코딩하지 않는다(PB195-400 B3 · 옛 「24 tools」)
+  console.error(`passbaton MCP ${PKG_VERSION} started (${listedTools().length} tools + ${listedPrompts().length} prompts${READONLY ? ' · read-only' : ''})`);
 }
 
 // CLI 인자(install/uninstall/status/config/help/--version)는 파일 위 「CLI 인자」 블록이 초기화 전에 끝낸다.

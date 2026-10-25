@@ -3,8 +3,8 @@
   "maintainers": ["leesgit"],
   "name": "passbaton",
   "display_name": "passbaton — Session Continuity for Claude Code, Codex & Gemini",
-  "description": "Zero-config session continuity and persistent memory for Claude Code, OpenAI Codex CLI, and Google Gemini CLI. Auto-injects your past context at session start, hands over state right before a compaction (carrying hot files + last build status), and saves what happened on exit — all to one local SQLite db shared across all three agents. 100% local, zero API cost. Every feature is opt-in via `passbaton config`. Includes 25 MCP tools for memory, task management, solution archive, and a knowledge graph, with multilingual semantic search across 94+ languages (all-MiniLM-L6-v2, on-device).",
-  "version": "2.1.2",
+  "description": "Zero-config session continuity and persistent memory for Claude Code, OpenAI Codex CLI, and Google Gemini CLI. Auto-injects your past context at session start, hands over state right before a compaction (carrying hot files + last build status), and saves what happened on exit — all to one local SQLite db shared across all three agents. 100% local, zero API cost. Every feature is opt-in via `passbaton config`. Includes MCP tools for memory, task management, solution archive, and a knowledge graph, with multilingual semantic search across 94+ languages (all-MiniLM-L6-v2, on-device).",
+  "version": "2.8.0",
   "author": {
     "name": "leesgit",
     "url": "https://github.com/leesgit"

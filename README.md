@@ -377,6 +377,8 @@ To rewrite your hook entries, run `passbaton-hooks install` once: it replaces th
 
 Nothing else changes — same hooks, same database, same behavior.
 
+**Alias policy (2.8):** the seven v1 bin names (`claude-session-continuity-mcp`, `claude-session-hooks`, `claude-hook-session-start|user-prompt|post-tool|pre-compact|session-end`) are kept as deprecated aliases for the whole 2.x line — each runs exactly the same file as its `passbaton*` name (a test pins this). They are removed only in a major release, with a release note, because a v1 hook entry that was never rewritten would otherwise fail silently. The MCP server now reports itself as `passbaton` (`serverInfo`, package version); the host-side server key that installs write (`project-manager`) is unchanged, so tool names stay the same.
+
 ---
 
 ## Quick Start
