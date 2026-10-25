@@ -203,3 +203,43 @@
 ### 시간
 
 - 400: 03:43–03:50 ≈ 0.12 h / 상한 0.75 h.
+
+## PB195-500 — L-48 · L-49 · L-50 (03:51–04:01)
+
+### ① L-48 files 줄 잡음 — 원인 재현 후 수정
+
+- 원인(읽기 전용 증거): 프로젝트 DB 사본에서 `skipped: agent-…: failed` 행 **153 개**(최근 2743·2738·2736 = fb1025 P2 원문과 같은 `1/3 roots`). 그 루트는 `apps/kenshi-fantasy/.claude/worktrees/agent-a55b2e4e5b7a512f3` 등 — 끝난 보조 에이전트의 격리 워크트리(hot_paths 에 경로 남음)이고 **디렉터리가 이미 없다**(`git worktree list` 에도 없음). `writesSince` 가 없는 cwd 로 git 을 띄워 `spawnSync git ENOENT` → `failed`. git 미설치·저장소 파손과 같은 말이 됐다.
+- 수정(커밋 `198ed13`): `utils/worktree.ts` `writesSince` — 루트 디렉터리가 없으면 `missing`(git 안 띄움). `session-end.ts` — `missing` 은 `coverage.workspace.removed`(basename 목록)로 따로 적고 `roots`·`uncovered` 에 안 셈. 디렉터리가 있는데 git 이 실패하면 예전대로 `uncovered: <이름>: failed` → 주입 줄 `skipped:` 에 그대로 보인다. 렌더러는 그대로(사라진 루트만 있으면 정상 완전 검사의 짧은 꼴).
+- 한계: 이미 저장된 옛 행 153 개는 basename 만 남아 다시 가를 수 없다 → 그 행들이 Recent 에서 밀려날 때까지 옛 꼴로 보인다(소급 재분류 안 함 · P-26).
+- 시험 `tests/files-line-2.8.e2e.test.ts` 2 개(실물 UserPromptSubmit → session_roots 에 루트 심기 → 실물 Stop → 실물 SessionStart):
+  1. 사라진 `agent-a55b2e4e5b7a512f3` 둘 → `removed` 둘 · `uncovered` 빈 · `1/1 roots` · 주입 줄 `files: 0 obs in checked scope · 1/1 roots · boundary=turn_start` · `failed`·`agent-` 없음.
+  2. 실제 실패(색인 파손 저장소 `broken-repo`) + 사라진 루트 → `uncovered: ['broken-repo: failed']` · 주입 줄 긴 꼴 `(1/2 roots, …, skipped: broken-repo: failed)` · `agent-` 없음.
+
+### ② L-49 같은 커밋 · 다른 세션 — 보존 확인 (코드 변경 없음)
+
+- 판단: 같은 커밋 ≠ 같은 기록(대화 요약과 루프 요약은 다른 세션의 다른 작업) → 합치거나 지우지 않는다. 2.8 에서 구분 수단이 이미 있다: `_(via …)_`(PB165-200 요약 출처) · `[origin unknown]` · 확인된 loop 행은 대화 카드에서 **노출만** 뺌(PB154-B · DB 행 유지).
+- fb1025 P3 가 셋 다 보인 이유: 설치본 2.7.2 에는 출처 칸·loop 거름이 없다(2.7.3 기능).
+- 시험 `tests/recent-same-commit-2.8.e2e.test.ts` 2 개: 대화 카드 = 같은 커밋 06e2fc6 의 대화 요약(`via assistant text`)·루프 요약(`via commit message`) 두 줄 모두 + 둘 다 `[origin unknown]` · 확인된 loop 행은 안 나옴 / 루프 카드 = 세 줄 모두 · DB 행 3.
+- **진짜 중복 축소는 보류**: 같은 세션 같은 턴의 재전달은 Stop 턴 정체성이 이미 막는다(stop-dedup 시험) · 같은 세션의 다른 턴이 같은 문구를 남긴 것을 줄이는 것은 L-45 보류 그대로(「같은 문구 ≠ 같은 의미」 r174) — 안전한 판정 기준이 없다.
+
+### ③ L-50 두 CLI 가 후보 tarball 에서 실행되는가
+
+- `scripts/verify-pack.mjs` 확장(커밋 `198ed13`): 포장 단계에서 `dist/cli-card.js`·`dist/utils/card-snapshot.js`·`dist/cli-search.js`·`dist/utils/source-search.js` 포함 확인 · 격리 prefix·HOME 에 **실제 `npm pack` tarball 을 설치한 뒤 설치된 bin 셈**(`<prefix>/passbaton-card.cmd`·`passbaton-search.cmd`)으로: 카드·메타 생성(메타 `packageVersion` = 설치된 package.json 2.8.0) · `--verify` 0 · 검색 결과 1. `--version` 안 씀(R-83). 새 역검증 모드 `--break=cli`(포장에서 `dist/utils/card-snapshot.js` 제외).
+- 실행(격리 `pb195-iso` HOME+TMP · npm 캐시도 그 아래): 기본 = **✅ 전부 PASS**(기존 9 + 새 4) · `--break=cli`(깨끗한 분리 worktree) = 포장 확인 FAIL + 설치본 `passbaton-card` 생성·verify FAIL(모듈 없음 → 실행 실패) → **✅ 판정이 빨갛다** · `passbaton-search` 는 그 파일과 무관해 PASS(예상). 로그 `scratchpad/pb195/verify-pack-normal.log`·`verify-pack-break-cli.log`.
+- 구분: **배포 가능한 CLI 확보 = 충족**(후보 tarball 에 들어 있고 설치본에서 임시 사본 없이 돈다) · **현재 세션 실행 경로 전환 = 안 함**(Astra 패킷은 여전히 `scratchpad/wt170/dist/cli-card.js` 사본을 쓴다 · 전환 = 사용자 설치 결정) → L-50 의 「임시 사본 의존」 은 해결됐다고 쓰지 않는다.
+
+### 검증 · 역검증
+
+- build 0 · tsc 0 · 관련(files-line + recent-same-commit + noise + workspace-writes) 통과 · 전체 **693 + 1 skip**(54 파일).
+- 역검증(`198ed13` 분리 worktree · `scratchpad/pb195/mut/m500.mjs` · `m500.log`) **3/3 RED-OK**: F-1 사라진 루트 판별 제거 → 시험 1 빨강 · F-2 실제 실패도 removed 로 숨김 → 시험 2 빨강(가시성) · R-1 같은 커밋 해시 기록을 합침 → 두 보존 시험 빨강. + verify-pack `--break=cli` 빨강.
+- 홈 점검(v0~v12): 묶음 앞뒤 모두 새 행 0 · 새 락 0 = CLEAN. 참고: sha `f1be47b7` · mtime 18:42:44Z 불변.
+
+### A-local
+
+- ① L-48: **충족**(정상 skip 잡음 없음 · 실제 실패 보임 · 옛 행 소급 안 함은 한계로 기록).
+- ② L-49: **충족(보존 확인)** · 진짜 중복 축소 = **보류**(L-45).
+- ③ L-50: **충족(배포 가능한 CLI)** · 세션 실행 경로 전환 = 사용자 결정 · H(가독성) 미관찰.
+
+### 시간
+
+- 500: 03:51–04:01 ≈ 0.17 h / 상한 0.75 h.
