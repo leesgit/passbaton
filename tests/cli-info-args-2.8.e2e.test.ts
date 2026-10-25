@@ -131,5 +131,5 @@ describe.skipIf(!built)('PB195-100 B4 — 정보 인자: 서버·DB 기동 전�
     expect(r2.timedOut).toBe(false);
     expect(r2.stdout).toContain('"id":1');
     expect(fs.existsSync(path.join(b.home, '.claude', 'sessions.db'))).toBe(true);
-  });
+  }, 60_000);   // 서버 두 번 기동 — 설치본(첫 실행)에서는 기본 5 초를 넘을 수 있다(PB195-800)
 });

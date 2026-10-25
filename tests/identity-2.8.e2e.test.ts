@@ -81,7 +81,8 @@ describe.skipIf(!built)('PB195-400 정체성 — 실제 응답과 맞춘다', ()
     expect(stderr).toContain(`started (${tools.length} tools + ${prompts.length} prompts · read-only)`);
   });
 
-  it('glama.json: 버전 = package.json · 도구 수를 적으면 실제 등록 수와 같아야 한다', () => {
+  // glama.json 은 레포 메타데이터(패키지 files 밖) — 설치본에서 돌릴 때는 없다(PB195-800)
+  it.skipIf(!fs.existsSync(path.join(ROOT, 'glama.json')))('glama.json: 버전 = package.json · 도구 수를 적으면 실제 등록 수와 같아야 한다', () => {
     const g = JSON.parse(fs.readFileSync(path.join(ROOT, 'glama.json'), 'utf8')) as { name: string; version: string; description: string };
     expect(g.name).toBe(PKG.name);
     expect(g.version).toBe(PKG.version);
