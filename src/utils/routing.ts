@@ -91,6 +91,8 @@ export function readRoutingDeclaration(workspaceRoot: string): RoutingDeclaratio
 
   for (const [cmd, value] of Object.entries(cmds as Record<string, unknown>)) {
     if (!COMMAND.test(cmd) || typeof value !== 'string' || !value.trim()) { out.invalid.push(cmd); continue; }
+    // 2.9 (P4-300): 대소문자만 다른 같은 명령은 뒤엣것이 앞엣것을 조용히 덮었다 — 둘 다 받지 않는다
+    if (out.commands.has(cmd.toLowerCase())) { out.commands.delete(cmd.toLowerCase()); out.invalid.push(cmd); continue; }
     const rel = value.trim();
     if (rel === '.') { out.commands.set(cmd.toLowerCase(), { rel, dir: null, name: null }); continue; }
     let real: string;

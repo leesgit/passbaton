@@ -14,12 +14,45 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { clampCardChars } from './utils/resume-card.js';
 import { renderCardSnapshot, verifyCardSnapshot, type CardMeta } from './utils/card-snapshot.js';
+import { readRoutingDeclaration } from './utils/routing.js';
+import { resolveWorkspaceRoot } from './utils/workspace.js';
 
 function usage(msg: string): number {
   process.stderr.write(`passbaton-card: ${msg}\n`
     + 'usage: passbaton-card --project-dir <dir> --out <card.md> [--meta <meta.json>] [--max-chars N] [--origin loop|unknown] [--no-git] [--force]\n'
-    + '       passbaton-card --verify <meta.json> [--card <card.md>]\n');
+    + '       passbaton-card --verify <meta.json> [--card <card.md>]\n'
+    + '       passbaton-card --routes [--workspace <dir>]\n');
   return 2;
+}
+
+/**
+ * 2.9 (Astra P4 reply-4 P4-300) — `passbaton-card --routes [--workspace <dir>]`
+ * 훅이 쓰는 **같은 함수**(readRoutingDeclaration · resolveWorkspaceRoot)로 라우팅 선언을 풀어 그대로 보여 준다.
+ * 새 게임을 만든 직후 「선언이 실제로 읽히는가」 를 DB·훅 없이 확인하는 용도. 아무것도 쓰지 않는다.
+ * 종료: 0 문제 없음 · 1 invalid·disabled·이름 충돌 있음 · 3 선언 없음
+ */
+function runRoutes(wsArg: string | undefined): number {
+  const ws = wsArg ? path.resolve(wsArg) : resolveWorkspaceRoot(process.cwd()).root;
+  const file = path.join(ws, '.claude', 'passbaton.config.json');
+  if (!fs.existsSync(file)) { process.stdout.write(`ROUTES none — no ${file}\n`); return 3; }
+  const d = readRoutingDeclaration(ws);
+  const byName = new Map<string, Set<string>>();
+  for (const t of d.commands.values()) {
+    if (!t.dir || !t.name) continue;
+    if (!byName.has(t.name)) byName.set(t.name, new Set());
+    byName.get(t.name)!.add(t.dir);
+  }
+  const clashes = [...byName].filter(([, dirs]) => dirs.size > 1).map(([n]) => n);
+  process.stdout.write(`ROUTES workspace=${ws} record=${d.record}\n`);
+  for (const [cmd, t] of [...d.commands].sort(([a], [b]) => a.localeCompare(b))) {
+    process.stdout.write(t.dir ? `ROUTE ${cmd} -> ${t.rel} project=${t.name} dir=${t.dir}\n` : `ROUTE ${cmd} -> . (release)\n`);
+  }
+  for (const c of d.invalid) process.stdout.write(`INVALID ${c}\n`);
+  if (d.disabled) process.stdout.write(`DISABLED ${d.disabled}\n`);
+  for (const n of clashes) process.stdout.write(`CLASH project name ${n} is used by more than one folder (routing.record = target will not attribute it)\n`);
+  const bad = d.invalid.length > 0 || !!d.disabled || clashes.length > 0;
+  process.stdout.write(bad ? 'ROUTES-CHECK problems\n' : 'ROUTES-CHECK ok\n');
+  return bad ? 1 : 0;
 }
 
 export function runCardCli(argv: string[]): number {
@@ -27,8 +60,8 @@ export function runCardCli(argv: string[]): number {
   const flags = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--no-git' || a === '--force') { flags.add(a); continue; }
-    if (['--project-dir', '--out', '--meta', '--max-chars', '--origin', '--verify', '--card'].includes(a)) {
+    if (a === '--no-git' || a === '--force' || a === '--routes') { flags.add(a); continue; }
+    if (['--project-dir', '--out', '--meta', '--max-chars', '--origin', '--verify', '--card', '--workspace'].includes(a)) {
       const v = argv[i + 1];
       if (v === undefined || v.startsWith('--')) return usage(`${a} needs a value`);
       opt[a] = v; i++; continue;
@@ -36,6 +69,7 @@ export function runCardCli(argv: string[]): number {
     return usage(`unknown argument ${a}`);
   }
 
+  if (flags.has('--routes')) return runRoutes(opt['--workspace']);
   if (opt['--verify']) {
     let meta: CardMeta;
     try { meta = JSON.parse(fs.readFileSync(opt['--verify'], 'utf-8')) as CardMeta; } catch (e) { return usage(`cannot read meta: ${(e as Error).message}`); }
