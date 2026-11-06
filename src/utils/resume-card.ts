@@ -60,6 +60,13 @@
  *     낱말 · chars = 본문 몫 하한(총예산 안에서 다른 원천 몫을 줄여 마련 · 못 마련하면 버리고 적는다). rows·items 를
  *     선언하면 머리 줄에 「need met」 또는 발췌 아래 「⚠ INSUFFICIENT — … — read <다음 확인 위치> directly」 와 생략량을 낸다.
  *     못 읽은 원천·예산으로 숨기거나 뺀 원천도 미충족이다. 선언이 없으면 판정도 생략량 글도 없다(2.9 와 같은 카드 바이트).
+ *   - `health: { maxAgeMinutes }` (2.10 · 선택 · Astra P5 reply-5 C5b): 이 원천은 **프로젝트의 실행기·감시기가 쓴 실행 상태 JSON**
+ *     이다(`.json` 은 이 선언이 있을 때만 읽는다). passbaton 은 사실을 만들지 않고 표시만 한다 — 로그를 세지 않고, 낱말을 해석하지 않는다.
+ *     파일 모양(최상위): `observed_at`(필수 · 오프셋 있는 ISO) · `state`(필수 · 생산자 낱말 그대로) · `attention`(불리언 · 생산자가
+ *     「사람이 볼 일」 이라 했는가) · `normal_stop`(불리언) · `last_attempt`·`last_success`(ISO) · `failure {count, first, last, text}`.
+ *     카드 줄: 정상 = 「run health: …」 · attention = 「⚠ RUN NEEDS ATTENTION — …」 · normal_stop = 「stopped normally」(이후 관측이 없어도 ⚠ 아님) ·
+ *     관측이 maxAgeMinutes 보다 오래됨 = 「⚠ RUN HEALTH STALE — … current state unknown」 · 파일 없음·깨짐·필수 칸 없음·시계 역행
+ *     (관측이 카드보다 미래 · 사건이 관측보다 미래 · 실패 first > last)·모순(attention 과 normal_stop 둘 다) = 「⚠ RUN HEALTH UNKNOWN — …」.
  */
 
 import type { RunOrigin } from './run-origin.js';
@@ -86,7 +93,22 @@ export interface ContinuitySource {
   tally?: string[];
   /** 2.10 — 이 원천이 카드에서 「충분」 하려면 보여야 하는 것(표 데이터 행·필수 낱말)과 본문 몫 예약 */
   need?: SourceNeed;
+  /** 2.10 — 실행 상태 JSON 원천(C5b) · 관측이 이보다 오래되면 STALE */
+  health?: { maxAgeMinutes: number };
 }
+
+/** 2.10 health — 생산자가 쓴 실행 상태(검사를 통과한 칸만) */
+export interface HealthFacts {
+  observedMs: number;
+  observedAt: string;
+  state: string;
+  attention: boolean;
+  normalStop: boolean;
+  lastAttemptMs?: number;
+  lastSuccessMs?: number;
+  failure?: { count: number; firstMs: number; lastMs: number; text: string };
+}
+export type HealthRead = { ok: true; facts: HealthFacts } | { ok: false; why: string };
 
 /**
  * 2.10 need (Astra P5 reply-5 C1) — 최소 줄 수만으로는 충분성을 말할 수 없다(표 머리만 보여도 「읽음」 이었다).
@@ -154,6 +176,9 @@ export interface CardItem {
   need?: NeedResult;
   /** 2.10 — 선택 범위 중 카드에 안 보인 줄·글자(잘렸을 때만) */
   omitted?: { lines: number; chars: number };
+  /** 2.10 health — 선언한 원천이면 언제나(못 읽었으면 healthMax 만) */
+  health?: HealthRead;
+  healthMax?: number;
   why?: string;
 }
 
@@ -175,6 +200,8 @@ const MAX_NEED_ITEMS = 6;
 const MAX_NEED_ITEM = 60;
 const MIN_NEED_CHARS = 60;
 const MAX_NEED_CHARS = 8000;
+const MAX_HEALTH_AGE_MIN = 7 * 24 * 60;
+const MAX_HEALTH_BYTES = 64 * 1024;
 /** 시계 차이 허용 — 이보다 더 미래인 시각은 「ahead of card time」 */
 const AHEAD_SLACK_MS = 5 * 60 * 1000;
 // 오프셋(또는 Z)이 있는 시각만 — 오프셋 없는 시각은 어느 시간대인지 몰라 경과를 지어내게 된다
@@ -263,6 +290,13 @@ export function readContinuityDeclaration(projectPath: string, io?: CardIo): Con
     if (src.tally !== undefined && !tallyOk) out.invalid.push(`${src.path}: tally ignored (1-${MAX_TALLY} non-empty words, ${MAX_TALLY_WORD} chars each)`);
     const need = src.need === undefined ? undefined : parseNeed(src.need);
     if (src.need !== undefined && !need) out.invalid.push(`${src.path}: need ignored (rows 1-${MAX_NEED_ROWS} · items 1-${MAX_NEED_ITEMS} words of ${MAX_NEED_ITEM} chars · chars ${MIN_NEED_CHARS}-${MAX_NEED_CHARS})`);
+    const hm = (src.health as { maxAgeMinutes?: unknown } | undefined)?.maxAgeMinutes;
+    const healthOk = typeof src.health === 'object' && src.health !== null && typeof hm === 'number' && Number.isInteger(hm) && hm >= 1 && hm <= MAX_HEALTH_AGE_MIN;
+    // health 모양이 틀리면 원천째 버린다 — .json 은 health 로만 읽으므로 남겨 봐야 「텍스트 아님」 거부뿐이다
+    if (src.health !== undefined && !healthOk) {
+      out.invalid.push(`${src.path}: health ignored (use {"maxAgeMinutes": 1-${MAX_HEALTH_AGE_MIN}})`);
+      if (path.extname(src.path).toLowerCase() === '.json') continue;
+    }
     out.sources.push({
       path: src.path,
       lines: src.lines as number | undefined,
@@ -273,6 +307,7 @@ export function readContinuityDeclaration(projectPath: string, io?: CardIo): Con
       ...(src.ages === true ? { ages: true } : {}),
       ...(tallyOk ? { tally: (src.tally as string[]).slice() } : {}),
       ...(need ? { need } : {}),
+      ...(healthOk ? { health: { maxAgeMinutes: hm as number } } : {}),
     });
   }
   return out;
@@ -338,7 +373,8 @@ function unmetNeed(need: SourceNeed | undefined, why: string): NeedResult | unde
 }
 
 /** 읽어도 되는 파일인가. 이유를 돌려주면 거부. ⚠ 내용은 절대 보지 않는다. */
-export function denyReason(projectPath: string, rel: string): { abs?: string; why?: string; missing?: boolean } {
+export function denyReason(projectPath: string, rel: string, allowJson = false): { abs?: string; why?: string; missing?: boolean } {
+  const textExt = (p: string) => TEXT_EXT.has(path.extname(p).toLowerCase()) || (allowJson && path.extname(p).toLowerCase() === '.json');
   let base: string;
   try { base = fs.realpathSync(projectPath); } catch { return { why: 'project folder unreadable' }; }
   const lexical = path.resolve(projectPath, rel);
@@ -350,14 +386,14 @@ export function denyReason(projectPath: string, rel: string): { abs?: string; wh
   if (!inside(lexical, lexBase)) return { why: 'outside the project' };
   const segs = path.relative(lexBase, lexical).split(/[\\/]/);
   if (segs.some(s => DENY_SEGMENT.test(s))) return { why: 'name looks like a secret — not read' };
-  if (!TEXT_EXT.has(path.extname(lexical).toLowerCase())) return { why: 'not a text source (.md .txt .markdown .rst or no extension)' };
+  if (!textExt(lexical)) return { why: 'not a text source (.md .txt .markdown .rst or no extension)' };
   if (!fs.existsSync(lexical)) return { missing: true };
   let real: string;
   try { real = fs.realpathSync(lexical); } catch { return { why: 'unresolvable path' }; }
   if (!inside(real, base)) return { why: 'link points outside the project' };
   const realSegs = path.relative(base, real).split(/[\\/]/);
   if (realSegs.some(s => DENY_SEGMENT.test(s))) return { why: 'link target looks like a secret — not read' };
-  if (!TEXT_EXT.has(path.extname(real).toLowerCase())) return { why: 'link target is not a text source' };
+  if (!textExt(real)) return { why: 'link target is not a text source' };
   try {
     if (!fs.statSync(real).isFile()) return { why: 'not a regular file' };
   } catch { return { why: 'unreadable' }; }
@@ -463,7 +499,8 @@ function findBlock(lines: string[], needle: string): { from: number; to: number;
 function readSourceBody(projectPath: string, src: ContinuitySource, maxChars: number, io?: CardIo): CardItem {
   const label = src.label ?? src.path;
   const base: CardItem = { label, path: src.path, outcome: 'unreadable', ...(src.optional === true ? { optional: true } : {}) };
-  const gate = denyReason(projectPath, src.path);
+  const gate = denyReason(projectPath, src.path, src.health !== undefined);
+  if (src.health && gate.abs) return readHealth(base, gate.abs, io);
   if (gate.missing) {
     // 끊어진 링크는 「없음」 이 아니라 가리키는 곳을 못 따라간 것이다 — optional 이어도 중립으로 내지 않는다
     let dangling = false;
@@ -544,11 +581,90 @@ function readSourceBody(projectPath: string, src: ContinuitySource, maxChars: nu
 
 const needField = (n: NeedResult | undefined) => (n ? { need: n } : {});
 
+/** 2.10 health — 오프셋 있는 ISO 만 시각으로 받는다(시간대를 지어내지 않는다) */
+const ISO_FULL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+const isoMs = (v: unknown): number | undefined => (typeof v === 'string' && ISO_FULL.test(v) && Number.isFinite(Date.parse(v)) ? Date.parse(v) : undefined);
+
+/** 생산자 JSON 의 모양만 검사한다. 판정(오래됨·시계·주의)은 카드 시각이 있는 renderItem 에서. */
+export function parseHealth(text: string): HealthRead {
+  let raw: unknown;
+  try { raw = JSON.parse(text.replace(/^﻿/, '')); } catch { return { ok: false, why: 'not valid JSON' }; }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ok: false, why: 'not a JSON object' };
+  const r = raw as Record<string, unknown>;
+  const observedMs = isoMs(r.observed_at);
+  if (observedMs === undefined) return { ok: false, why: 'observed_at missing or without a time zone offset' };
+  if (typeof r.state !== 'string' || !r.state.trim()) return { ok: false, why: 'state missing' };
+  for (const k of ['attention', 'normal_stop']) {
+    if (r[k] !== undefined && typeof r[k] !== 'boolean') return { ok: false, why: `${k} is not a boolean` };
+  }
+  const facts: HealthFacts = {
+    observedMs, observedAt: r.observed_at as string, state: r.state.slice(0, 40),
+    attention: r.attention === true, normalStop: r.normal_stop === true,
+  };
+  for (const [k, f] of [['last_attempt', 'lastAttemptMs'], ['last_success', 'lastSuccessMs']] as const) {
+    if (r[k] === undefined || r[k] === null) continue;
+    const ms = isoMs(r[k]);
+    if (ms === undefined) return { ok: false, why: `${k} is not an ISO time with offset` };
+    facts[f] = ms;
+  }
+  if (r.failure !== undefined && r.failure !== null) {
+    const f = r.failure as Record<string, unknown>;
+    const firstMs = isoMs(f.first), lastMs = isoMs(f.last);
+    if (typeof f.count !== 'number' || !Number.isInteger(f.count) || f.count < 1 || firstMs === undefined || lastMs === undefined || typeof f.text !== 'string') {
+      return { ok: false, why: 'failure needs {count >= 1, first, last, text}' };
+    }
+    facts.failure = { count: f.count, firstMs, lastMs, text: f.text.replace(/\s+/g, ' ').slice(0, 120) };
+  }
+  return { ok: true, facts };
+}
+
+function readHealth(base: CardItem, abs: string, io?: CardIo): CardItem {
+  let buf: Buffer;
+  try { buf = io ? io.read(abs) : fs.readFileSync(abs); } catch { return { ...base, outcome: 'unreadable', why: 'unreadable', health: { ok: false, why: 'unreadable' } }; }
+  if (buf.length > MAX_HEALTH_BYTES) return { ...base, outcome: 'unreadable', why: `larger than ${MAX_HEALTH_BYTES >> 10} KB`, health: { ok: false, why: 'file too large' } };
+  const text = buf.toString('utf-8');
+  const sha = createHash('sha1').update(text).digest('hex').slice(0, 10);
+  return { ...base, outcome: 'ok', sha, health: parseHealth(text) };
+}
+
+const agoText = (ms: number) => {
+  const m = Math.round(ms / 60000);
+  return m < 90 ? `${m}m` : `${(ms / 3600000).toFixed(1)}h`;
+};
+
+/** health 원천의 카드 줄 하나. ⚠ 는 생산자가 attention 을 말했거나, 상태를 믿을 수 없을 때만. */
+export function healthLine(h: HealthRead | undefined, maxAgeMinutes: number, now: number): string {
+  if (!h || !h.ok) return `⚠ RUN HEALTH UNKNOWN — ${h ? h.why : 'source not read'}`;
+  const f = h.facts;
+  const ahead = (ms: number | undefined) => ms !== undefined && ms > f.observedMs + AHEAD_SLACK_MS;
+  if (f.observedMs > now + AHEAD_SLACK_MS) return `⚠ RUN HEALTH UNKNOWN — observed_at ${f.observedAt} is ahead of card time (clock?)`;
+  if (ahead(f.lastAttemptMs) || ahead(f.lastSuccessMs) || (f.failure && (ahead(f.failure.lastMs) || f.failure.firstMs > f.failure.lastMs))) {
+    return `⚠ RUN HEALTH UNKNOWN — event times are inconsistent with observed_at ${f.observedAt} (clock?)`;
+  }
+  if (f.attention && f.normalStop) return `⚠ RUN HEALTH UNKNOWN — producer says both attention and normal_stop (state "${f.state}")`;
+  const age = now - f.observedMs;
+  const ev = [
+    f.lastSuccessMs !== undefined ? `last success ${agoText(now - f.lastSuccessMs)} ago` : 'no success recorded',
+    ...(f.lastAttemptMs !== undefined ? [`last attempt ${agoText(now - f.lastAttemptMs)} ago`] : []),
+    ...(f.failure ? [`same failure ×${f.failure.count} (${new Date(f.failure.firstMs).toISOString().slice(0, 16)}Z → ${new Date(f.failure.lastMs).toISOString().slice(0, 16)}Z): ${f.failure.text}`] : []),
+  ].join(' · ');
+  const seen = `observed ${agoText(age)} ago`;
+  // 정상 정지 뒤에는 관측이 끊기는 것이 정상이다 — 오래됐다고 경고하지 않는다
+  if (f.normalStop) return `run health: stopped normally (state "${f.state}") · ${seen} · no further observations expected`;
+  if (age > maxAgeMinutes * 60000) {
+    return `⚠ RUN HEALTH STALE — ${seen} (max ${maxAgeMinutes}m) · last state "${f.state}"${f.attention ? ' (needed attention then)' : ''} · current state unknown — check the runner`;
+  }
+  if (f.attention) return `⚠ RUN NEEDS ATTENTION — state "${f.state}" · ${ev} · ${seen}`;
+  return `run health: state "${f.state}" · ${ev} · ${seen}`;
+}
+
 /**
  * 원천 하나를 읽는다. 2.10: need 를 선언한 원천이 본문 없이 끝나면(없음·거부·블록 없음·빈 범위) 그 자체로 미충족이다.
  */
 export function readSource(projectPath: string, src: ContinuitySource, maxChars: number, io?: CardIo): CardItem {
-  const it = readSourceBody(projectPath, src, maxChars, io);
+  const raw = readSourceBody(projectPath, src, maxChars, io);
+  // 2.10 health: 못 읽었어도(없음·거부) 선언은 남긴다 — 카드가 「실행 상태 미확인」 을 말해야 한다
+  const it = src.health ? { ...raw, healthMax: src.health.maxAgeMinutes } : raw;
   if (it.outcome === 'ok' || !src.need) return it;
   return { ...it, ...needField(unmetNeed(src.need, `source not read (${it.why ?? it.outcome})`)) };
 }
@@ -601,6 +717,14 @@ export interface ResumeCard {
 }
 
 function renderItem(it: CardItem, omitBody = false, now = Date.now()): string[] {
+  if (it.healthMax !== undefined) {
+    // health 원천은 본문(JSON)을 싣지 않고 판정 줄 하나만 — 최소 카드에서도 같다(본문이 아니라 상태다)
+    if (it.outcome === 'ok') return [`### ${it.label} — \`${it.path}\` · sha1 ${it.sha} · run health (declared)`, healthLine(it.health, it.healthMax, now)];
+    const head = it.outcome === 'missing' && it.optional === true
+      ? `### ${it.label} — \`${it.path}\` · file absent (optional source — not an error)`
+      : `### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`;
+    return [head, healthLine(undefined, it.healthMax, now)];
+  }
   if (it.outcome === 'ok' && omitBody) {
     // 본문만 뺀다 — 무엇을 어디서 읽어야 하는지(경로·범위·해시·상태)는 남긴다
     const needBit = it.need ? ' · declared need not checked in this card (body omitted)' : '';
@@ -760,7 +884,7 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   if (card.text.length > budget) { maxInvalid = 0; card = renderCard(items, invalid, maxInvalid, ctx); }
   // 3) 뒤쪽 원천부터 「예산 때문에 안 보임」 으로 바꾼다 — 구조로, 그리고 그 사실을 적는다
   for (let i = items.length - 1; i >= 0 && card.text.length > budget; i--) {
-    if (items[i].outcome !== 'ok') continue;
+    if (items[i].outcome !== 'ok' || items[i].healthMax !== undefined) continue;   // health 는 본문이 아니라 한 줄 상태다
     items = items.map((it, j) => j === i
       ? { label: it.label, path: it.path, outcome: 'empty' as CardOutcome, budgetHidden: true, why: 'not shown — card budget too small', from: it.from, to: it.to, totalLines: it.totalLines, sha: it.sha,
           ...needField(unmetNeed(sources[i].need, 'body not shown — card budget too small')) }
