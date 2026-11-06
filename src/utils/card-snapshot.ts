@@ -134,7 +134,9 @@ export function renderCardSnapshot(projectDir: string, opts: SnapshotOptions): C
   const project = path.resolve(projectDir);
   const io = opts.io ?? createSnapshotIo();
   const origin: RunOrigin = opts.origin ?? 'unknown';
-  const card = buildResumeCard(project, opts.maxChars, { origin, io });
+  // 2.10 ages — 카드의 경과와 메타 generatedAt 이 같은 시각에서 나온다
+  const now = Date.now();
+  const card = buildResumeCard(project, opts.maxChars, { origin, io, now });
   if (!card) return null;
   // 선언도 같은 버퍼에서 다시 해석한다(캐시 적중 — 다시 읽지 않는다)
   const decl = readContinuityDeclaration(project, io);
@@ -194,7 +196,7 @@ export function renderCardSnapshot(projectDir: string, opts: SnapshotOptions): C
     renderVersion: CARD_RENDER_VERSION,
     packageVersion: packageVersion(),
     project,
-    generatedAt: new Date().toISOString(),
+    generatedAt: new Date(now).toISOString(),
     maxChars: opts.maxChars,
     origin,
     config: { path: cfgPath, present: cfgBuf !== null, bytes: cfgBuf ? cfgBuf.length : null, sha256: cfgBuf ? sha256(cfgBuf) : null },

@@ -48,6 +48,13 @@
  *     「file absent (optional source)」 로 낸다(`.ralph/DEMO_STOP`·요청 대기 파일처럼 없는 것이 정상인 원천).
  *     ⛔ 경로 경계 거부·비밀 이름·일반 파일 아님·읽기 실패·블록 없음·빈 범위·잘림은 optional 이어도 그대로 보인다.
  *     없는 선택 원천은 「읽음」(anyRead)으로 세지 않는다. 불리언이 아닌 값은 원천을 살리고 optional 만 버린다.
+ *   - `ages: true` (2.10 · 선택): 보인 발췌 안의 ISO-8601 시각(오프셋·Z 필수)마다 **카드 생성 시각 기준 경과**를
+ *     발췌 아래 한 줄로 적는다(줄 번호 · 시각 바로 앞 낱말 = 이름 · 최대 6 개). 원문은 바꾸지 않는다.
+ *     파일이 「요청 …」·「변경 …」 처럼 이름을 붙여야 둘을 구별할 수 있다 — passbaton 은 이름을 지어내지 않는다.
+ *     카드 시각보다 5 분 넘게 뒤인 시각은 경과 대신 「ahead of card time」 으로 낸다(시계 역행을 0 으로 숨기지 않는다).
+ *   - `tally: ["준비 필요", "응답 대기", …]` (2.10 · 선택 · 1~6 개 · 낱말당 30 자): **선택 범위 전체**(예산으로 잘린
+ *     부분 포함)에서 각 낱말이 든 줄 수를 머리 줄에 적는다. 프로젝트가 선언한 상태 낱말만 센다 — 뜻을 해석하지 않는다.
+ *   두 선택 모두 모양이 틀리면 원천을 살리고 그 선택만 버린다(invalid 에 적는다).
  */
 
 import type { RunOrigin } from './run-origin.js';
@@ -68,6 +75,10 @@ export interface ContinuitySource {
   role?: SourceRole;
   /** 없는 것이 정상인 원천(2.7.3 PB165-100) — 명시적 true 일 때만 「파일 없음」 을 중립으로 낸다 */
   optional?: boolean;
+  /** 2.10 — 보인 발췌의 ISO 시각마다 카드 생성 시각 기준 경과를 적는다 */
+  ages?: boolean;
+  /** 2.10 — 선택 범위 전체에서 이 낱말들이 든 줄 수를 센다 */
+  tally?: string[];
 }
 
 export interface ContinuityDeclaration {
@@ -105,6 +116,10 @@ export interface CardItem {
   budgetHidden?: boolean;
   /** 선언에서 optional: true 였다(2.7.3 PB165-100) — outcome 이 missing 일 때만 표시가 달라진다 */
   optional?: boolean;
+  /** 2.10 ages — 보인 발췌 안의 시각(파일 줄 번호 · 앞 낱말 · 원문 · epoch ms) */
+  stamps?: { line: number; label: string; iso: string; ms: number }[];
+  /** 2.10 tally — [낱말, 선택 범위 전체에서 그 낱말이 든 줄 수] */
+  tally?: [string, number][];
   why?: string;
 }
 
@@ -118,6 +133,13 @@ export const MAX_CONFIG_BYTES = 64 * 1024;
 const HEADER_RESERVE = 140;
 const MIN_CARD_CHARS = 400;
 const MAX_CARD_CHARS = 20000;
+const MAX_TALLY = 6;
+const MAX_TALLY_WORD = 30;
+const MAX_STAMPS = 6;
+/** 시계 차이 허용 — 이보다 더 미래인 시각은 「ahead of card time」 */
+const AHEAD_SLACK_MS = 5 * 60 * 1000;
+// 오프셋(또는 Z)이 있는 시각만 — 오프셋 없는 시각은 어느 시간대인지 몰라 경과를 지어내게 된다
+const ISO_STAMP = /(?:(\S+)\s+)?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2}))/g;
 
 const TEXT_EXT = new Set(['', '.md', '.markdown', '.txt', '.rst']);
 // 경로 조각 하나라도 걸리면 읽지 않는다.
@@ -196,6 +218,10 @@ export function readContinuityDeclaration(projectPath: string, io?: CardIo): Con
     if (src.role !== undefined && !isRole(src.role)) out.invalid.push(`${src.path}: role ${JSON.stringify(src.role).slice(0, 30)} ignored`);
     // optional 도 같다 — "true" 같은 문자열은 불리언이 아니다. 버리면 기본(없음 = ⚠)으로 돌아가 부재를 숨기지 않는다
     if (src.optional !== undefined && typeof src.optional !== 'boolean') out.invalid.push(`${src.path}: optional ${JSON.stringify(src.optional).slice(0, 30)} ignored`);
+    if (src.ages !== undefined && typeof src.ages !== 'boolean') out.invalid.push(`${src.path}: ages ${JSON.stringify(src.ages).slice(0, 30)} ignored`);
+    const tallyOk = Array.isArray(src.tally) && src.tally.length >= 1 && src.tally.length <= MAX_TALLY
+      && src.tally.every(w => typeof w === 'string' && w.trim() !== '' && w.length <= MAX_TALLY_WORD);
+    if (src.tally !== undefined && !tallyOk) out.invalid.push(`${src.path}: tally ignored (1-${MAX_TALLY} non-empty words, ${MAX_TALLY_WORD} chars each)`);
     out.sources.push({
       path: src.path,
       lines: src.lines as number | undefined,
@@ -203,6 +229,8 @@ export function readContinuityDeclaration(projectPath: string, io?: CardIo): Con
       label: typeof src.label === 'string' && src.label.trim() ? src.label.slice(0, 80) : src.path,
       ...(isRole(src.role) ? { role: src.role } : {}),
       ...(src.optional === true ? { optional: true } : {}),
+      ...(src.ages === true ? { ages: true } : {}),
+      ...(tallyOk ? { tally: (src.tally as string[]).slice() } : {}),
     });
   }
   return out;
@@ -404,7 +432,35 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
     ...base, outcome: 'ok', from, to, shownTo, totalLines: lines.length, partialFile: partial,
     sha, excerpt, truncated, matches,
     ...(sliced ? { sliced } : {}), ...(budgetLimited ? { budgetLimited } : {}),
+    ...(src.ages ? { stamps: stampsOf(kept, from) } : {}),
+    // 잘린 부분까지 센다 — 예산이 상태 개수를 바꾸면 안 된다
+    ...(src.tally ? { tally: src.tally.map(w => [w, selected.filter(l => l.includes(w)).length] as [string, number]) } : {}),
   };
+}
+
+/** 2.10 ages — 보인 줄에서만 찾는다(읽는 사람이 본 시각에만 경과를 붙인다). 이름은 시각 바로 앞 낱말 그대로. */
+function stampsOf(kept: string[], from: number): { line: number; label: string; iso: string; ms: number }[] {
+  const out: { line: number; label: string; iso: string; ms: number }[] = [];
+  kept.forEach((l, i) => {
+    for (const m of l.matchAll(ISO_STAMP)) {
+      const ms = Date.parse(m[2]);
+      if (!Number.isFinite(ms)) continue;
+      const label = m[1] && /[\p{L}\p{N}]/u.test(m[1]) ? m[1].slice(0, 20) : '';
+      out.push({ line: from + i, label, iso: m[2], ms });
+    }
+  });
+  return out;
+}
+
+function agesLine(stamps: { line: number; label: string; iso: string; ms: number }[], now: number): string {
+  const at = new Date(now).toISOString().slice(0, 16) + 'Z';
+  const shown = stamps.slice(0, MAX_STAMPS).map(s => {
+    const d = now - s.ms;
+    const age = d < -AHEAD_SLACK_MS ? 'ahead of card time (clock?)' : `+${(Math.max(0, d) / 3600000).toFixed(1)}h`;
+    return `L${s.line} ${s.label || '(unnamed)'} ${age}`;
+  });
+  const more = stamps.length > MAX_STAMPS ? ` · +${stamps.length - MAX_STAMPS} more` : '';
+  return `ages at card time ${at}: ${shown.join(' · ')}${more}`;
 }
 
 /** 발췌 안의 백틱 열보다 긴 펜스 — 문서의 ``` 가 카드의 펜스를 깨지 않게. */
@@ -427,7 +483,7 @@ export interface ResumeCard {
   minimal?: boolean;
 }
 
-function renderItem(it: CardItem, omitBody = false): string[] {
+function renderItem(it: CardItem, omitBody = false, now = Date.now()): string[] {
   if (it.outcome === 'ok' && omitBody) {
     // 본문만 뺀다 — 무엇을 어디서 읽어야 하는지(경로·범위·해시·상태)는 남긴다
     return [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (of ${it.totalLines}${it.partialFile ? '+' : ''}) · sha1 ${it.sha} · ok · body omitted (loop card) — read the source directly`];
@@ -437,8 +493,11 @@ function renderItem(it: CardItem, omitBody = false): string[] {
     const bits = [`sha1 ${it.sha}`];
     if (it.truncated) bits.push(`truncated — shown to line ${it.shownTo}`);
     if (it.matches && it.matches > 1) bits.push(`${it.matches} matches — first heading/item used`);
+    if (it.tally) bits.push(`tally (whole range) ${it.tally.map(([w, n]) => `${w} ${n}`).join(' · ')}`);
     const fence = fenceFor(it.excerpt ?? '');
-    return [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`, fence, it.excerpt ?? '', fence];
+    const lines = [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`, fence, it.excerpt ?? '', fence];
+    if (it.stamps && it.stamps.length) lines.push(agesLine(it.stamps, now));
+    return lines;
   }
   // 2.7.3 (PB165-100): 선언이 optional 이고 **파일이 없을 때만** 중립 — 거부·읽기 실패·블록 없음은 아래 ⚠ 그대로
   if (it.outcome === 'missing' && it.optional === true) return [`### ${it.label} — \`${it.path}\` · file absent (optional source — not an error)`];
@@ -485,6 +544,8 @@ interface RenderCtx {
   /** loop 최소 카드 — strip[i] 원천은 본문을 뺀다 */
   minimal: boolean;
   strip: boolean[];
+  /** 2.10 ages 기준 시각(epoch ms) — 한 카드 안에서 하나 */
+  now: number;
 }
 
 function renderCard(items: CardItem[], invalid: string[], maxInvalid: number, ctx: RenderCtx): { text: string; anyRead: boolean } {
@@ -498,7 +559,7 @@ function renderCard(items: CardItem[], invalid: string[], maxInvalid: number, ct
     : anyRead
     ? '## Resume card — repo source of truth (read this before the DB summary below)'
     : '## Resume card — ⚠ none of the declared sources could be read (the DB summary below is all there is)');
-  items.forEach((it, i) => out.push(...renderItem(it, ctx.minimal && ctx.strip[i])));
+  items.forEach((it, i) => out.push(...renderItem(it, ctx.minimal && ctx.strip[i], ctx.now)));
   if (invalid.length && maxInvalid > 0) {
     const shown = invalid.slice(0, maxInvalid).map(s => s.slice(0, 100));
     out.push(`⚠ ignored continuity entries: ${shown.join(', ')}${invalid.length > maxInvalid ? ` … +${invalid.length - maxInvalid}` : ''}`);
@@ -517,6 +578,8 @@ export interface BuildCardOptions {
   origin?: RunOrigin;
   /** 2.8 (C1): 원천 바이트 공급 — 스냅샷 카드만 넘긴다. 없으면 기존 동작(파일에서 읽음) */
   io?: CardIo;
+  /** 2.10 ages 기준 시각(epoch ms) — 시험용. 기본 = 지금 */
+  now?: number;
 }
 
 export function buildResumeCard(projectPath: string, maxChars: number, opts: BuildCardOptions = {}): ResumeCard | null {
@@ -535,7 +598,7 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   const task: TaskWatch | null = taskIndex >= 0 ? { index: taskIndex, src: decl.sources[taskIndex] } : null;
   // 2.7.3 (PB154-C): 출처만으로 줄이지 않는다 — loop **그리고** 명시적 opt-in 일 때만
   const minimal = opts.origin === 'loop' && decl.loopCard === 'minimal';
-  const ctx: RenderCtx = { task, minimal, strip: decl.sources.map(s => s.role === 'current-task' || s.role === 'history') };
+  const ctx: RenderCtx = { task, minimal, strip: decl.sources.map(s => s.role === 'current-task' || s.role === 'history'), now: opts.now ?? Date.now() };
 
   let per = Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
   let items = sources.map(s => readSource(projectPath, s, per, io));
