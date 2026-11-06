@@ -24,7 +24,7 @@ import {
 import type { RunOrigin } from './run-origin.js';
 
 /** 카드 렌더 규칙의 식별. resume-card.ts 의 출력 규칙을 바꾸면 올린다. */
-export const CARD_RENDER_VERSION = 'passbaton-resume-card/2.8.0';
+export const CARD_RENDER_VERSION = 'passbaton-resume-card/2.10.0';
 export const CARD_META_SCHEMA = 'passbaton.card-meta/1';
 /** 스냅샷은 원천 전체를 읽어 전체 해시를 낸다 — 이보다 크면 읽지 않는다(NOT READ) */
 export const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
@@ -74,6 +74,9 @@ export interface CardMetaSource {
   shown: { toLine?: number; truncated: boolean; sliced: boolean; budgetLimited: boolean; budgetHidden: boolean; bodyOmitted: boolean };
   /** full = 고른 범위 전부가 카드에 보였다 · partial = 일부만 · none = 본문 없음(못 읽음·생략·예산) */
   delivery: SourceDelivery;
+  /** 2.10 need 판정(선언했을 때만) · 잘렸을 때 생략량 */
+  need?: CardItem['need'];
+  omitted?: CardItem['omitted'];
   /** 보조: HEAD 의 같은 경로 blob 과 비교(git 없음·비추적이면 그렇다고 적는다) */
   git?: { headBlob: string | null; state: 'clean' | 'modified' | 'not-in-head' | 'unknown' };
 }
@@ -87,7 +90,7 @@ export interface CardMeta {
   maxChars: number;
   origin: RunOrigin;
   config: { path: string; present: boolean; bytes: number | null; sha256: string | null };
-  card: { path: string | null; bytes: number; chars: number; sha256: string; anyRead: boolean; minimal: boolean; taskStatus: string | null };
+  card: { path: string | null; bytes: number; chars: number; sha256: string; anyRead: boolean; minimal: boolean; taskStatus: string | null; insufficient?: string[] };
   sources: CardMetaSource[];
   invalid: string[];
   redistribution: ResumeCard['redistribution'] | null;
@@ -187,7 +190,10 @@ export function renderCardSnapshot(projectDir: string, opts: SnapshotOptions): C
     }
     return {
       ...base, inCard: Boolean(it), outcome: it ? it.outcome : 'omitted', ...(it?.why ? { why: it.why } : {}),
-      file, range, shown, delivery, ...(git ? { git } : {}),
+      file, range, shown, delivery,
+      ...(it?.need ? { need: it.need } : src.need && (src.need.rows !== undefined || src.need.items !== undefined) ? { need: { met: false, why: it ? 'not checked' : 'source omitted from the card' } } : {}),
+      ...(it?.omitted ? { omitted: it.omitted } : {}),
+      ...(git ? { git } : {}),
     };
   });
 
@@ -203,6 +209,7 @@ export function renderCardSnapshot(projectDir: string, opts: SnapshotOptions): C
     card: {
       path: opts.cardPath ?? null, bytes: bytes.length, chars: card.text.length, sha256: sha256(bytes),
       anyRead: card.anyRead, minimal: Boolean(card.minimal), taskStatus: card.taskStatus ?? null,
+      ...(card.insufficient ? { insufficient: card.insufficient } : {}),
     },
     sources,
     invalid: card.invalid,

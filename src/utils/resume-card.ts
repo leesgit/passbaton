@@ -55,6 +55,11 @@
  *   - `tally: ["준비 필요", "응답 대기", …]` (2.10 · 선택 · 1~6 개 · 낱말당 30 자): **선택 범위 전체**(예산으로 잘린
  *     부분 포함)에서 각 낱말이 든 줄 수를 머리 줄에 적는다. 프로젝트가 선언한 상태 낱말만 센다 — 뜻을 해석하지 않는다.
  *   두 선택 모두 모양이 틀리면 원천을 살리고 그 선택만 버린다(invalid 에 적는다).
+ *   - `need: { rows?, items?, chars? }` (2.10 · 선택 · Astra P5 reply-5 C1): 이 원천이 카드에서 「충분」 하려면 **보인** 발췌에
+ *     있어야 하는 것. rows = 표 데이터 행 수(머리·구분 줄·펜스 안 제외 — 표 머리만이면 0) · items = 그대로 들어 있어야 하는
+ *     낱말 · chars = 본문 몫 하한(총예산 안에서 다른 원천 몫을 줄여 마련 · 못 마련하면 버리고 적는다). rows·items 를
+ *     선언하면 머리 줄에 「need met」 또는 발췌 아래 「⚠ INSUFFICIENT — … — read <다음 확인 위치> directly」 와 생략량을 낸다.
+ *     못 읽은 원천·예산으로 숨기거나 뺀 원천도 미충족이다. 선언이 없으면 판정도 생략량 글도 없다(2.9 와 같은 카드 바이트).
  */
 
 import type { RunOrigin } from './run-origin.js';
@@ -79,6 +84,31 @@ export interface ContinuitySource {
   ages?: boolean;
   /** 2.10 — 선택 범위 전체에서 이 낱말들이 든 줄 수를 센다 */
   tally?: string[];
+  /** 2.10 — 이 원천이 카드에서 「충분」 하려면 보여야 하는 것(표 데이터 행·필수 낱말)과 본문 몫 예약 */
+  need?: SourceNeed;
+}
+
+/**
+ * 2.10 need (Astra P5 reply-5 C1) — 최소 줄 수만으로는 충분성을 말할 수 없다(표 머리만 보여도 「읽음」 이었다).
+ *   rows  = **보인** 발췌 안의 표 데이터 행(머리·구분 줄 제외 · 코드 펜스 안 제외) 최소 수
+ *   items = 보인 발췌에 그대로 들어 있어야 하는 낱말(1~6 · 60 자) — 뜻을 해석하지 않는다
+ *   chars = 이 원천 본문 몫의 하한(총예산 안에서 다른 원천 몫을 줄여 마련 · 못 마련하면 버리고 적는다)
+ * 판정은 rows·items 를 선언했을 때만 낸다 — 선언이 없으면 「충분」 이라고 말하지 않는다.
+ */
+export interface SourceNeed {
+  rows?: number;
+  items?: string[];
+  chars?: number;
+}
+
+/** need 판정 결과 — met=false 면 카드에 ⚠ INSUFFICIENT 줄이 붙는다 */
+export interface NeedResult {
+  met: boolean;
+  rowsShown?: number;
+  rowsTotal?: number;
+  rowsNeed?: number;
+  missing?: string[];
+  why?: string;
 }
 
 export interface ContinuityDeclaration {
@@ -120,6 +150,10 @@ export interface CardItem {
   stamps?: { line: number; label: string; iso: string; ms: number }[];
   /** 2.10 tally — [낱말, 선택 범위 전체에서 그 낱말이 든 줄 수] */
   tally?: [string, number][];
+  /** 2.10 need — 선언했을 때만 */
+  need?: NeedResult;
+  /** 2.10 — 선택 범위 중 카드에 안 보인 줄·글자(잘렸을 때만) */
+  omitted?: { lines: number; chars: number };
   why?: string;
 }
 
@@ -136,6 +170,11 @@ const MAX_CARD_CHARS = 20000;
 const MAX_TALLY = 6;
 const MAX_TALLY_WORD = 30;
 const MAX_STAMPS = 6;
+const MAX_NEED_ROWS = 50;
+const MAX_NEED_ITEMS = 6;
+const MAX_NEED_ITEM = 60;
+const MIN_NEED_CHARS = 60;
+const MAX_NEED_CHARS = 8000;
 /** 시계 차이 허용 — 이보다 더 미래인 시각은 「ahead of card time」 */
 const AHEAD_SLACK_MS = 5 * 60 * 1000;
 // 오프셋(또는 Z)이 있는 시각만 — 오프셋 없는 시각은 어느 시간대인지 몰라 경과를 지어내게 된다
@@ -222,6 +261,8 @@ export function readContinuityDeclaration(projectPath: string, io?: CardIo): Con
     const tallyOk = Array.isArray(src.tally) && src.tally.length >= 1 && src.tally.length <= MAX_TALLY
       && src.tally.every(w => typeof w === 'string' && w.trim() !== '' && w.length <= MAX_TALLY_WORD);
     if (src.tally !== undefined && !tallyOk) out.invalid.push(`${src.path}: tally ignored (1-${MAX_TALLY} non-empty words, ${MAX_TALLY_WORD} chars each)`);
+    const need = src.need === undefined ? undefined : parseNeed(src.need);
+    if (src.need !== undefined && !need) out.invalid.push(`${src.path}: need ignored (rows 1-${MAX_NEED_ROWS} · items 1-${MAX_NEED_ITEMS} words of ${MAX_NEED_ITEM} chars · chars ${MIN_NEED_CHARS}-${MAX_NEED_CHARS})`);
     out.sources.push({
       path: src.path,
       lines: src.lines as number | undefined,
@@ -231,9 +272,69 @@ export function readContinuityDeclaration(projectPath: string, io?: CardIo): Con
       ...(src.optional === true ? { optional: true } : {}),
       ...(src.ages === true ? { ages: true } : {}),
       ...(tallyOk ? { tally: (src.tally as string[]).slice() } : {}),
+      ...(need ? { need } : {}),
     });
   }
   return out;
+}
+
+/** need 모양 검사 — 한 칸이라도 틀리면 need 전체를 버린다(반쪽 판정이 「충분」 처럼 보이지 않게). */
+function parseNeed(v: unknown): SourceNeed | undefined {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
+  const n = v as Record<string, unknown>;
+  const known = new Set(['rows', 'items', 'chars']);
+  if (Object.keys(n).some(k => !known.has(k))) return undefined;
+  const int = (x: unknown, lo: number, hi: number) => typeof x === 'number' && Number.isInteger(x) && x >= lo && x <= hi;
+  if (n.rows !== undefined && !int(n.rows, 1, MAX_NEED_ROWS)) return undefined;
+  if (n.chars !== undefined && !int(n.chars, MIN_NEED_CHARS, MAX_NEED_CHARS)) return undefined;
+  if (n.items !== undefined && !(Array.isArray(n.items) && n.items.length >= 1 && n.items.length <= MAX_NEED_ITEMS
+    && n.items.every(w => typeof w === 'string' && w.trim() !== '' && w.length <= MAX_NEED_ITEM))) return undefined;
+  if (n.rows === undefined && n.items === undefined && n.chars === undefined) return undefined;
+  return {
+    ...(n.rows !== undefined ? { rows: n.rows as number } : {}),
+    ...(n.items !== undefined ? { items: (n.items as string[]).slice() } : {}),
+    ...(n.chars !== undefined ? { chars: n.chars as number } : {}),
+  };
+}
+
+/** 표 구분 줄(`|---|:--:|`) */
+const isTableSep = (l: string) => /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/.test(l);
+const isPipeRow = (l: string) => /^\s*\|/.test(l);
+
+/** 줄마다 「표 데이터 행인가」 — 머리(바로 아래가 구분 줄)·구분 줄·펜스 안은 아니다. */
+function dataRowMask(lines: string[]): boolean[] {
+  const fence = fenceMask(lines);
+  return lines.map((l, i) => !fence[i] && isPipeRow(l) && !isTableSep(l)
+    && !(i + 1 < lines.length && !fence[i + 1] && isTableSep(lines[i + 1])));
+}
+
+/** 보인 발췌(kept)와 선택 범위(selected)로 need 를 판정한다. kept 는 selected 의 앞부분이다. */
+function judgeNeed(need: SourceNeed, selected: string[], keptCount: number, excerpt: string): NeedResult | undefined {
+  if (need.rows === undefined && need.items === undefined) return undefined;   // chars 만 = 예약만, 판정 없음
+  const out: NeedResult = { met: true };
+  const reasons: string[] = [];
+  if (need.rows !== undefined) {
+    const mask = dataRowMask(selected);
+    out.rowsTotal = mask.filter(Boolean).length;
+    out.rowsShown = mask.slice(0, keptCount).filter(Boolean).length;
+    out.rowsNeed = need.rows;
+    if (out.rowsShown < need.rows) {
+      reasons.push(out.rowsTotal === 0 ? `no table data rows in the range (need ${need.rows})` : `table rows shown ${out.rowsShown}/${out.rowsTotal} (need ${need.rows})`);
+    }
+  }
+  if (need.items !== undefined) {
+    const body = excerpt.replace(/…$/, '');
+    out.missing = need.items.filter(w => !body.includes(w));
+    if (out.missing.length) reasons.push(`not shown: ${out.missing.map(w => JSON.stringify(w)).join(', ')}`);
+  }
+  if (reasons.length) { out.met = false; out.why = reasons.join(' · '); }
+  return out;
+}
+
+/** 본문이 없는 결과(못 읽음·예산으로 숨김)의 need — 판정을 선언했으면 언제나 미충족 */
+function unmetNeed(need: SourceNeed | undefined, why: string): NeedResult | undefined {
+  if (!need || (need.rows === undefined && need.items === undefined)) return undefined;
+  return { met: false, ...(need.rows !== undefined ? { rowsNeed: need.rows } : {}), why };
 }
 
 /** 읽어도 되는 파일인가. 이유를 돌려주면 거부. ⚠ 내용은 절대 보지 않는다. */
@@ -359,7 +460,7 @@ function findBlock(lines: string[], needle: string): { from: number; to: number;
   return { from: pick.i + 1, to: j, hitCap, matches: cands.length };   // 1-based, 포함
 }
 
-export function readSource(projectPath: string, src: ContinuitySource, maxChars: number, io?: CardIo): CardItem {
+function readSourceBody(projectPath: string, src: ContinuitySource, maxChars: number, io?: CardIo): CardItem {
   const label = src.label ?? src.path;
   const base: CardItem = { label, path: src.path, outcome: 'unreadable', ...(src.optional === true ? { optional: true } : {}) };
   const gate = denyReason(projectPath, src.path);
@@ -435,7 +536,21 @@ export function readSource(projectPath: string, src: ContinuitySource, maxChars:
     ...(src.ages ? { stamps: stampsOf(kept, from) } : {}),
     // 잘린 부분까지 센다 — 예산이 상태 개수를 바꾸면 안 된다
     ...(src.tally ? { tally: src.tally.map(w => [w, selected.filter(l => l.includes(w)).length] as [string, number]) } : {}),
+    // 2.10 — 생략량은 선택 범위 기준(블록 상한 밖은 모른다 — hitCap 이면 「truncated」 가 이미 말한다)
+    ...(truncated ? { omitted: { lines: to - shownTo + (sliced ? 1 : 0), chars: Math.max(0, slice.length - (excerpt.length - (sliced ? 1 : 0))) } } : {}),
+    ...(src.need ? needField(judgeNeed(src.need, selected, kept.length, excerpt)) : {}),
   };
+}
+
+const needField = (n: NeedResult | undefined) => (n ? { need: n } : {});
+
+/**
+ * 원천 하나를 읽는다. 2.10: need 를 선언한 원천이 본문 없이 끝나면(없음·거부·블록 없음·빈 범위) 그 자체로 미충족이다.
+ */
+export function readSource(projectPath: string, src: ContinuitySource, maxChars: number, io?: CardIo): CardItem {
+  const it = readSourceBody(projectPath, src, maxChars, io);
+  if (it.outcome === 'ok' || !src.need) return it;
+  return { ...it, ...needField(unmetNeed(src.need, `source not read (${it.why ?? it.outcome})`)) };
 }
 
 /** 2.10 ages — 보인 줄에서만 찾는다(읽는 사람이 본 시각에만 경과를 붙인다). 이름은 시각 바로 앞 낱말 그대로. */
@@ -481,27 +596,44 @@ export interface ResumeCard {
   taskStatus?: TaskStatus;
   /** loop 최소 카드로 냈다(2.7.3 PB154-C) — 호출부는 Recent Sessions 도 뺀다 */
   minimal?: boolean;
+  /** 2.10 need — 판정을 선언한 원천 중 이 카드에서 필요를 못 채운 경로(선언이 없으면 칸 없음) */
+  insufficient?: string[];
 }
 
 function renderItem(it: CardItem, omitBody = false, now = Date.now()): string[] {
   if (it.outcome === 'ok' && omitBody) {
     // 본문만 뺀다 — 무엇을 어디서 읽어야 하는지(경로·범위·해시·상태)는 남긴다
-    return [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (of ${it.totalLines}${it.partialFile ? '+' : ''}) · sha1 ${it.sha} · ok · body omitted (loop card) — read the source directly`];
+    const needBit = it.need ? ' · declared need not checked in this card (body omitted)' : '';
+    return [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (of ${it.totalLines}${it.partialFile ? '+' : ''}) · sha1 ${it.sha} · ok · body omitted (loop card) — read the source directly${needBit}`];
   }
   if (it.outcome === 'ok') {
     const total = `of ${it.totalLines}${it.partialFile ? '+' : ''}`;
     const bits = [`sha1 ${it.sha}`];
     if (it.truncated) bits.push(`truncated — shown to line ${it.shownTo}`);
+    // 생략량은 need 를 선언한 원천에만 카드 글로 적는다 — 선언 없는 카드는 2.9 와 같은 바이트(메타에는 언제나 있다)
+    if (it.omitted && it.need) bits.push(`omitted ${it.omitted.lines} line(s) / ${it.omitted.chars} chars`);
     if (it.matches && it.matches > 1) bits.push(`${it.matches} matches — first heading/item used`);
     if (it.tally) bits.push(`tally (whole range) ${it.tally.map(([w, n]) => `${w} ${n}`).join(' · ')}`);
+    if (it.need?.met) bits.push(`need met${it.need.rowsShown !== undefined ? ` (table rows ${it.need.rowsShown}/${it.need.rowsTotal})` : ''}`);
     const fence = fenceFor(it.excerpt ?? '');
     const lines = [`### ${it.label} — \`${it.path}:${it.from}-${it.to}\` (${total}) · ${bits.join(' · ')}`, fence, it.excerpt ?? '', fence];
     if (it.stamps && it.stamps.length) lines.push(agesLine(it.stamps, now));
+    if (it.need && !it.need.met) lines.push(insufficientLine(it));
     return lines;
   }
   // 2.7.3 (PB165-100): 선언이 optional 이고 **파일이 없을 때만** 중립 — 거부·읽기 실패·블록 없음은 아래 ⚠ 그대로
-  if (it.outcome === 'missing' && it.optional === true) return [`### ${it.label} — \`${it.path}\` · file absent (optional source — not an error)`];
-  return [`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`];
+  // 2.10: need 를 선언했으면 optional 이어도 「충분하지 않다」 를 함께 적는다(없는 원천이 필요를 채웠다고 보이면 안 된다)
+  const tail = it.need && !it.need.met ? [insufficientLine(it)] : [];
+  if (it.outcome === 'missing' && it.optional === true) return [`### ${it.label} — \`${it.path}\` · file absent (optional source — not an error)`, ...tail];
+  return [`### ${it.label} — \`${it.path}\` · ⚠ NOT READ (${it.why ?? it.outcome})`, ...tail];
+}
+
+/** 선언한 필요를 이 카드가 채우지 못했다 — 어디를 직접 읽을지 같이 적는다 */
+function insufficientLine(it: CardItem): string {
+  // 다음 확인 위치 = 보인 다음 줄부터(다 보였는데도 모자라면 범위 전체 — 원천 자체에 없다는 뜻)
+  const next = it.shownTo !== undefined && it.to !== undefined && it.shownTo < it.to && it.shownTo >= (it.from ?? 1) ? it.shownTo + (it.sliced ? 0 : 1) : it.from;
+  const where = it.from !== undefined ? `\`${it.path}:${next}-${it.to}\`` : `\`${it.path}\``;
+  return `⚠ INSUFFICIENT — ${it.need?.why ?? 'declared need not met'} — read ${where} directly`;
 }
 
 /** 「현재 작업」 원천의 상태(2.7.3 PB154-D). budget = 읽었거나 읽을 수 있었지만 카드 예산 때문에 못 보였다. */
@@ -600,15 +732,28 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   const minimal = opts.origin === 'loop' && decl.loopCard === 'minimal';
   const ctx: RenderCtx = { task, minimal, strip: decl.sources.map(s => s.role === 'current-task' || s.role === 'history'), now: opts.now ?? Date.now() };
 
-  let per = Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
-  let items = sources.map(s => readSource(projectPath, s, per, io));
+  // 2.10 need.chars — 선언한 원천 본문 몫의 하한. 총예산은 그대로이고 나머지 원천이 남은 몫을 똑같이 나눈다.
+  //   나머지 원천마다 최소 60 자를 못 남기면 예약 전체를 버리고 적는다(조용히 일부만 지키지 않는다).
+  let reserve = sources.map(s => s.need?.chars ?? 0);
+  const others = reserve.filter(r => r === 0).length;
+  const pool = budget - HEADER_RESERVE * sources.length - reserve.reduce((a, b) => a + b, 0);
+  if (reserve.some(r => r > 0) && pool < 60 * others) {
+    sources.forEach((s, i) => { if (reserve[i] > 0) invalid.push(`${s.path}: need.chars ${reserve[i]} ignored — card budget ${budget} cannot reserve it`); });
+    reserve = reserve.map(() => 0);
+  }
+  const reserved = reserve.some(r => r > 0);
+  let per = reserved
+    ? Math.max(60, Math.floor(pool / Math.max(1, others)))
+    : Math.max(60, Math.floor((budget - HEADER_RESERVE * sources.length) / Math.max(1, sources.length)));
+  const readAll = () => sources.map((s, i) => readSource(projectPath, s, Math.max(per, reserve[i]), io));
+  let items = readAll();
   let maxInvalid = 4;
   let card = renderCard(items, invalid, maxInvalid, ctx);
 
-  // 1) 발췌를 줄인다
+  // 1) 발췌를 줄인다(예약한 원천의 하한은 그대로 — 예약이 있으면 나머지만 줄어든다)
   for (let k = 0; k < 4 && card.text.length > budget && per > 60; k++) {
     per = Math.max(60, Math.floor(per * budget / card.text.length) - 20);
-    items = sources.map(s => readSource(projectPath, s, per, io));
+    items = readAll();
     card = renderCard(items, invalid, maxInvalid, ctx);
   }
   // 2) 경고 목록을 개수만 남긴다
@@ -617,7 +762,8 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   for (let i = items.length - 1; i >= 0 && card.text.length > budget; i--) {
     if (items[i].outcome !== 'ok') continue;
     items = items.map((it, j) => j === i
-      ? { label: it.label, path: it.path, outcome: 'empty' as CardOutcome, budgetHidden: true, why: 'not shown — card budget too small', from: it.from, to: it.to, totalLines: it.totalLines, sha: it.sha }
+      ? { label: it.label, path: it.path, outcome: 'empty' as CardOutcome, budgetHidden: true, why: 'not shown — card budget too small', from: it.from, to: it.to, totalLines: it.totalLines, sha: it.sha,
+          ...needField(unmetNeed(sources[i].need, 'body not shown — card budget too small')) }
       : it);
     card = renderCard(items, invalid, maxInvalid, ctx);
   }
@@ -629,7 +775,7 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
     maxInvalid = 0;
     card = renderCard(items, shownInvalid, maxInvalid, ctx);
   }
-  const c0: ResumeCard = { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead, taskStatus: taskStatusOf(items, task), ...(minimal ? { minimal } : {}) };
+  const c0: ResumeCard = { text: card.text.slice(0, budget), items, invalid, anyRead: card.anyRead, taskStatus: taskStatusOf(items, task), ...(minimal ? { minimal } : {}), ...insufficientOf(items, decl.sources, ctx) };
 
   // 5) 남는 예산을 **한 번** 잘린 원천에 똑같이 나눈다 (2.7.2 · Astra reply-150 PB150-01 계약 1~6)
   //   ★ 균등 몫은 없는 원천(NOT READ 한 줄)·짧은 원천의 몫을 그냥 버렸다 — Ashfall 실측 3200 중 2390 만 썼다.
@@ -656,5 +802,21 @@ export function buildResumeCard(projectPath: string, maxChars: number, opts: Bui
   }
   const out = renderCard(grown, shownInvalid, maxInvalid, ctx);
   if (out.text.length > budget) return { ...c0, redistribution: { spare, targets: targets.length, extraReads, applied: false, why: 'rendered card would exceed the budget' } };
-  return { text: out.text, items: grown, invalid, anyRead: out.anyRead, taskStatus: taskStatusOf(grown, task), ...(minimal ? { minimal } : {}), redistribution: { spare, targets: targets.length, extraReads, applied: true } };
+  return { text: out.text, items: grown, invalid, anyRead: out.anyRead, taskStatus: taskStatusOf(grown, task), ...(minimal ? { minimal } : {}), ...insufficientOf(grown, decl.sources, ctx), redistribution: { spare, targets: targets.length, extraReads, applied: true } };
+}
+
+/**
+ * 2.10 need — 판정(rows·items)을 선언한 원천 중 이 카드에서 필요를 못 채운 것의 경로.
+ * 카드에서 빠진 원천(예산 생략)·본문을 뺀 원천(loop 최소 카드)도 못 채운 것이다 — 「안 보였다」 를 「충분」 으로 세지 않는다.
+ * 선언이 하나도 없으면 칸 자체가 없다(기존 카드와 같다).
+ */
+function insufficientOf(items: CardItem[], sources: ContinuitySource[], ctx: RenderCtx): { insufficient?: string[] } {
+  const judged = sources.map((s, i) => ({ s, i })).filter(({ s }) => s.need && (s.need.rows !== undefined || s.need.items !== undefined));
+  if (judged.length === 0) return {};
+  return {
+    insufficient: judged.filter(({ i }) => {
+      const it = items[i];
+      return !it || !it.need || !it.need.met || (ctx.minimal && ctx.strip[i] && it.outcome === 'ok');
+    }).map(({ s }) => s.path),
+  };
 }
