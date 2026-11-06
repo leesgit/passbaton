@@ -548,7 +548,7 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
         return { src: 'route-released', ids: row ? routeRowId(row) : undefined, text: `\n<routed-context project="${project}" via="${cmd}">\nRoute released — back to ${project} (no routed project in this session)\n</routed-context>\n` };
       }
       if (cmd && target) {
-        const block = routedBlock(cmd, target, project, release, ROUTE_CARD_CHARS);
+        const block = routedBlock(cmd, target, project, release, ROUTE_CARD_CHARS, decl.record);
         const same = row && row.target_rel === target.rel && row.card_hash === block.hash;
         db.prepare(`
           INSERT INTO session_route (session_id, project, command, target_rel, target_name, card_hash, updated_at)
@@ -565,7 +565,7 @@ function routeTurn(dbPath: string, project: string, workspaceRoot: string, input
         const t = currentRoute(decl, row.command, row.target_rel);
         // 설정에서 사라지거나 바뀐 선택은 계속 암시하지 않는다 — 한 번 알리고 지운다
         if (!t) return clear(`${row.command} no longer maps to ${row.target_rel}`);
-        const block = routedBlock(row.command, t, project, release, ROUTE_CARD_CHARS);
+        const block = routedBlock(row.command, t, project, release, ROUTE_CARD_CHARS, decl.record);
         if (block.hash === row.card_hash) return null;
         db.prepare("UPDATE session_route SET card_hash = ?, updated_at = datetime('now') WHERE session_id = ? AND project = ?").run(block.hash, sessionId, project);
         return { src: 'routed-card', text: block.text, ids: joinIds(routeRowId(row), block.sources) };

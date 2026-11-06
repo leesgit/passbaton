@@ -40,6 +40,11 @@ export interface RoutingDeclaration {
   invalid: string[];
   /** 선언은 있는데 라우팅을 통째로 끈 이유(예: 해제 명령 없음) */
   disabled?: string;
+  /**
+   * 2.9 (Astra P4 reply-4 P4-200): 라우팅된 턴의 기록을 어디에 둘지. **옵트인**이다.
+   *   'root'(기본 · 2.7~2.8 동작) = 루트 프로젝트 · 'target' = `routing.record: "target"` 일 때만 대상 프로젝트.
+   */
+  record: 'root' | 'target';
 }
 
 /**
@@ -65,7 +70,7 @@ function strictlyInside(child: string, parent: string): boolean {
 const COMMAND = /^\/[A-Za-z0-9][\w-]*$/;
 
 export function readRoutingDeclaration(workspaceRoot: string): RoutingDeclaration {
-  const out: RoutingDeclaration = { commands: new Map(), invalid: [] };
+  const out: RoutingDeclaration = { commands: new Map(), invalid: [], record: 'root' };
   let raw: unknown;
   try {
     const file = path.join(workspaceRoot, '.claude', 'passbaton.config.json');
@@ -74,6 +79,10 @@ export function readRoutingDeclaration(workspaceRoot: string): RoutingDeclaratio
   } catch {
     return out;
   }
+  const rec = (raw as { routing?: { record?: unknown } })?.routing?.record;
+  // 모르는 값은 조용히 'target' 으로 보지 않는다 — 기본값 유지 + invalid 에 남긴다
+  if (rec === 'target') out.record = 'target';
+  else if (rec !== undefined && rec !== 'root') out.invalid.push('record');
   const cmds = (raw as { routing?: { commands?: unknown } })?.routing?.commands;
   if (typeof cmds !== 'object' || cmds === null || Array.isArray(cmds)) return out;
 
@@ -123,8 +132,11 @@ export function cardHash(text: string): string {
 }
 
 /** 카드 앞에 붙는 선택 표시 — 무엇이 골랐고, 기록은 어디로 가고, 어떻게 푸는가 */
-export function routeBanner(command: string, target: RouteTarget, rootProject: string, release: string): string {
-  return `**Routed project: ${target.name}** (selected by \`${command}\` in this session · this conversation is still recorded under ${rootProject} · send \`${release}\` to return to ${rootProject})`;
+export function routeBanner(command: string, target: RouteTarget, rootProject: string, release: string, record: 'root' | 'target' = 'root'): string {
+  const where = record === 'target' && target.name !== rootProject
+    ? `turns from now on are recorded under ${target.name} (routing.record = target)`
+    : `this conversation is still recorded under ${rootProject}`;
+  return `**Routed project: ${target.name}** (selected by \`${command}\` in this session · ${where} · send \`${release}\` to return to ${rootProject})`;
 }
 
 /** 해제 명령(값이 ".") 하나 — 안내에 쓴다. readRoutingDeclaration 이 명령을 남겼으면 반드시 있다 */
@@ -145,10 +157,10 @@ export function routeClearedBlock(command: string, targetName: string, rootProje
 }
 
 /** 라우팅된 프로젝트의 카드 블록과 그 해시. 카드 선언이 없으면 그렇다고 쓴다(지어내지 않는다). */
-export function routedBlock(command: string, target: RouteTarget, rootProject: string, release: string, maxChars: number): { text: string; hash: string; sources: string[] } {
+export function routedBlock(command: string, target: RouteTarget, rootProject: string, release: string, maxChars: number, record: 'root' | 'target' = 'root'): { text: string; hash: string; sources: string[] } {
   const card = target.dir ? buildResumeCard(target.dir, maxChars) : null;
   const body = card ? card.text : `⚠ ${target.name} declares no continuity.sources in ${target.rel}/.claude/passbaton.config.json — no resume card`;
-  const text = `\n<routed-context project="${target.name}" via="${command}">\n${routeBanner(command, target, rootProject, release)}\n\n${body}\n</routed-context>\n`;
+  const text = `\n<routed-context project="${target.name}" via="${command}">\n${routeBanner(command, target, rootProject, release, record)}\n\n${body}\n</routed-context>\n`;
   // ★ 해시는 **실제로 내는 블록 전체** — 본문만 잡으면 해제 명령·별칭이 바뀌어도 안내가 안 바뀐다(reply-147 ③)
   return { text, hash: cardHash(text), sources: card ? cardSourceIds(card, target.rel) : [] };
 }
@@ -170,3 +182,50 @@ export function cardSourceIds(card: ResumeCard, rel: string): string[] {
 
 /** 원장용 DB 원천 식별 — **읽은 session_route 행의 값**으로만(입력으로 짓지 않는다) */
 export const routeRowId = (row: { session_id: string; project: string }) => `session_route:${row.session_id}/${row.project}`;
+
+/**
+ * 2.9 (Astra P4 reply-4 P4-200) — 이 Stop 의 기록을 어느 프로젝트에 둘지.
+ *
+ * 계약:
+ *   - `record: "target"` 이 아니면 언제나 루트(기존 동작).
+ *   - 근거 = 이 세션의 session_route 행(이번 턴의 UserPromptSubmit 이 쓴 선택). 행이 없으면 루트.
+ *   - 선택이 지금 설정과 맞지 않거나(명령 삭제·대상 변경·폴더 삭제), 대상 이름이 루트와 같거나,
+ *     같은 이름의 다른 대상이 선언에 있으면 **대상으로 보내지 않는다** — 루트에 두고 이유를 남긴다
+ *     (다른 프로젝트로 조용히 저장하지 않는다).
+ *   - 과거 행은 건드리지 않는다(소급 없음 · P-23).
+ * DB 파일은 바꾸지 않는다 — 같은 워크스페이스 DB 안에서 `project` 값만 정한다.
+ */
+export interface RecordAttribution {
+  project: string;
+  /** 대상으로 보냈을 때만 — 출처 표시(루트 Recent 에 다시 넣는 근거가 아니다) */
+  routedFrom?: { root: string; via: string; target: string; since: string; session: string };
+  /** 대상으로 보내려다 못 보낸 이유 — 이때 project = 루트 */
+  unattributed?: string;
+}
+
+export function recordAttribution(
+  db: { prepare(sql: string): { get(...a: unknown[]): unknown } },
+  decl: RoutingDeclaration,
+  sessionId: string,
+  rootProject: string,
+): RecordAttribution {
+  if (decl.record !== 'target') return { project: rootProject };
+  let row: { command: string; target_rel: string; target_name: string; updated_at: string } | undefined;
+  try {
+    row = db.prepare('SELECT command, target_rel, target_name, updated_at FROM session_route WHERE session_id = ? AND project = ?')
+      .get(sessionId, rootProject) as typeof row;
+  } catch { return { project: rootProject }; }
+  if (!row) return { project: rootProject };
+  const t = currentRoute(decl, row.command, row.target_rel);
+  if (!t || !t.name) return { project: rootProject, unattributed: `${row.command} no longer maps to ${row.target_rel}` };
+  if (t.name === rootProject) return { project: rootProject, unattributed: `target name ${t.name} equals the root project name` };
+  for (const other of decl.commands.values()) {
+    if (other.dir && other.name === t.name && other.dir !== t.dir) {
+      return { project: rootProject, unattributed: `two routed folders share the name ${t.name}` };
+    }
+  }
+  return {
+    project: t.name,
+    routedFrom: { root: rootProject, via: row.command, target: t.rel, since: row.updated_at, session: sessionId },
+  };
+}

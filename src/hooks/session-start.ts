@@ -234,7 +234,7 @@ function loadContext(dbPath: string, project: string, source?: string, projectPa
             lines.push(led.add('route-cleared', routeClearedBlock(row.command, row.target_name, project,
               decl.disabled ?? (decl.commands.size === 0 ? 'routing is no longer declared' : `${row.command} no longer maps to ${row.target_rel}`)), routeRowId(row)));
           } else {
-            const block = routedBlock(row.command, t, project, releaseCommand(decl), CARD_CHARS);
+            const block = routedBlock(row.command, t, project, releaseCommand(decl), CARD_CHARS, decl.record);
             const cost = estimateTokens(block.text);
             if (tokenBudget > cost) {
               lines.push(led.add('routed-card', block.text, [routeRowId(row), ...block.sources].join(',')));

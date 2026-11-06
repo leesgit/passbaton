@@ -18,6 +18,7 @@ import Database from 'better-sqlite3';
 import { logHookError, isCodexHost, isGeminiHost } from '../utils/logger.js';
 import { isEnabled } from '../utils/config.js';
 import { detectWorkspaceRoot, isEphemeralRoot, resolveWorkspaceRoot } from '../utils/workspace.js';
+import { readRoutingDeclaration, recordAttribution, isWorkspaceRootCwd } from '../utils/routing.js';
 import { ensureSessionsDb } from '../db/bootstrap.js';
 import { filterTrackedPaths, partitionTrackedPaths, displayName } from '../utils/paths.js';
 import { migrateSchema } from '../db/migrate.js';
@@ -1238,6 +1239,7 @@ async function main() {
     let hasOriginColumn = false;
     let hasSourceColumn = false;
     let hasStateSourceColumn = false;
+    let hasRoutedFromColumn = false;
     try {
       migrateSchema(db);
       const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
@@ -1248,7 +1250,35 @@ async function main() {
       hasSourceColumn = cols.includes('summary_source');
       hasStateSourceColumn = (db.prepare('PRAGMA table_info(active_context)').all() as Array<{ name: string }>)
         .some(c => c.name === 'state_source');
+      hasRoutedFromColumn = cols.includes('routed_from');
     } catch { /* 보강 실패 → 구스키마로 동작 */ }
+
+    // ★ 2.9 (Astra P4 reply-4 P4-200) — 기록 귀속(옵트인 `routing.record: "target"`).
+    //   루트에서 연 대화가 `/ashfall` 처럼 하위 프로젝트를 골랐으면, **이번 턴의** 기록을 그 프로젝트에 둔다.
+    //   - 저장소(DB 파일)는 그대로 · `project` 값만 바뀐다. 다른 훅이 루트 이름으로 쓴 턴 자료(session_turns·
+    //     session_files·session_roots)는 루트 이름으로 읽는다 — 그래서 `project`(루트)와 `recordProject` 를 따로 둔다.
+    //   - 요약 입력은 **이번 턴의 응답만**. 트랜스크립트 전체에서 모은 커밋·이전 응답(다른 구간일 수 있다)은 쓰지 않는다.
+    //   - 대상으로 못 보내면 루트에 두고 이유를 routed_from 에 남긴다.
+    let recordProject = project;
+    let routedFrom: string | null = null;
+    let routedMetadataDropped = false;
+    if (sessionId && hasRoutedFromColumn && isWorkspaceRootCwd(cwd, wsRoot)) {
+      try {
+        const att = recordAttribution(db, readRoutingDeclaration(wsRoot), sessionId, project);
+        if (att.routedFrom) {
+          recordProject = att.project;
+          routedFrom = JSON.stringify({ ...att.routedFrom, turn: input.prompt_id || input.turn_id || null });
+          const own = input.last_assistant_message ? extractSummaryFromText(input.last_assistant_message) : '';
+          const ownStripped = own ? (stripSlashPrefix(own) || own) : '';
+          lastWork = ownStripped || NO_OUTCOME;
+          lastWorkSource = ownStripped ? 'assistant-text' : 'no-result';
+          nextTasks = input.last_assistant_message ? extractNextTasks(input.last_assistant_message) : [];
+          routedMetadataDropped = true;
+        } else if (att.unattributed) {
+          routedFrom = JSON.stringify({ root: project, unattributed: att.unattributed, session: sessionId });
+        }
+      } catch (e) { logHookError('session-end/route-record', e); }
+    }
 
     // ★ 턴 식별자가 있으면 그것이 정체성이다. 유사도로 추측하지 않는다.
     //
@@ -1265,10 +1295,10 @@ async function main() {
         SELECT id FROM sessions
         WHERE project = ? AND session_id IS ? AND prompt_id = ?
         LIMIT 1
-      `).get(project, sessionId, turnId);
+      `).get(recordProject, sessionId, turnId);
 
       if (already) {
-        hookLog(`[SessionEnd] Skipping re-fire of the same turn (${turnId.slice(0, 8)}) for ${project}`);
+        hookLog(`[SessionEnd] Skipping re-fire of the same turn (${turnId.slice(0, 8)}) for ${recordProject}`);
         db.close();
         process.exit(0);
       }
@@ -1289,9 +1319,9 @@ async function main() {
         SELECT id FROM sessions
         WHERE project = ? AND last_work = ? AND timestamp > datetime('now', '-24 hour')
         LIMIT 1
-      `).get(project, lastWork);
+      `).get(recordProject, lastWork);
       if (recentExact) {
-        hookLog(`[SessionEnd] Skipping duplicate (exact, 24h) for ${project}`);
+        hookLog(`[SessionEnd] Skipping duplicate (exact, 24h) for ${recordProject}`);
         db.close();
         process.exit(0);
       }
@@ -1303,11 +1333,11 @@ async function main() {
           SELECT last_work FROM sessions
           WHERE project = ? AND timestamp > datetime('now', '-24 hour')
           ORDER BY timestamp DESC LIMIT 20
-        `).all(project) as Array<{ last_work: string }>;
+        `).all(recordProject) as Array<{ last_work: string }>;
         for (const row of recent24h) {
           if (!row.last_work) continue;
           if (normalizeUrls(row.last_work) === normalizedLastWorkUrl) {
-            hookLog(`[SessionEnd] Skipping URL-normalized duplicate for ${project}`);
+            hookLog(`[SessionEnd] Skipping URL-normalized duplicate for ${recordProject}`);
             db.close();
             process.exit(0);
           }
@@ -1323,13 +1353,13 @@ async function main() {
         SELECT last_work FROM sessions
         WHERE project = ? AND timestamp > datetime('now', '-24 hour')
         ORDER BY timestamp DESC LIMIT 30
-      `).all(project) as Array<{ last_work: string }>;
+      `).all(recordProject) as Array<{ last_work: string }>;
       for (const row of recentRows) {
         if (!row.last_work) continue;
         const normalizedCurrent = stripSlashPrefix(lastWork) || lastWork;
         const normalizedRow = stripSlashPrefix(row.last_work) || row.last_work;
         if (jaccardSimilarity(normalizedCurrent, normalizedRow) >= 0.85) {
-          hookLog(`[SessionEnd] Skipping near-duplicate (jaccard >= 0.85) for ${project}`);
+          hookLog(`[SessionEnd] Skipping near-duplicate (jaccard >= 0.85) for ${recordProject}`);
           db.close();
           process.exit(0);
         }
@@ -1392,6 +1422,8 @@ async function main() {
     if (hasOriginColumn) insertCols.push('run_origin');
     // 2.7.3 (reply-165 PB165-200): 요약의 생성 출처 — 출처와 마찬가지로 중복 판정에는 넣지 않는다
     if (hasSourceColumn) insertCols.push('summary_source');
+    // 2.9 (P4-200): 기록 귀속 출처 — 중복 판정에는 넣지 않는다(같은 턴의 재전달은 같은 귀속을 본다)
+    if (hasRoutedFromColumn) insertCols.push('routed_from');
     const runOrigin = readRunOrigin();
 
     const dedupWhere = turnId && hasTurnColumns
@@ -1423,11 +1455,12 @@ async function main() {
       const shipped = files.slice(0, 15);
 
       const common = [
-        project,
+        recordProject,
         lastWork,
         JSON.stringify([...new Set(nextTasks)].slice(0, 5)),
         JSON.stringify(shipped),
-        hasMetadata ? JSON.stringify(metadata) : null,
+        // 2.9: 대상으로 보낸 턴엔 트랜스크립트 전체에서 모은 커밋·결정을 싣지 않는다(다른 구간 것일 수 있다)
+        hasMetadata && !routedMetadataDropped ? JSON.stringify(metadata) : null,
       ];
 
       // 목록이 비었을 때 그것이 「안 고쳤다」인지 「안 봤다」인지 여기서 갈린다.
@@ -1442,11 +1475,12 @@ async function main() {
           : common),
         ...(hasOriginColumn ? [runOrigin] : []),
         ...(hasSourceColumn ? [lastWorkSource] : []),
+        ...(hasRoutedFromColumn ? [routedFrom] : []),
       ];
 
       const dedupArgs = turnId && hasTurnColumns
-        ? [project, sessionId, turnId]
-        : [project, lastWork];
+        ? [recordProject, sessionId, turnId]
+        : [recordProject, lastWork];
 
       const res = insertStmt.run(...values, ...dedupArgs);
 
@@ -1495,11 +1529,11 @@ async function main() {
       || (filesFromSession && modifiedFiles.length > 0);
     const hadState = db.prepare(
       "SELECT 1 FROM active_context WHERE project = ? AND current_state IS NOT NULL AND current_state != ''"
-    ).get(project);
+    ).get(recordProject);
     if (workedThisTurn || !hadState) {
       // 2.7.3 (reply-165 PB165-200): State 와 **같은 행**에 그 글의 생성 출처 — 다른 행에서 가져다 붙이지 않는다
       // 2.8 (PB170-010): 이 세 칸만 — blockers·last_verification 은 Stop 이 모르는 칸이라 보존(옛 REPLACE 는 영구 삭제)
-      writeActiveContext(db, project, {
+      writeActiveContext(db, recordProject, {
         current_state: lastWork,
         recent_files: JSON.stringify(modifiedFiles.slice(0, 15)),
         ...(hasStateSourceColumn ? { state_source: lastWorkSource } : {}),
