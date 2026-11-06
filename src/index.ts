@@ -34,6 +34,7 @@ import { tokenizeQuery, buildFtsQuery } from './utils/tokenize.js';
 import { migrateSchema } from './db/migrate.js';
 import { buildResumeCard } from './utils/resume-card.js';
 import { writeActiveContext } from './utils/active-context.js';
+import { resolveWorkspaceRoot } from './utils/workspace.js';
 
 // ===== CLI 인자 — 초기화보다 먼저 (2.8 · Astra reply-195 PB195-100 · 원장 B4) =====
 // 이 아래(WORKSPACE_ROOT 탐지 → `.claude/` 생성 → `new Database` → 스키마·이주)는 모듈 최상위에서 곧바로 돈다.
@@ -95,36 +96,17 @@ async function loadTransformers() {
 }
 
 // 기본 경로 설정 (자동 감지)
+// ★ 2.9 (원장 L-54·L-55 · Astra P4 reply-4 P4-100): 여기 있던 별도 사본은 가장 가까운 `.claude/` 에서 멈추고
+//   홈 경계가 없었다. 그래서 `apps/<game>/.claude/` 를 가진 하위 레포에서 띄운 **서버**는 그 앱 DB 를,
+//   같은 cwd 의 **훅**(utils/workspace.ts)은 모노레포 DB 를 봤다 — 한 세션을 두 컴포넌트가 다른 DB 로 봤다.
+//   이제 훅과 같은 판정기 하나만 쓴다(db/database.ts 는 2026-09-09 에 이미 그렇게 바꿨다).
 function detectWorkspaceRoot(): string {
-  // 1. 환경변수가 설정되어 있으면 사용
-  if (process.env.WORKSPACE_ROOT) {
-    return process.env.WORKSPACE_ROOT;
+  const { root, reason } = resolveWorkspaceRoot(process.cwd());
+  if (reason === 'cwd') {
+    console.error('Warning: WORKSPACE_ROOT not set and could not auto-detect. Using current directory.');
+    console.error('Set WORKSPACE_ROOT environment variable in your MCP config for best results.');
   }
-
-  // 2. 현재 디렉토리에서 상위로 탐색하며 apps/ 또는 .claude/ 디렉토리 찾기
-  let current = process.cwd();
-  const root = path.parse(current).root;
-
-  while (current !== root) {
-    // apps/ 디렉토리가 있으면 여기가 workspace root
-    if (existsSync(path.join(current, 'apps'))) {
-      return current;
-    }
-    // .claude/ 디렉토리가 있으면 여기가 workspace root
-    if (existsSync(path.join(current, '.claude'))) {
-      return current;
-    }
-    // package.json + turbo.json이 있으면 모노레포 루트
-    if (existsSync(path.join(current, 'package.json')) && existsSync(path.join(current, 'turbo.json'))) {
-      return current;
-    }
-    current = path.dirname(current);
-  }
-
-  // 3. 못 찾으면 현재 디렉토리 사용 (경고 출력)
-  console.error('Warning: WORKSPACE_ROOT not set and could not auto-detect. Using current directory.');
-  console.error('Set WORKSPACE_ROOT environment variable in your MCP config for best results.');
-  return process.cwd();
+  return root;
 }
 
 const WORKSPACE_ROOT = detectWorkspaceRoot();

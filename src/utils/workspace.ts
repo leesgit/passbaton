@@ -40,14 +40,30 @@ import * as path from 'path';
  * **홈 디렉터리와 파일시스템 루트는 후보로 올리지 않는다** — cwd 자체일 때만 예외.
  * `~/.claude/sessions.db` 는 프로젝트 루트가 아니라 탐지 실패가 쌓인 결과물이다.
  */
+/**
+ * 홈 경계 — `os.homedir()`(HOME/USERPROFILE 환경 변수를 따른다) **와** OS 계정의 실제 프로필.
+ * ★ 2.9 (L-53·L-54 · Astra P4 reply-4 P4-100): 환경 변수만 보면 HOME 을 다른 곳으로 돌린 프로세스
+ *   (시험 하네스 · 격리 실행)에서 **진짜 프로필**이 경계가 아니게 되어 `C:\Users\<me>\.claude\sessions.db`
+ *   까지 올라가 거기에 기록했다(10-26 · 11-06 두 번 실측 — 프로젝트 이름 = 윈도우 사용자명).
+ * Windows 는 대소문자를 가리지 않으므로 비교도 그렇게 한다.
+ */
+function homeGuards(): Set<string> {
+  const norm = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+  const out = new Set<string>();
+  try { out.add(norm(os.homedir())); } catch { /* 없으면 건너뛴다 */ }
+  try { const h = os.userInfo().homedir; if (h) out.add(norm(h)); } catch { /* 계정 정보 없음(일부 컨테이너) */ }
+  return out;
+}
+
 function candidateDirs(start: string): string[] {
   const fsRoot = path.parse(start).root;
-  const home = path.resolve(os.homedir());
+  const homes = homeGuards();
+  const isHome = (p: string) => homes.has(process.platform === 'win32' ? p.toLowerCase() : p);
   const dirs = [start];
 
   for (let current = start; ; ) {
     const parent = path.dirname(current);
-    if (parent === current || parent === home || parent === fsRoot) break;
+    if (parent === current || isHome(parent) || parent === fsRoot) break;
     dirs.push(parent);
     current = parent;
   }

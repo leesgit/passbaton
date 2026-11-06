@@ -108,6 +108,7 @@ describe.skipIf(!built)('PB195-100 B4 — 정보 인자: 서버·DB 기동 전�
     expect(r.code).toBe(0);
     expect(r.stdout.trim()).toBe(PKG_VERSION);
     expect(fs.readdirSync(path.join(home, '.claude'))).toEqual([]);
+    expect(fs.existsSync(path.join(ws, '.claude'))).toBe(false);   // 2.9: positive control now opens the DB here
   });
 
   it('config(하위 명령)도 DB 를 열지 않는다', async () => {
@@ -130,6 +131,9 @@ describe.skipIf(!built)('PB195-100 B4 — 정보 인자: 서버·DB 기동 전�
     const r2 = await run([], { cwd: b.ws, env: envFor(b.home, null), send: INIT, timeoutMs: 20000 });
     expect(r2.timedOut).toBe(false);
     expect(r2.stdout).toContain('"id":1');
-    expect(fs.existsSync(path.join(b.home, '.claude', 'sessions.db'))).toBe(true);
+    // 2.9 (P4-100 · L-54): the server no longer climbs into the home's `.claude/` — it falls back to cwd
+    //   like the hooks' resolver (reason `cwd`). The positive half is that it still opened a DB in this layout.
+    expect(fs.existsSync(path.join(b.ws, '.claude', 'sessions.db'))).toBe(true);
+    expect(fs.readdirSync(path.join(b.home, '.claude'))).toEqual([]);
   }, 60_000);   // 서버 두 번 기동 — 설치본(첫 실행)에서는 기본 5 초를 넘을 수 있다(PB195-800)
 });

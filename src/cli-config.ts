@@ -17,16 +17,8 @@ import {
   invalidateConfigCache,
 } from './utils/config.js';
 
-function detectWorkspaceRoot(cwd: string): string {
-  let current = cwd;
-  const root = path.parse(current).root;
-  while (current !== root) {
-    if (fs.existsSync(path.join(current, 'apps'))) return current;
-    if (fs.existsSync(path.join(current, '.claude', 'sessions.db'))) return current;
-    current = path.dirname(current);
-  }
-  return cwd;
-}
+// 2.9 (P4-100): 별도 사본을 버리고 훅·서버와 같은 판정기를 쓴다(홈 경계·레포 경계가 사본에는 없었다)
+import { detectWorkspaceRoot } from './utils/workspace.js';
 
 interface ConfigFile {
   version?: number;
