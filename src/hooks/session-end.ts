@@ -26,6 +26,7 @@ import { readRunOrigin } from '../utils/run-origin.js';
 import { writeActiveContext } from '../utils/active-context.js';
 import { acquireStopLock } from '../utils/stop-lock.js';
 import type { SummarySource } from '../utils/summary-source.js';
+import { pickSummary, type SummaryBasis } from '../utils/summary-pick.js';
 import { humanTurn, requestLine } from '../utils/human-turn.js';
 import { writesSince, findWorktreeRoot, readHead, MAX_ROOTS, type RootWrites } from '../utils/worktree.js';
 import { readWorkspaceDeclaration, scanArtifacts, countDeclaredRoots } from '../utils/workspace-config.js';
@@ -152,68 +153,8 @@ function isNoiseLine(line: string): boolean {
   return false;
 }
 
-/**
- * 단일 텍스트(last_assistant_message 등)에서 의미있는 요약 추출
- *
- * 우선순위:
- * 1. 구조화 마커 <!--SESSION:{"done":"..."}-->
- * 2. 완료 문장 패턴 (I've completed..., 구현 완료 등)
- * 3. 첫 의미있는 단락 (테이블/코드블록/리스트 제외)
- */
-function extractSummaryFromText(content: string): string {
-  if (!content || content.length < 10) return '';
-
-  // 전처리: 테이블 행, 코드블록 제거 → 순수 텍스트
-  const cleanedContent = content
-    .replace(/```[\s\S]*?```/g, '')              // 코드블록 제거
-    .split('\n')
-    .filter(line => !line.trim().startsWith('|') && !line.trim().startsWith('---'))
-    .join('\n');
-
-  // 전략 1: 구조화 마커 (CLAUDE.md 규칙을 따르는 경우)
-  const markerMatch = content.match(/<!--SESSION:(.*?)-->/s);
-  if (markerMatch?.[1]) {
-    try {
-      const parsed = JSON.parse(markerMatch[1]);
-      if (parsed.done && parsed.done.length > 5) return stripMarkdown(parsed.done).slice(0, 200);
-    } catch { /* malformed JSON, fall through */ }
-  }
-
-  // 전략 2: 완료/성과 문장 추출 (정제된 텍스트에서)
-  const completionMatch = cleanedContent.match(
-    /(?:I've |I have |Successfully |completed |finished |implemented |fixed |created |added |updated |refactored |deployed |배포 완료|구현 완료|작업 완료|수정 완료|테스트 통과|빌드 성공)([^.!?\n]{5,150}[.!?]?)/i
-  );
-  if (completionMatch) {
-    const sentence = stripMarkdown(completionMatch[0]).trim();
-    if (sentence.length > 15) return sentence.slice(0, 200);
-  }
-
-  // 전략 3: ✅ 마커 뒤 텍스트 (정제된 텍스트에서)
-  const checkMatch = cleanedContent.match(/✅\s*(.+)/);
-  if (checkMatch?.[1]) {
-    const cleaned = stripMarkdown(checkMatch[1]).trim();
-    if (cleaned.length > 10) return cleaned.slice(0, 200);
-  }
-
-  // 전략 4: 첫 헤딩 제목 — 단, 일반적인 섹션 헤딩은 제외
-  const headingMatch = cleanedContent.match(/^#{1,3}\s+(.+)$/m);
-  if (headingMatch?.[1]) {
-    const title = stripMarkdown(headingMatch[1]).trim();
-    // "결과 요약", "평가", "분석" 같은 일반 헤딩은 의미없는 요약이므로 건너뜀
-    const genericHeadings = /^(결과|요약|분석|평가|결론|테스트|현재|문제|핵심|다음|참고|MCP|Overview|Summary|Result|Analysis|Test)/i;
-    if (title.length > 5 && !genericHeadings.test(title)) return title.slice(0, 200);
-  }
-
-  // 전략 5: 첫 의미있는 단락 (노이즈 라인 건너뜀)
-  const lines = cleanedContent.split('\n');
-  for (const line of lines) {
-    if (isNoiseLine(line)) continue;
-    const cleaned = stripMarkdown(line).trim();
-    if (cleaned.length > 20) return cleaned.slice(0, 200);
-  }
-
-  return '';
-}
+// assistant 글에서 요약 한 줄을 고르는 규칙은 utils/summary-pick.ts (2.10 · Astra P5 reply-5 C2) —
+// 제목형 문구·문장 한가운데 동사 조각을 쓰지 않는다. 못 고르면 null = 호출부가 no-result.
 
 /**
  * 다음 할 일 추출 (텍스트에서)
@@ -774,6 +715,17 @@ async function main() {
     let lastWork = '';
     // 2.7.3 (reply-165 PB165-200): lastWork 를 **실제로 채운 분기**. 채운 자리에서만 정한다 — 나중에 글로 추정하지 않는다.
     let lastWorkSource: SummarySource | null = null;
+    // 2.10 (P5 reply-5 C2): assistant 글에서 골랐다면 어디서·어떤 규칙으로(원문 위치·턴·역할). 다른 분기면 null.
+    let lastWorkBasis: Omit<SummaryBasis, 'turn'> | null = null;
+    /** assistant 글 하나에서 고른다 — 고르면 lastWork·출처·근거를 한 자리에서 정한다 */
+    const pickFrom = (content: string | undefined, msg: string): boolean => {
+      const p = content ? pickSummary(content) : null;
+      if (!p) return false;
+      lastWork = p.text;
+      lastWorkSource = 'assistant-text';
+      lastWorkBasis = { role: 'assistant', msg, kind: p.kind, line: p.line };
+      return true;
+    };
     let nextTasks: string[] = [];
     let commitMessages: string[] = [];
     let errorsSolved: string[] = [];
@@ -839,15 +791,14 @@ async function main() {
 
     // 2d: last_assistant_message에서 추출
     if (!lastWork && input.last_assistant_message) {
-      lastWork = extractSummaryFromText(input.last_assistant_message);
-      if (lastWork) lastWorkSource = 'assistant-text';
+      pickFrom(input.last_assistant_message, 'last');
     }
 
-    // 2c: transcript에서 최근 assistant 메시지 스캔 (이미 파싱됨)
+    // 2c: transcript에서 최근 assistant 메시지 스캔 (이미 파싱됨) — recent-0 = 트랜스크립트의 마지막 응답
     if (!lastWork && transcript.recentAssistantMessages.length > 0) {
-      for (let i = transcript.recentAssistantMessages.length - 1; i >= 0; i--) {
-        lastWork = extractSummaryFromText(transcript.recentAssistantMessages[i]);
-        if (lastWork) { lastWorkSource = 'assistant-text'; break; }
+      const n = transcript.recentAssistantMessages.length;
+      for (let i = n - 1; i >= 0; i--) {
+        if (pickFrom(transcript.recentAssistantMessages[i], `recent-${n - 1 - i}`)) break;
       }
     }
 
@@ -875,8 +826,7 @@ async function main() {
         process.exit(0);
       }
       for (let i = assistantMsgs.length - 1; i >= Math.max(0, assistantMsgs.length - 5); i--) {
-        lastWork = extractSummaryFromText(assistantMsgs[i].content);
-        if (lastWork) { lastWorkSource = 'assistant-text'; break; }
+        if (pickFrom(assistantMsgs[i].content, 'legacy')) break;
       }
     }
 
@@ -1240,6 +1190,8 @@ async function main() {
     let hasSourceColumn = false;
     let hasStateSourceColumn = false;
     let hasRoutedFromColumn = false;
+    let hasBasisColumn = false;
+    let hasStateBasisColumn = false;
     try {
       migrateSchema(db);
       const cols = (db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>)
@@ -1248,9 +1200,11 @@ async function main() {
         .every(c => cols.includes(c));
       hasOriginColumn = cols.includes('run_origin');
       hasSourceColumn = cols.includes('summary_source');
-      hasStateSourceColumn = (db.prepare('PRAGMA table_info(active_context)').all() as Array<{ name: string }>)
-        .some(c => c.name === 'state_source');
+      const acCols = (db.prepare('PRAGMA table_info(active_context)').all() as Array<{ name: string }>).map(c => c.name);
+      hasStateSourceColumn = acCols.includes('state_source');
+      hasStateBasisColumn = acCols.includes('state_basis');
       hasRoutedFromColumn = cols.includes('routed_from');
+      hasBasisColumn = cols.includes('summary_basis');
     } catch { /* 보강 실패 → 구스키마로 동작 */ }
 
     // ★ 2.9 (Astra P4 reply-4 P4-200) — 기록 귀속(옵트인 `routing.record: "target"`).
@@ -1268,10 +1222,12 @@ async function main() {
         if (att.routedFrom) {
           recordProject = att.project;
           routedFrom = JSON.stringify({ ...att.routedFrom, turn: input.prompt_id || input.turn_id || null });
-          const own = input.last_assistant_message ? extractSummaryFromText(input.last_assistant_message) : '';
+          const ownPick = input.last_assistant_message ? pickSummary(input.last_assistant_message) : null;
+          const own = ownPick?.text ?? '';
           const ownStripped = own ? (stripSlashPrefix(own) || own) : '';
           lastWork = ownStripped || NO_OUTCOME;
           lastWorkSource = ownStripped ? 'assistant-text' : 'no-result';
+          lastWorkBasis = ownStripped && ownPick ? { role: 'assistant', msg: 'last', kind: ownPick.kind, line: ownPick.line } : null;
           nextTasks = input.last_assistant_message ? extractNextTasks(input.last_assistant_message) : [];
           routedMetadataDropped = true;
         } else if (att.unattributed) {
@@ -1424,6 +1380,12 @@ async function main() {
     if (hasSourceColumn) insertCols.push('summary_source');
     // 2.9 (P4-200): 기록 귀속 출처 — 중복 판정에는 넣지 않는다(같은 턴의 재전달은 같은 귀속을 본다)
     if (hasRoutedFromColumn) insertCols.push('routed_from');
+    // 2.10 (P5 reply-5 C2): 요약을 고른 원문 위치·규칙·턴·역할(JSON) — assistant 글에서 고른 행만 · 중복 판정에는 넣지 않는다
+    //   stripSlashPrefix 가 글을 바꿨어도 고른 위치는 같다. 다른 분기(커밋·폴백·결과 없음)는 NULL.
+    const basisJson = lastWorkSource === 'assistant-text' && lastWorkBasis
+      ? JSON.stringify({ ...(lastWorkBasis as Omit<SummaryBasis, 'turn'>), turn: turnId ?? null } satisfies SummaryBasis)
+      : null;
+    if (hasBasisColumn) insertCols.push('summary_basis');
     const runOrigin = readRunOrigin();
 
     const dedupWhere = turnId && hasTurnColumns
@@ -1476,6 +1438,7 @@ async function main() {
         ...(hasOriginColumn ? [runOrigin] : []),
         ...(hasSourceColumn ? [lastWorkSource] : []),
         ...(hasRoutedFromColumn ? [routedFrom] : []),
+        ...(hasBasisColumn ? [basisJson] : []),
       ];
 
       const dedupArgs = turnId && hasTurnColumns
@@ -1537,6 +1500,7 @@ async function main() {
         current_state: lastWork,
         recent_files: JSON.stringify(modifiedFiles.slice(0, 15)),
         ...(hasStateSourceColumn ? { state_source: lastWorkSource } : {}),
+        ...(hasStateBasisColumn ? { state_basis: basisJson } : {}),
       });
     }
     // 일한 증거가 없는 턴은 active_context 를 건드리지 않는다 — updated_at 을 올리면 오래된 State 가

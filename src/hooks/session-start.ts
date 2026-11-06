@@ -17,7 +17,7 @@ import { InjectLedger, sha12 } from '../utils/inject-ledger.js';
 import { traceResumeEvent } from '../utils/resume-event.js';
 import { readTailLines, matchCompaction } from '../utils/compact-id.js';
 import { readRunOrigin } from '../utils/run-origin.js';
-import { viaLabel } from '../utils/summary-source.js';
+import { viaWithBasis } from '../utils/summary-source.js';
 import { readRoutingDeclaration, releaseCommand, routedBlock, currentRoute, routeClearedBlock, isWorkspaceRootCwd, routeRowId } from '../utils/routing.js';
 
 interface SessionInput {
@@ -135,10 +135,10 @@ const CARD_CHARS = clampCardChars(process.env.PASSBATON_CARD_CHARS, 3200);
 type PickedState = { text: string; blockers: string | null; meta: string | null; via: string | null; src?: string };
 function selectState(db: Database.Database, project: string, thisOrigin: 'loop' | 'unknown'): PickedState | null {
   const activeCols = new Set((db.prepare('PRAGMA table_info(active_context)').all() as Array<{ name: string }>).map(c => c.name));
-  const active = db.prepare(`SELECT current_state, blockers, updated_at${activeCols.has('state_source') ? ', state_source' : ''} FROM active_context WHERE project = ?`).get(project) as
-    { current_state: string | null; blockers: string | null; updated_at: string | null; state_source?: string | null } | undefined;
+  const active = db.prepare(`SELECT current_state, blockers, updated_at${activeCols.has('state_source') ? ', state_source' : ''}${activeCols.has('state_basis') ? ', state_basis' : ''} FROM active_context WHERE project = ?`).get(project) as
+    { current_state: string | null; blockers: string | null; updated_at: string | null; state_source?: string | null; state_basis?: string | null } | undefined;
   if (!active?.current_state) return null;
-  const via = viaLabel(active.state_source);
+  const via = viaWithBasis(active.state_source, active.state_basis);
   if (thisOrigin === 'loop') return { text: active.current_state, blockers: active.blockers, meta: null, via, src: 'active_context' };
 
   const cols = new Set((db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map(c => c.name));
@@ -157,15 +157,16 @@ function selectState(db: Database.Database, project: string, thisOrigin: 'loop' 
   // 확인된 loop 기록 → 버린다. loop 를 뺀 최신 적격 행 하나.
   const hasEvidence = ['file_coverage', 'workspace_writes', 'modified_files'].every(c => cols.has(c));
   const hasSource = cols.has('summary_source');
+  const hasBasis = cols.has('summary_basis');
   const rows = db.prepare(`
-    SELECT id, last_work, issues, timestamp${hasEvidence ? ', file_coverage, workspace_writes, modified_files' : ''}${hasSource ? ', summary_source' : ''} FROM sessions
+    SELECT id, last_work, issues, timestamp${hasEvidence ? ', file_coverage, workspace_writes, modified_files' : ''}${hasSource ? ', summary_source' : ''}${hasBasis ? ', summary_basis' : ''} FROM sessions
     WHERE project = ?
       AND COALESCE(run_origin, 'unknown') != 'loop'
       AND last_work NOT IN ('Session ended', 'Session work completed', 'Session started', '')
       AND length(last_work) > 15
     ORDER BY timestamp DESC, id DESC LIMIT 200
   `).all(project) as Array<{ id: number; last_work: string; issues: string | null; timestamp: string | null;
-    file_coverage?: string | null; workspace_writes?: string | null; modified_files?: string | null; summary_source?: string | null }>;
+    file_coverage?: string | null; workspace_writes?: string | null; modified_files?: string | null; summary_source?: string | null; summary_basis?: string | null }>;
   const parse = <T>(raw: string | null | undefined, fallback: T): T => {
     if (!raw) return fallback;
     try { return JSON.parse(raw) as T; } catch { return fallback; }
@@ -184,7 +185,7 @@ function selectState(db: Database.Database, project: string, thisOrigin: 'loop' 
   }
   // MCP session_end 는 blockers 를 issues 에 글 그대로 적는다(훅 행은 JSON 메타). 같은 행의 것만 붙인다.
   const blockers = row.issues && row.issues.trim() !== '' && parse<unknown>(row.issues, undefined) === undefined ? row.issues : null;
-  return { text: row.last_work, blockers, meta: `${when(row.timestamp)} · origin unknown · newer loop records excluded`, via: viaLabel(row.summary_source), src: `sessions:${row.id}` };
+  return { text: row.last_work, blockers, meta: `${when(row.timestamp)} · origin unknown · newer loop records excluded`, via: viaWithBasis(row.summary_source, row.summary_basis), src: `sessions:${row.id}` };
 }
 
 // 2.8 (PB170-100 N3): 카드 조각의 원천 식별 — 원천마다 경로@sha1(못 읽었으면 결과)
@@ -438,6 +439,7 @@ function renderFileEvidence(row: {
       ? ', user_intent, modified_files, workspace_writes, file_coverage'
       : '';
     const hasSummarySource = sessionCols.has('summary_source');
+    const hasSummaryBasis = sessionCols.has('summary_basis');
 
     // 2.7.3 (reply-154 PB154-B): 대화 카드에서는 **확인된 loop 행만** 뺀다 — 출처 필터를 먼저(WHERE) 걸고 LIMIT 3.
     //   ⛔ 먼저 3 개를 뽑고 빼면 최신 loop 행이 슬롯을 먹어 대화 칸이 빈다. 행은 지우지 않는다(노출만 바꾼다).
@@ -447,7 +449,7 @@ function renderFileEvidence(row: {
     const hideLoop = thisOrigin !== 'loop' && hasOrigin;
     const markUnknown = thisOrigin !== 'loop';
     const recentSessions = db.prepare(`
-      SELECT id, last_work, next_tasks, issues, timestamp${extraCols}${hasOrigin ? ', run_origin' : ''}${hasSummarySource ? ', summary_source' : ''} FROM sessions
+      SELECT id, last_work, next_tasks, issues, timestamp${extraCols}${hasOrigin ? ', run_origin' : ''}${hasSummarySource ? ', summary_source' : ''}${hasSummaryBasis ? ', summary_basis' : ''} FROM sessions
       WHERE project = ?
         ${hideLoop ? "AND COALESCE(run_origin, 'unknown') != 'loop'" : ''}
         AND last_work != 'Session ended'
@@ -460,7 +462,7 @@ function renderFileEvidence(row: {
       id: number; last_work: string; next_tasks: string; issues: string; timestamp: string;
       user_intent?: string | null; modified_files?: string | null;
       workspace_writes?: string | null; file_coverage?: string | null;
-      run_origin?: string | null; summary_source?: string | null;
+      run_origin?: string | null; summary_source?: string | null; summary_basis?: string | null;
     }>;
 
     // 2.7.3 (PB154-C): loop 최소 카드면 Recent Sessions 를 싣지 않는다(행은 그대로 · 노출만)
@@ -472,7 +474,7 @@ function renderFileEvidence(row: {
         const work = session.last_work.length > 140 ? session.last_work.slice(0, 140) + '...' : session.last_work;
         const tag = markUnknown && session.run_origin !== 'loop' ? ' [origin unknown]' : '';
         // 2.7.3 (PB165-200): 그 행의 생성 출처 — 칸이 없는 옛 DB·NULL 은 via unknown
-        sessionLines.push(`- [${session.timestamp?.slice(0, 10) || '?'}]${tag} ${work} _(${viaLabel(session.summary_source)})_`);
+        sessionLines.push(`- [${session.timestamp?.slice(0, 10) || '?'}]${tag} ${work} _(${viaWithBasis(session.summary_source, session.summary_basis)})_`);
 
         // ★ 상세(요청 → 한 일 → 커버리지 → 파일)는 **가장 최근 한 건에만** 붙인다.
         //   셋 다 붙이면 예산을 파일 목록이 다 먹고 정작 지시사항이 잘린다.

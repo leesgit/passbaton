@@ -44,8 +44,11 @@ const COLUMNS: Record<string, Record<string, string>> = {
     // routed_from (2.9 · Astra P4 reply-4 P4-200): routing.record = target 으로 대상 프로젝트에 둔 행의 출처(JSON) ·
     //   대상으로 못 보낸 행은 {root, unattributed} · 그 밖은 NULL(옛 행 소급 없음)
     routed_from: 'TEXT',
+    // summary_basis (2.10 · Astra P5 reply-5 C2): assistant 글에서 고른 요약의 근거 JSON {role, msg, kind, line, turn}
+    //   (utils/summary-pick.ts) · 다른 분기·옛 행 = NULL(소급 없음) · active_context.state_basis 는 State 행의 같은 값
+    summary_basis: 'TEXT',
   },
-  active_context: { state_source: 'TEXT' },
+  active_context: { state_source: 'TEXT', state_basis: 'TEXT' },
   session_files: { prompt_id: 'TEXT' },
   session_roots: { head_baseline: 'TEXT' },
   compact_handover: { pre_uuid: 'TEXT' },

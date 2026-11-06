@@ -12,6 +12,8 @@
  *   - 커밋 메시지 출처도 완료 증명이 아니다(트랜스크립트 전체에서 모은 것이다). 출처를 밝힐 뿐이다.
  */
 
+import { basisLabel } from './summary-pick.js';
+
 export type SummarySource = 'commit' | 'assistant-text' | 'fallback' | 'no-result';
 
 const SOURCES: ReadonlySet<string> = new Set<SummarySource>(['commit', 'assistant-text', 'fallback', 'no-result']);
@@ -33,4 +35,14 @@ const LABEL: Record<SummarySource | 'unknown', string> = {
 /** 표시용 한 조각 — 「via commit message」 처럼. */
 export function viaLabel(raw: unknown): string {
   return LABEL[summarySourceOf(raw)];
+}
+
+/**
+ * 2.10 (P5 reply-5 C2): assistant 글에서 고른 요약이면 원문 위치를 붙인다 — 「via assistant text · status line L3 of the last reply」.
+ * 근거 칸은 **같은 행의 것만** 쓴다. 출처가 assistant-text 가 아니거나 칸이 없거나 읽을 수 없으면 붙이지 않는다(지어내지 않는다).
+ */
+export function viaWithBasis(source: unknown, basis: unknown): string {
+  const via = viaLabel(source);
+  const where = summarySourceOf(source) === 'assistant-text' ? basisLabel(basis) : null;
+  return where ? `${via} · ${where}` : via;
 }

@@ -106,8 +106,9 @@ describe.skipIf(!built)('PB165-200 Stop 이 고른 분기를 같은 행에 · �
     expect(r[0]).toMatchObject({ last_work: said, summary_source: 'assistant-text' });
     expect(active?.state_source).toBe('assistant-text');
     const out = start(ws, proj);
-    expect(stateLine(out)).toContain(`${said} _(via assistant text · recorded `);
-    expect(recent(out)[0]).toMatch(/ _\(via assistant text\)_$/);
+    // 2.10 (P5 reply-5 C2): assistant 글이면 원문 위치가 붙는다
+    expect(stateLine(out)).toContain(`${said} _(via assistant text · first statement L1 of the last reply · recorded `);
+    expect(recent(out)[0]).toMatch(/ _\(via assistant text · first statement L1 of the last reply\)_$/);
   });
 
   it('트랜스크립트의 assistant 문장(2c)도 assistant-text', () => {
@@ -159,7 +160,7 @@ describe.skipIf(!built)('PB165-200 Stop 이 고른 분기를 같은 행에 · �
     const rec = recent(out);
     expect(rec).toHaveLength(2);
     // 두 행이 같은 초에 들어가 순서는 정해지지 않는다 — 글로 찾아 각 행의 출처를 본다
-    expect(rec.find(l => l.includes('미니맵 깜빡임'))).toMatch(/ _\(via assistant text\)_$/);
+    expect(rec.find(l => l.includes('미니맵 깜빡임'))).toMatch(/ _\(via assistant text · first statement L1 of the last reply\)_$/);
     expect(rec.find(l => l.includes(COMMIT))).toMatch(/ _\(via commit message\)_$/);
   });
 

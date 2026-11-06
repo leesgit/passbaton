@@ -22,15 +22,17 @@
 
 import type Database from 'better-sqlite3';
 
-export type ActiveContextColumn = 'current_state' | 'state_source' | 'active_tasks' | 'recent_files' | 'blockers' | 'last_verification';
+export type ActiveContextColumn = 'current_state' | 'state_source' | 'state_basis' | 'active_tasks' | 'recent_files' | 'blockers' | 'last_verification';
 export type ActiveContextFields = Partial<Record<ActiveContextColumn, string | null>>;
 
-const COLUMNS: readonly ActiveContextColumn[] = ['current_state', 'state_source', 'active_tasks', 'recent_files', 'blockers', 'last_verification'];
+const COLUMNS: readonly ActiveContextColumn[] = ['current_state', 'state_source', 'state_basis', 'active_tasks', 'recent_files', 'blockers', 'last_verification'];
 
 export function writeActiveContext(db: Database.Database, project: string, fields: ActiveContextFields): void {
   const present = new Set((db.prepare('PRAGMA table_info(active_context)').all() as Array<{ name: string }>).map(c => c.name));
   const given: ActiveContextFields = { ...fields };
   if ('current_state' in given && !('state_source' in given)) given.state_source = null;
+  // 2.10: state_basis(원문 위치)도 State 글과 한 쌍 — 앞 글의 위치가 새 글에 붙지 않게
+  if ('current_state' in given && !('state_basis' in given)) given.state_basis = null;
   const cols = COLUMNS.filter(c => c in given && present.has(c));
   if (cols.length === 0) return;
   const stamp = cols.includes('current_state');
