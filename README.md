@@ -262,6 +262,43 @@ Declare which **commands** select which project in the root `.claude/passbaton.c
 - All of this goes out in the hook's single output (Codex/Gemini receive one JSON object)
 - Cost (Ashfall data, 15 runs, median, Windows): 94 ms (2.6.1) → 100 ms with nothing selected, 112 ms with a selection held
 
+#### Recording routed turns under the routed project — opt-in (v2.9.0+)
+
+By default (above) every turn of a root conversation is recorded under the root, so the root's next card fills up with
+sub-project work. Opt in per workspace:
+
+```json
+{ "routing": { "commands": { "/ashfall": "apps/kenshi-fantasy", "/home": "." }, "record": "target" } }
+```
+
+- From then on, each turn taken while a route is selected is recorded under the routed project (same DB file — only the
+  `project` value changes). The root card no longer shows it; a session opened inside that project does. Turns after the
+  release command go back to the root. **Old rows are not moved or re-classified.**
+- A routed turn's summary comes from **that turn's answer only** — commits, decisions and earlier answers collected from the
+  whole transcript (possibly another project's segment) are not used for it
+- Provenance: `sessions.routed_from` = `{root, via, target, since, session, turn}`. When the route no longer maps, the target
+  name equals the root's, or two routed folders share a name, the turn stays under the root with `{root, unattributed, …}`
+- Auto-extracted memories, solutions and decisions still go to the root project (unchanged)
+- Any other `record` value is ignored (root) and reported as invalid; the same command declared twice with different case
+  is rejected (it used to be silently overwritten)
+
+Check what the hooks will read, without a DB or side effects:
+
+```bash
+npx passbaton-card --routes            # or: --workspace <root>
+# ROUTES workspace=… record=target · ROUTE /ashfall -> apps/kenshi-fantasy project=kenshi-fantasy dir=… · ROUTES-CHECK ok
+```
+
+Exit 0 = fine · 1 = invalid entry, disabled declaration or a project-name clash · 3 = no declaration.
+
+#### One workspace root for the server, hooks and config CLI (v2.9.0+)
+
+The MCP server and the config CLI had their own root detectors. The server stopped at the nearest `.claude/` and had no
+home guard, so a sub-repo `apps/<app>/` with its own `.claude/` made the **server** open `apps/<app>/.claude/sessions.db`
+while the **hooks** wrote to the monorepo DB. All three now use the hooks' resolver. The home guard also stops at the real
+account profile (`os.userInfo().homedir`), not only `HOME`/`USERPROFILE` — with `HOME` redirected, runs could climb into
+the real `~/.claude/sessions.db`.
+
 ### Decision index through the card (v2.7.0+)
 
 When work is steered by written decisions (reviews, replies from another agent), keep a short **index** in the repo and
