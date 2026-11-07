@@ -299,6 +299,36 @@ while the **hooks** wrote to the monorepo DB. All three now use the hooks' resol
 account profile (`os.userInfo().homedir`), not only `HOME`/`USERPROFILE` — with `HOME` redirected, runs could climb into
 the real `~/.claude/sessions.db`.
 
+### Card source options: ages, tally, need, health — opt-in (v2.10.0+)
+
+All four are optional per source in `continuity.sources`. Without them the card bytes are the same as 2.9.
+
+```json
+{ "continuity": { "sources": [
+  { "path": "docs/PENDING", "label": "requests", "ages": true, "tally": ["waiting for reply", "needs prep"] },
+  { "path": "docs/INDEX.md", "block": "Active", "label": "decision index", "need": { "rows": 1, "items": ["Active"], "chars": 600 } },
+  { "path": ".runner/health.json", "label": "run health", "health": { "maxAgeMinutes": 45 } }
+] } }
+```
+
+- `ages: true` — each ISO-8601 time with an offset or `Z` in the shown excerpt gets its age relative to the card time
+- `tally: [...]` (1–6 words, 30 chars each) — counts lines containing each word across the **whole selected range**, including
+  lines cut by the budget, so "3 waiting" stays true when only one is shown
+- `need: { rows?, items?, chars? }` — what the shown excerpt must contain to count as enough: `rows` = table data rows (header,
+  separator and fenced lines excluded — a header-only table is 0), `items` = words that must appear verbatim, `chars` = a minimum
+  body share taken from other sources inside the same total budget. With `rows`/`items` declared the header says `need met`, or
+  `⚠ INSUFFICIENT — … — read <path:lines> directly` with the omitted amount. Undeclared = no verdict
+- `health: { maxAgeMinutes }` — the source is a run-state JSON **written by your own runner or supervisor**; passbaton only shows it
+  (it does not count logs or interpret words). Shape: `observed_at` (required, ISO with offset), `state` (required, producer's word),
+  `attention`, `normal_stop` (booleans), `last_attempt`, `last_success` (ISO), `failure {count, first, last, text}`. Card lines:
+  `run health: …` · `⚠ RUN NEEDS ATTENTION — …` · `stopped normally` · `⚠ RUN HEALTH STALE` (older than `maxAgeMinutes`) ·
+  `⚠ RUN HEALTH UNKNOWN` (missing, broken, clock going backwards, or contradictory)
+
+#### Stop summary picks the explicit status first (v2.10.0+)
+
+The saved summary of a turn now prefers an explicit status / next step / blocker line. A heading-only line ("Review results")
+or a mid-sentence fragment is never used as the state, and the row records where the summary came from.
+
 ### Decision index through the card (v2.7.0+)
 
 When work is steered by written decisions (reviews, replies from another agent), keep a short **index** in the repo and
